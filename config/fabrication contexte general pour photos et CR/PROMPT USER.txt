@@ -1,0 +1,37 @@
+À partir des documents suivants :
+- un texte de cadrage rédigé par l’expert,
+- une ou plusieurs ordonnances judiciaires définissant la mission,
+- éventuellement des écritures de parties ou notes de procédure,
+
+produis DEUX fichiers JSON distincts, exploitables tels quels dans une application d’expertise judiciaire :
+
+1) « contexte_general_photos.json »
+2) « contexte_general_compte_rendu.json »
+
+Contraintes communes :
+- Chaque fichier doit contenir STRICTEMENT les quatre champs suivants :
+  "mission", "etat_avancement", "system", "user"
+- Aucun autre champ ne doit être ajouté.
+- Aucune information ne doit être inventée ou extrapolée.
+- Aucun nom de personne ne doit être mentionné.
+- Aucun horodatage précis issu des transcriptions ne doit être mentionné.
+- Répondre uniquement par les deux objets JSON, sans commentaire.
+
+Contraintes spécifiques :
+
+A) Pour « contexte_general_photos.json » :
+- "mission" : résumé synthétique de la mission de l’expert, orienté vers la constatation matérielle et la description des ouvrages.
+- "etat_avancement" : situation procédurale de la réunion (numéro de réunion, date, objet ponctuel), sans appréciation technique.
+- "system" : qualification factuelle des photographies (réunion sur site, usage illustratif).
+- "user" : finalité des libellés et commentaires photo (description factuelle des éléments visibles ou explicitement mentionnés).
+
+B) Pour « contexte_general_compte_rendu.json » :
+- "mission" : mission de l’expert telle qu’elle ressort de l’ordonnance, incluant l’organisation des opérations et les suites à donner.
+- "etat_avancement" : objet et contexte de la réunion analysée (chronologie, lien avec réunions précédentes).
+- "system" : cadre d’analyse des transcriptions pour produire un compte rendu de réunion.
+- "user" : consignes sur le contenu du compte rendu (constats, échanges, décisions de suite), sans règles de style redondantes.
+
+Documents à analyser :
+[COLLER ICI le texte de cadrage de l’expert]
+[COLLER ICI l’ordonnance ou les ordonnances]
+[COLLER ICI, le cas échéant, d’autres pièces pertinentes]

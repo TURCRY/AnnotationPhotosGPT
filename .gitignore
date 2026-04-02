@@ -1,0 +1,68 @@
+# Environnements
+.venv/
+__pycache__/
+*.pyc
+.env
+.streamlit/
+AnnotationPhotosGPT.egg-info/
+*.egg-info/
+
+# Données temporaires
+data/temp/
+data/uploads/
+
+# Archives et sauvegardes
+*.zip
+* - Copie.py
+* ver 0.py
+* ver 1.py
+* ver 2.py
+*.pyobsolete
+
+# Build / distribution
+build/
+dist/
+exe/
+
+# Fichiers Office temporaires
+~$*
+*.tmp
+
+# Données lourdes / métier
+data/*.csv
+!data/README_data.md
+!data/contexte_general.json
+!data/infos_projet.json
+!data/progression_annotation.json
+data/*.docx
+data/*.xlsx
+data/transcription.csv
+data/photos.csv
+
+# Documentation lourde
+docs/**/*.docx
+docs/**/*.pdf
+docs/~$*
+docs/diag/
+docs/template claude/
+
+# Configs de copie / travail
+config/copie_config_*/
+data/copie config */
+app/zip gpt*/
+
+# Fichiers locaux / outils
+ffmpeg
+mkdir
+cd
+*.lnk
+
+# Système
+Thumbs.db
+.DS_Store
+
+
+# Docs / assets optionnels
+docs/**/*.html
+scripts/*.pdf
+ressources/icons/*.ico

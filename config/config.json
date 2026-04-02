@@ -1,0 +1,55 @@
+{
+    "openai_api_key": "API_OPENAI_PLACEHOLDER",
+    "model": "gpt-4o-mini",
+    "asr_model": "gpt-4o-mini-transcribe",
+    "temperature": 0.25,
+    "max_tokens": 120,
+    "retries": 3,
+    "timeout": 180,
+    "audio_av": 60,
+    "audio_ap": 60,
+    "default_delays": {
+        "libelle": {
+            "before": 30,
+            "after": 15
+        },
+        "commentaire": {
+            "before": 120,
+            "after": 120
+        }
+    },
+    "masquer_textes_gpt": false,
+    "afficher_photo_precedente": true,
+    "chemin_transcription_secondaire": "",
+    "filtrer_photos_retirees": true,
+    "csv_autosave": true,
+    "fichier_export_word": true,
+    "export_pdf": false,
+    "resume_session": true,
+    "alerte_manque_transcription": true,
+    "alerte_sonore": false,
+    "autosave_periodique": false,
+    "multi_utilisateur": false,
+    "import_partiel_possible": false,
+    "export_csv_all\u00e9g\u00e9": false,
+    "gpt_prompts": {
+        "system": "Vous rédigez UNIQUEMENT à partir des éléments fournis (transcription et contexte).\n Interdictions absolues : \n - Ne pas inventer, ne pas extrapoler, \n ne pas expliquer les causes.\n- Ne pas transformer une question/doute en affirmation.\n - Ne pas employer de langage normatif ou évaluatif : « règles de l’art », « conforme/non conforme », « durable », « inadéquat », « anormal », « ne devrait pas », etc.\n- Ne pas conclure, ne pas attribuer de responsabilité.\n Style : factuel, neutre, phrases courtes.",
+        "libelle_prompt": "Contexte : {{contexte_general}}\nMission : {{mission}}\nTranscription :\n{{transcription}}\nTÂCHE — LIBELLÉ PHOTO :\n- Répondre uniquement par le libellé (5 à 12 mots). Sans autre texte.\n- Décrire seulement le sujet principal (élément matériel).\n- Si la transcription n’est pas exploitable : écrire « Vue générale — élément non précisé ».",
+        "commentaire_prompt": "Contexte : {{contexte_general}} \nMission : {{mission}}\nTranscription :\n{{transcription}}\nTÂCHE — COMMENTAIRE :\n- Répondre uniquement par le commentaire (2 à 4 phrases). Sans titre, sans note.\n- Rapporter les propos comme des propos : utiliser « il est indiqué/évoqué/observé ».\n- Ne pas reformuler une question en constat.\n- Interdit : règles de l’art, conformité, durabilité, imputations, conclusions."
+    },
+    "llm_backend": "local",               
+    "local_llm": {
+        "base_url": "http://192.168.0.155:5050",
+        "api_key": "LOCAL_LLM_API_KEY_PLACEHOLDER",
+        "model": "Qwen_2_5_14B",
+        "timeout": 30
+    },
+    "wol": {
+    "mac_pcfixe": "10-FF-E0-64-EB-73",
+    "broadcast_ip": "192.168.0.255",
+    "port": 9,
+    "max_wait_sec": 90,
+    "ping_path": "/ping",
+    "poll_interval_sec": 3
+  }
+}

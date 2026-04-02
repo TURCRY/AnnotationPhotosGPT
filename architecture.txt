@@ -1,0 +1,48 @@
+AnnotationPhotosGPT/
+├── app/
+│   ├── main.py
+│   ├── gpt_integration.py
+│   └── autres modules .py nécessaires
+│
+├── config/
+│   ├── config.json
+│   ├── contexte_general.json
+│   ├── prompt_gpt.json
+│   ├── .env                 ✅ clé API réelle (à exclure du dépôt Git)
+│   └── .env.exemple         ✅ modèle à versionner
+│
+├── data/
+│   ├── transcription.csv
+│   ├── photos.csv
+│   ├── prise_de_son.wav
+│   ├── annotations.csv
+│   ├── infos_projet.json
+│   └── progression_annotation.json
+│
+├── docs/
+│   ├── Compilation_PyInstaller_Procedure.pdf
+│   ├── README_compilation.md
+│   ├── gestion_projet_doc.pdf
+│   ├── conventions.md
+│   ├── Bilan_Projet_AnnotationPhotosGPT.pdf
+│   └── (autres docx éventuels d’interface)
+│
+├── exe/
+│   └── convert_transcription_docx.exe         ✅ exécutable autonome
+│
+├── scripts/
+│   ├── convert_transcription_docx.py
+│   ├── convert_docx_gui.py
+│   ├── generate_word_report.py
+│   ├── gestion_projet.bat
+│   ├── compile_convert_transcription_docx.bat
+│   └── run_convert_transcription_docx.bat
+│
+├── spec/
+│   └── convert_transcription_docx.spec
+│
+├── README.md
+├── README_Windows.md
+├── requirements.txt
+└── run_app.bat
+

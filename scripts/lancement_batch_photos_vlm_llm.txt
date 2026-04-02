@@ -1,0 +1,21 @@
+
+# version depuis laptop
+
+python C:\AnnotationPhotosGPT\scripts\batch_photos_vlm_llm.py ^
+  --photos_csv "\\192.168.0.155\Affaires\2025-J37\AE_Expert_captations\accedit-2025-09-02\photos\J37 Touzeau photos 02 09 2025.csv" ^
+  --root_affaires "\\192.168.0.155\Affaires" ^
+  --flask_url "http://127.0.0.1:5050" ^
+  --infos_projet_json "\\192.168.0.155\Affaires\2025-J37\AF_Expert_ASR\transcriptions\accedit-2025-09-02\infos_projet.json" ^
+  --transcript_dir "\\192.168.0.155\Affaires\2025-J37\AF_Expert_ASR\transcriptions\accedit-2025-09-02" ^
+  --only_missing
+
+# version depuis pc Fixe
+
+python batch_photos_vlm_llm.py ^
+  --photos_csv "C:\Affaires\2025-J37\...\photos.csv" ^
+  --root_pcfixe "C:\Affaires" ^
+  --flask_url "http://127.0.0.1:5000" ^
+  --transcript_csv "C:\Affaires\2025-J37\AE_Expert_ASR\transcriptions\XXX.csv" ^
+  --mission_file "C:\Affaires\2025-J37\_Config\mission.txt" ^
+  --contexte_file "C:\Affaires\2025-J37\_Config\contexte_general.txt" ^
+  --only_missing

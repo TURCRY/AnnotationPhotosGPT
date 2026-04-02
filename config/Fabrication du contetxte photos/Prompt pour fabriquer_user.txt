@@ -1,0 +1,26 @@
+À partir des éléments suivants :
+- un texte de présentation rédigé par l’expert,
+- une ordonnance judiciaire définissant la mission,
+- éventuellement une requête ou des écritures de parties,
+
+produis un fichier JSON nommé « contexte_general_photos.json » respectant STRICTEMENT la structure suivante :
+
+{
+  "mission": "...",
+  "system": "...",
+  "user": "..."
+}
+
+Contraintes impératives :
+- Le champ "mission" résume la mission de l’expert telle qu’elle ressort de l’ordonnance, sans interprétation.
+- Le champ "system" décrit uniquement le cadre factuel des photographies (réunion sur site, usage illustratif).
+- Le champ "user" précise la finalité des libellés et commentaires photo, sans rappeler les règles de style ou de neutralité.
+- Le texte doit être concis, non redondant, et exploitable tel quel dans une application d’annotation de photographies.
+- Aucune référence aux règles de l’art, à la conformité, aux responsabilités ou aux conclusions.
+- Ne pas inclure de clés supplémentaires.
+- Répondre uniquement par le JSON final, sans commentaire.
+
+Voici les documents à analyser :
+[COLLER ICI le texte libre de l’expert]
+[COLLER ICI l’ordonnance]
+[COLLER ICI, le cas échéant, d’autres documents]

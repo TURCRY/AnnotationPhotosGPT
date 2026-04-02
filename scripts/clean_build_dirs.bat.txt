@@ -1,0 +1,17 @@
+@echo off
+echo Nettoyage des répertoires de compilation...
+
+rem Suppression des fichiers .spec compilés précédemment
+del /q ..\spec\*.spec
+
+rem Suppression des répertoires build et dist
+rmdir /s /q ..\build
+rmdir /s /q ..\dist
+
+rem Suppression des anciens exécutables
+del /q ..\exe\*.exe
+
+rem Suppression des sous-dossiers dans le répertoire exe
+for /d %%G in ("..\exe\*") do @rd /s /q "%%G"
+
+echo Nettoyage terminé.

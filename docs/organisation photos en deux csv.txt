@@ -1,0 +1,190 @@
+
+PCFIXE_META_COLS = [
+  	"chemin_photo_native_pcfixe",			# chemin_photo_native_pcfixe
+  	"chemin_photo_reduite_pcfixe",			# chemin_photo_reduite_pcfixe
+  	"photo_disponible_pcfixe",			# photo_disponible_pcfixe
+  	"date_copie_pcfixe",				# date_copie_pcfixe
+
+        "photo_rel_reduite",				# photo_rel_reduite
+        "photo_rel_native",	 			# photo_rel_native
+
+]
+
+LAPTOP_META_COLS = [
+        "chemin_photo_native",				# chemin_photo_native
+        "chemin_photo_reduite",				# chemin_photo_reduite
+
+        "id_affaire",					# id_affaire   (à faire saisir dans selection_fichiers_interface.py)
+        "id_captation",					# id_captation (à faire saisir dans selection_fichiers_interface.py)        
+	"orientation_photo",				# orientation_photo
+
+
+]
+
+#  PC fixe → laptop
+
+BATCH_COLS = [
+
+
+        "description_vlm",				# description_vlm
+        "libelle_propose",				# libelle_propose
+        "commentaire_propose",				# commentaire_propose
+
+        "batch_status",					# batch_status
+        "batch_id",					# batch_id
+        "batch_ts",					# batch_ts
+        "vlm_err",					# vlm_err
+        "vlm_prompt_ctx_len",				# vlm_prompt_ctx_len
+        "vlm_img_bytes",				# vlm_img_bytes
+        "vlm_mode",					# vlm_mode
+        "vlm_call_id",					# vlm_call_id
+
+        "sujets_ids",					# sujets_ids : ex. 6|18|27
+        "sujets_scores",				# sujets_scores : ex. 0.71|0.66|0.61 (score embedding ou score final)
+        "sujets_method",				# sujets_method : ex. embed_topk+llm_validate
+        "sujets_justif",				# sujets_justif (optionnel mais très utile) : 1–2 verbatims (provenant des interventions[].texte) ayant motivé la validation.
+]
+
+# laptop → PC fixe
+DICTEE_COLS = [			
+        "dictee_audio_path_pcfixe",			# dictee_audio_path_pcfixe"
+        "dictee_asr_text",				# dictee_asr_text
+        "dictee_asr_status",				# dictee_asr_status
+        "dictee_asr_ts",				# dictee_asr_ts
+        "dictee_audio_sha256",				# dictee_audio_sha256 (cas dictée si backend openai)
+        "dictee_audio_size",				# dictee_audio_size (cas dictée si backend openai)
+]
+
+# laptop → PC fixe, pour que le PC fixe “voit” la fenêtre audio choisie par l’UI
+UI_CTX_COLS = [
+
+        "horodatage_photo",				# horodatage_photo (jj/mm/aaaa hh:mm:ss)
+        "horodatage_secondes",				# horodatage_secondes
+
+        "t_audio",					# t_audio
+        "decalage_individuel",				# decalage_individuel
+        "synchro_audio",				# synchro_audio
+        "decalage_moyen",				# decalage_moyen
+
+
+
+        "nom_fichier_image",				# nom_fichier_image
+        "annotation_validee",				# annotation_validee	
+        
+
+] 
+
+#**********************************************************
+
+
+La clé de jointure recommandée :
+➡️ photo_rel_native (stable, indépendant des chemins locaux).
+
+1️⃣ photos_ui.csv (auteur unique : UI / laptop)
+🔑 Clés et identification
+
+photo_rel_native
+
+nom_fichier_image
+
+id_affaire
+
+id_captation
+
+🖼 Métadonnées UI (lecture seule ou modifiables par UI)
+
+chemin_photo_native
+
+chemin_photo_reduite
+
+orientation_photo
+
+horodatage_photo
+
+horodatage_secondes
+
+🎙 Fenêtre audio décidée par l’UI
+
+t_audio
+
+decalage_individuel
+
+synchro_audio
+
+decalage_moyen
+
+📝 Dictée (UI → batch)
+
+dictee_audio_path_pcfixe
+
+dictee_asr_text
+
+dictee_asr_status
+
+dictee_asr_ts
+
+dictee_audio_sha256
+
+dictee_audio_size
+
+✅ État métier (pilotage batch)
+
+annotation_validee ← utilisé par le batch pour skipper
+
+(optionnel) ui_ts ← timestamp global de dernière modification UI sur la ligne
+
+La clé de jointure recommandée :
+➡️ photo_rel_native (stable, indépendant des chemins locaux).
+
+1️⃣ photos_ui.csv (auteur unique : UI / laptop)
+🔑 Clés et identification
+
+photo_rel_native
+
+nom_fichier_image
+
+id_affaire
+
+id_captation
+
+🖼 Métadonnées UI (lecture seule ou modifiables par UI)
+
+chemin_photo_native
+
+chemin_photo_reduite
+
+orientation_photo
+
+horodatage_photo
+
+horodatage_secondes
+
+🎙 Fenêtre audio décidée par l’UI
+
+t_audio
+
+decalage_individuel
+
+synchro_audio
+
+decalage_moyen
+
+📝 Dictée (UI → batch)
+
+dictee_audio_path_pcfixe
+
+dictee_asr_text
+
+dictee_asr_status
+
+dictee_asr_ts
+
+dictee_audio_sha256
+
+dictee_audio_size
+
+✅ État métier (pilotage batch)
+
+annotation_validee ← utilisé par le batch pour skipper
+
+(optionnel) ui_ts ← timestamp global de dernière modification UI sur la ligne

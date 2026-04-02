@@ -1,0 +1,64 @@
+
+Cahier des charges pour la réécriture du script convert_transcription_docx.py
+
+1. OBJECTIF
+------------
+Le script doit convertir un fichier Word (.docx) de transcription en un fichier CSV propre et structuré.
+
+2. FORMAT DU FICHIER D'ENTRÉE
+------------------------------
+- Fichier au format .docx produit par un tiers.
+- Chaque bloc de transcription est délimité par :
+  [Maj+Entrée] + [Entrée] + [Entrée] (caractères invisibles).
+- Le contenu de chaque bloc suit la structure : 
+  [Horodatage] [Nom du locuteur] [Texte de la transcription].
+- Le texte peut comporter des caractères de présentation inutiles au début (par ex. "- " à supprimer).
+
+3. TRAITEMENTS À APPLIQUER
+----------------------------
+- **Horodatage** :
+  - Repérer l'horodatage en début de bloc (format MM:SS ou H:MM:SS).
+  - Le convertir systématiquement en format HH:MM:SS.
+  - Exemple :
+    - "2:34" devient "00:02:34"
+    - "1:12:30" devient "01:12:30"
+
+- **Locuteur** :
+  - Le locuteur doit être conservé tel quel.
+  - Aucun retraitement du nom du locuteur.
+
+- **Texte** :
+  - Nettoyer le début du texte de tout caractère inutile (par exemple "-", espaces en trop).
+  - Supprimer les sauts de lignes internes superflus.
+  - Conserver la ponctuation normale du texte.
+
+4. FORMAT DU FICHIER DE SORTIE
+-------------------------------
+- Fichier CSV encodé en UTF-8 avec BOM (utf-8-sig).
+- Séparateur de champ : point-virgule (;).
+- Trois colonnes dans l'ordre suivant :
+  - horodatage
+  - locuteur
+  - texte
+- Une ligne par bloc de transcription extrait.
+
+5. INTERFACE UTILISATEUR
+-------------------------
+- À l'ouverture du script :
+  - Ouvrir une fenêtre de sélection de fichier pour choisir le fichier .docx à convertir.
+- Pas de demande supplémentaire en console.
+- À la fin :
+  - Afficher un message indiquant le chemin du fichier CSV exporté.
+
+6. RÈGLES PARTICULIÈRES
+------------------------
+- Le script doit être autonome (peut être exécuté indépendamment des autres scripts ou batchs).
+- Le script doit être robuste aux accents et caractères spéciaux dans les chemins et contenus.
+- L'horodatage est relatif au début de l'enregistrement WAV lié.
+- Ne jamais inventer d'informations : en cas de doute sur un bloc, le bloc doit être ignoré proprement.
+
+7. ENVIRONNEMENT CIBLE
+------------------------
+- Windows 10/11.
+- Python 3.13.2.
+- Utilisation prévue avec compilation PyInstaller en fichier .exe.

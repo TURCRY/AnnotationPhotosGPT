@@ -1,0 +1,24 @@
+Affaires/
+└─ 2025-J37/
+   ├─ AE_Expert_captations/
+   │  └─ <id_captation>/
+   │     ├─ photos/
+   │     │  ├─ photos.csv
+   │     │  ├─ JPG/
+   │     │  └─ JPG reduit/
+   │     │
+   │     └─ audio/
+   │        ├─ *.wav              (natif)
+   │        ├─ *_mono16_16000Hz.wav
+   │        ├─ paramètres ASR / VLM audio
+   │        └─ fichiers techniques liés à la captation audio
+   │
+   └─ AF_Expert_ASR/
+      └─ transcriptions/
+         └─ <id_captation>/
+            ├─ *.csv / *.srt / *.vtt
+            ├─ contexte_general_photos.json
+            ├─ prompts_gpt.json
+            ├─ *_participants.xlsx
+            ├─ *_sujets.xlsx
+            └─ contexte_general_compte_rendu.json
