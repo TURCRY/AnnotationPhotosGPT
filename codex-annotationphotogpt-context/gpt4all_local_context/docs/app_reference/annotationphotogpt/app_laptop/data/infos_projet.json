@@ -1,0 +1,60 @@
+{
+  "fichier_transcription": "C:\\Users\\Utilisateur\\Documents\\NTU-Consult\\4 - Dossiers\\4 - Judiciaire\\4.1 - Civil\\J37 - Touzeau - Orgerus TJ78\\D - Captations expert\\Audio du 02 09 2025\\J37 Touzeau 02 09 2025_mono16_16000Hz(wav).csv",
+  "fichier_photos": "C:\\Users\\Utilisateur\\Documents\\NTU-Consult\\4 - Dossiers\\4 - Judiciaire\\4.1 - Civil\\J37 - Touzeau - Orgerus TJ78\\D - Captations expert\\Photos du 02 09 2025\\J37 Touzeau photos 02 09 2025.csv",
+  "fichier_photos_batch": "C:\\Users\\Utilisateur\\Documents\\NTU-Consult\\4 - Dossiers\\4 - Judiciaire\\4.1 - Civil\\J37 - Touzeau - Orgerus TJ78\\D - Captations expert\\Photos du 02 09 2025\\photos_batch.csv",
+
+  "fichier_audio": "C:\\AnnotationPhotosGPT\\data\\temp\\audio_compatible.wav",
+  "audio_compat_source": "C:\\Users\\Utilisateur\\Documents\\NTU-Consult\\4 - Dossiers\\4 - Judiciaire\\4.1 - Civil\\J37 - Touzeau - Orgerus TJ78\\D - Captations expert\\Audio du 02 09 2025\\J37 Touzeau 02 09 2025_mono16_16000Hz.wav",
+  
+  "fichier_audio_source": "C:\\Users\\Utilisateur\\Documents\\NTU-Consult\\4 - Dossiers\\4 - Judiciaire\\4.1 - Civil\\J37 - Touzeau - Orgerus TJ78\\D - Captations expert\\Audio du 02 09 2025\\J37 Touzeau 02 09 2025_mono16_16000Hz.wav",
+  "fichier_audio_compatible": "C:\\AnnotationPhotosGPT\\data\\temp\\audio_compatible.wav",
+  
+  "fichier_contexte_general": "C:\\Users\\Utilisateur\\Documents\\NTU-Consult\\4 - Dossiers\\4 - Judiciaire\\4.1 - Civil\\J37 - Touzeau - Orgerus TJ78\\D - Captations expert\\Audio du 02 09 2025\\contexte_general_photos.json",
+  "horodatage_audio": "2025-09-02 14:30:54",
+  "decalage_moyen": -4.0,
+  "t0_global": "2025-09-02 14:30:50",
+  "calibrage_valide": true,
+  "mission": "Décrire de manière synthétique, neutre et technique le contenu d’une photographie prise lors des opérations d’expertise relatives aux infiltrations et à l’humidité de l’immeuble en s’appuyant sur les échanges transcrits autour du même horodatage.",
+  "system": "Tu es un expert judiciaire en bâtiment intervenant dans le cadre d’une expertise ordonnée par le tribunal judiciaire de Versailles (ordonnance du 12 septembre 2024). Tu analyses des bribes de transcription horodatées associées, le cas échéant, à des photographies prises lors de la première réunion d’expertise du 03 septembre 2025.\n\nÀ partir de ces éléments, tu dois produire DEUX SORTIES :\n(1) un compte rendu de réunion (texte) ;\n(2) une liste de « Sujets » destinée à être exportée en tableur, sous forme de tableau structuré avec les colonnes : Numero, Titre, Localisation, Description, Commentaire.\n\nContraintes générales :\n- Tu n’inventes aucune information et tu ne complètes pas les lacunes : tu t’en tiens strictement à ce qui ressort de la transcription et à ce que les photos permettent de décrire objectivement.\n- Tu ne mentionnes ni les horodatages ni les noms de personnes physiques ; tu peux utiliser des désignations neutres (ex. « demandeurs », « architecte », « entreprise », « assureur », « liquidateur ») si et seulement si la transcription les identifie.\n- Style : factuel, neutre, structuré, sans appréciation juridique ni conclusion sur les responsabilités.\n\nRègles de production :\nA) COMPTE RENDU : un texte court et structuré, mentionnant notamment : présence/absence des parties, objet de la réunion (ouverture/cadrage), constats visités et observations formulées, pièces sollicitées/annoncées, décisions de suite (investigations, devis, calendrier, enveloppe d’investigations, mises en cause).\nB) SUJETS (table) : chaque sujet correspond à un point distinct évoqué (désordre, non-conformité, inachèvement, élément contractuel discuté, question de délai/retard/interruption, point financier/compte, demande de pièce, investigation à réaliser). Le champ Numero est un entier incrémental. Le champ Localisation indique la zone (pièce, façade, ouvrage, fondations, etc.) si la transcription/le visuel le permet, sinon « Non précisé ». Le champ Commentaire contient, si pertinent, la décision de suite (ex. « demander devis », « vérifier sur site », « transmettre pièce », « à confirmer »).",
+  "user": "Contexte de l’affaire : expertise ordonnée par ordonnance du 12 septembre 2024, relative à des travaux d’agrandissement/rénovation d’un bien situé 73 route de Mantes à Buchelay (78200). Le périmètre de l’expertise est limité aux désordres, malfaçons, non-façons, non-conformités et inachèvements allégués expressément dans l’assignation et appréciés au regard des documents contractuels.\n\nPoints de mission (à garder en toile de fond) :\n- préciser les liens contractuels entre intervenants ;\n- relever et décrire les désordres/malfaçons/inachèvements/non-conformités ;\n- en analyser causes, origine, étendue et imputations techniques possibles ;\n- apprécier les conséquences (solidité, habitabilité, esthétique, usage/destination) ;\n- dire si les travaux sont conformes aux documents contractuels et aux règles de l’art ;\n- proposer des solutions de reprise et apprécier leur coût au vu des devis ;\n- apprécier les préjudices motivés ;\n- le cas échéant : avis sur comptes, délais convenus, retards, pénalités, conditions d’interruption du chantier, valeur des travaux exécutés et restant à faire.\n\nRéunion analysée : première réunion d’expertise du 03 septembre 2025. La transcription relate les échanges et constatations opérées lors de cette réunion.\n\nTa tâche :\n1) Produire un COMPTE RENDU fidèle de la réunion (ouverture de mission, constats initiaux, points discutés, demandes de pièces, décisions de suite, organisation).\n2) Produire une LISTE DE SUJETS sous forme de tableau (Numero, Titre, Localisation, Description, Commentaire) prête à être exportée en .xls/.xlsx, sans ajouter de sujets non présents dans la transcription ou les photos.\n\nContraintes : neutralité, pas de noms propres, pas d’horodatage, aucune extrapolation au-delà de la transcription et des photos.",
+  "pcfixe": {
+    "fichier_transcription": "C:\\Affaires\\2025-J37\\AF_Expert_ASR\\transcriptions\\accedit-2025-09-02\\J37 Touzeau 02 09 2025_mono16_16000Hz(wav).csv",
+    "fichier_photos": "C:\\Affaires\\2025-J37\\AE_Expert_captations\\accedit-2025-09-02\\photos\\J37 Touzeau photos 02 09 2025.csv",
+    "fichier_photos_batch": "C:\\Affaires\\2025-J37\\AE_Expert_captations\\accedit-2025-09-02\\photos\\photos_batch.csv",
+    
+    "fichier_audio": "C:\\Affaires\\2025-J37\\AE_Expert_captations\\accedit-2025-09-02\\audio\\audio_compatible.wav",
+    "audio_compat_source": "C:\\Affaires\\2025-J37\\AE_Expert_captations\\accedit-2025-09-02\\audio\\J37 Touzeau 02 09 2025_mono16_16000Hz.wav",
+    
+    "fichier_audio_source": "C:\\Affaires\\2025-J37\\AE_Expert_captations\\accedit-2025-09-02\\audio\\J37 Touzeau 02 09 2025_mono16_16000Hz.wav",
+    "fichier_audio_compatible": "C:\\Affaires\\2025-J37\\AE_Expert_captations\\accedit-2025-09-02\\audio\\audio_compatible.wav",
+
+    "fichier_contexte_general": "C:\\Affaires\\2025-J37\\AF_Expert_ASR\\transcriptions\\accedit-2025-09-02\\contexte_general_photos.json",
+    "config_llm": "C:\\Affaires\\2025-J37\\AF_Expert_ASR\\transcriptions\\accedit-2025-09-02\\config_llm.json",
+    "out_dir": "C:\\Affaires\\2025-J37\\AE_Expert_captations\\accedit-2025-09-02\\audio\\out",
+    "boost_file": "D:\\GPT4All_Local\\config\\boost_vocab.txt",
+    "max_speakers": 6,
+    "proper_names_file": "C:\\Affaires\\2025-J37\\AF_Expert_ASR\\transcriptions\\accedit-2025-09-02\\proper_names.txt"
+  },  
+  "profil_execution": "pcfixe",
+  "id_affaire": "2025-J37",
+  "id_captation": "accedit-2025-09-02",
+  "audio_av": 45.0,
+  "audio_ap": 30.0,
+  "photo_depart": 2,
+  "audio_depart": "00:00:00",
+  "decalage_photo_audio": null,
+  "sync_points": [],
+  "plages_utilisees": {
+    "libelle": {
+      "avant": 45.0,
+      "apres": 30.0
+    },
+    "commentaire": {
+      "avant": 90.0,
+      "apres": 60.0
+    }
+  },
+  "horodatage_reference": "exif",
+  "dernier_point_sync": null,
+  "last_sync_update": null
+  }

@@ -1,0 +1,4 @@
+image_id;group
+img001.jpg;Cuisine
+img002.jpg;Cuisine
+img010.jpg;Salle_de_bains

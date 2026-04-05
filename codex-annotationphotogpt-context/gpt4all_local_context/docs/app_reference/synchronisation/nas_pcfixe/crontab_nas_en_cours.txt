@@ -1,0 +1,45 @@
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+# 🔁 Restauration automatique de la crontab (jours ouvrés + week-end)
+15 7 * * 1-5 /volume1/Web/cron-restore/update_crontab.sh >> /volume1/Web/logs/cron_restore.log 2>&1
+15 9 * * 6,0 /volume1/Web/cron-restore/update_crontab.sh >> /volume1/Web/logs/cron_restore.log 2>&1
+
+# 🔐 Renouvellement des certificats (après 07h, quotidien, idempotent)
+0 8 * * * flock -n /var/lock/renew_cert.lock sh -c 'sleep $((RANDOM%300)); /volume1/Web/certbot_config/renew_cert.sh' >> /var/log/renew_cert.log 2>&1
+
+# 📋 Vérification quotidienne des certificats (multi-domaines)
+25 8 * * * /volume1/Web/cron-restore/check_cert_status.sh >> /volume1/Web/logs/cert_status.log 2>&1
+
+# Cloudflare Tunnel (boot + healthcheck en journée)
+@reboot /volume1/home/nicolas/cloudflare_visible/test_tunnel_start.sh >> /volume1/home/nicolas/cloudflare_visible/cloudflared.log 2>&1
+*/30 7-23 * * * flock -n /var/lock/cloudflared.lock /volume1/home/nicolas/cloudflare_visible/validate_tunnel.sh >> /volume1/home/nicolas/cloudflare_visible/cloudflared.log 2>&1
+
+# Planinfcation synchronisation toutes les 2 heures entre PCfixe et NAS pour les Affaires
+10 */2 * * * flock -n /var/lock/sync_affaires.lock su -s /bin/sh - nicolas -c '/volume1/Web/Pilote_Affaires/scripts/sync_affaires.sh' >> /volume1/Web/logs/sync_affaires.log 2>&1
+
+# 🔎 Vérification de conformité de la crontab
+10 8 * * * /volume1/Web/cron-restore/check_crontab_status.sh >> /volume1/Web/logs/crontab_status.log 2>&1
+
+
+# 🚀 Relance composants essentiels après reboot NAS
+@reboot sh -c 'sleep 300; /volume1/Web/cron-restore/start_all.sh' >> /volume1/Web/logs/start_all.log 2>&1
+
+
+# 🧹 Nettoyage des logs >30 jours (dimanche 03:00)
+30 22 * * 0 /volume1/Web/cron-restore/clean_old_logs.sh >> /volume1/Web/logs/clean_old_logs.log 2>&1
+
+# (optionnel) forcer un check le 1er de chaque mois en journée
+30 11 1 * * flock -n /var/lock/renew_cert.lock /volume1/Web/certbot_config/renew_cert.sh >> /var/log/renew_cert.log 2>&1
+
+# --- ASUSTOR (conservée) ---
+0,1 0 * * * /usr/sbin/usermanutil -check_expiration
+
+0,1 0 * * * /usr/sbin/usermanutil -daily_midnight_check
+
+
+
+
+
+
+

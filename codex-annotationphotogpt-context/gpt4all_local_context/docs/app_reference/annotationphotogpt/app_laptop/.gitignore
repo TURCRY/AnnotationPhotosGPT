@@ -1,0 +1,40 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Copies / obsolètes
+* - Copie.py
+* ver 0.py
+*.pyobsolete
+
+# Archives
+*.zip
+
+# Runtime data
+data/uploads/
+data/temp/
+data/runtime/
+data/cache/
+
+# Fichiers métier lourds ou sensibles
+data/*.xlsx
+data/*.docx
+data/transcription.csv
+
+# Configs locales de travail
+config/copie_config_*/
+config/Fabrication*/
+config/fabrication*/
+
+# Build / packaging
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Streamlit local
+.streamlit/

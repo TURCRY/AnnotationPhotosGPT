@@ -1,0 +1,5 @@
+.\build_photos_for_index.ps1 `
+  -UiCsv   "C:\Affaires\2025-J37\AE_Expert_captations\accedit-2025-09-02\photos\J37 Touzeau photos 02 09 2025.csv" `
+  -GtpCsv  "C:\Affaires\2025-J37\AE_Expert_captations\accedit-2025-09-02\photos\J37 Touzeau photos 02 09 2025_GTP_20260123_1647.csv" `
+  -BatchCsv "C:\Affaires\2025-J37\AE_Expert_captations\accedit-2025-09-02\photos\photos_batch.csv" `
+  -OutCsv  "C:\Affaires\2025-J37\AE_Expert_captations\accedit-2025-09-02\photos\_vector\photos\photos_for_index.csv"

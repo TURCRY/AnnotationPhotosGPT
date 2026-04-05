@@ -1,0 +1,29 @@
+# Droit / procédure (si vos enregistrements en contiennent)
+expertise judiciaire
+référé
+ordonnance
+contradictoire
+dire
+sapiteur
+consignation
+
+# Construction / bâtiment
+DTU
+RGA
+fissuration
+désordre
+infiltration
+étanchéité
+reprise en sous-œuvre
+fondations
+maçonnerie
+descente d’eaux pluviales
+EU
+EP
+
+# Abréviations fréquentes
+R+1
+RDC
+SDB
+WC
+OPR

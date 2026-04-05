@@ -1,0 +1,11 @@
+curl.exe -X POST http://PCFIXE_LAN2:4891/vision/merge_structured_report `
+  -H "Authorization: Bearer VOTRE_CLE" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "style":"court",
+    "llm_model_name":"Qwen_2_5_14B",
+    "items":[
+      {"image_id":"img001.jpg","group":"Cuisine","raw_json":"{...}"},
+      {"image_id":"img002.jpg","group":"Cuisine","raw_json":"{...}"}
+    ]
+  }'

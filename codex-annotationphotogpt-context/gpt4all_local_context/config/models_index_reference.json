@@ -1,0 +1,606 @@
+{
+  "DeepSeek_R1_7B": {
+    "type": "llm",
+    "provider": "deepseek",
+    "file": "DeepSeek-R1-Distill-Qwen-7B-IQ2_M.gguf",
+    "original_filename": "DeepSeek-R1-Distill-Qwen-7B-IQ2_M.gguf",
+    "directory": "DeepSeek_R1_7B",
+    "manifest": {
+      "model_id": "DeepSeek_R1_7B",
+      "backend": "llama.cpp",
+      "original_filename": "DeepSeek-R1-Distill-Qwen-7B-IQ2_M.gguf",
+      "file": "DeepSeek-R1-Distill-Qwen-7B-IQ2_M.gguf",
+      "directory": "DeepSeek_R1_7B",
+      "quantization": "iq2_m",
+      "source": "local",
+      "comment": "Auto-generated with standard model name",
+      "commentaire": "Ajout par script"
+    }
+  },
+  "BGE_M3": {
+    "type": "embedding",
+    "provider": "BAAI",
+    "directory": "Embeddings/BGE_M3",
+    "file": null,
+    "manifest": {
+      "model_id": "BAAI/bge-m3",
+      "backend": "sentence-transformers",
+      "source": "huggingface",
+      "dims": 1024,
+      "comment": "BGE-M3 (dense/hybride). Très bon retrieval multilingue."
+    }
+  },
+  "E5_Multilingual_Large": {
+    "type": "embedding",
+    "provider": "intfloat",
+    "directory": "Embeddings/E5_Multilingual_Large",
+    "file": null,
+    "manifest": {
+      "model_id": "intfloat/multilingual-e5-large",
+      "backend": "sentence-transformers",
+      "source": "huggingface",
+      "dims": 1024,
+      "comment": "E5 large multilingue. Très bon pour RAG multi-langues."
+    }
+  },
+  "MiniLM_L6_v2": {
+    "type": "embedding",
+    "provider": "sentence-transformers",
+    "directory": "Embeddings/MiniLM_L6_v2",
+    "file": null,
+    "manifest": {
+      "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+      "backend": "sentence-transformers",
+      "source": "huggingface",
+      "dims": 384,
+      "comment": "Rapide, léger. Bon baseline en français/anglais."
+    }
+  },
+  "Nomic_Embed": {
+    "type": "embedding",
+    "provider": "nomic.ai",
+    "directory": "Nomic_Embed",
+    "file": null,
+    "manifest": {
+      "model_id": "nomic-embed-text-v1.5",
+      "backend": "python",
+      "source": "local",
+      "type": "embedding",
+      "provider": "nomic.ai",
+      "comment": "EModèle d'embeddings textuels de haute qualité pour la recherche sémantique et RAG. Compatible avec ChromaDB pour les bases de données vectorielles."
+    }
+  },
+  "Falcon3_10B": {
+    "type": "llm",
+    "provider": "tiiuae",
+    "file": "Falcon3-10B-Instruct-IQ2_M.gguf",
+    "original_filename": "Falcon3-10B-Instruct-IQ2_M.gguf",
+    "directory": "Falcon3_10B",
+    "manifest": {
+      "model_id": "Falcon3_10B",
+      "backend": "llama.cpp",
+      "original_filename": "Falcon3-10B-Instruct-IQ2_M.gguf",
+      "file": "Falcon3-10B-Instruct-IQ2_M.gguf",
+      "directory": "Falcon3_10B",
+      "quantization": "iq2_m",
+      "source": "local",
+      "comment": "Auto-generated with standard model name",
+      "commentaire": "Ajout par script"
+    }
+  },
+  "Gemma_3_1B": {
+    "type": "llm",
+    "provider": "google",
+    "file": "gemma-3-1b-it-Q4_K_M.gguf",
+    "original_filename": "gemma-3-1b-it-Q4_K_M.gguf",
+    "directory": "Gemma_3_1B",
+    "manifest": {
+      "model_id": "Gemma_3_1B",
+      "backend": "llama.cpp",
+      "original_filename": "gemma-3-1b-it-Q4_K_M.gguf",
+      "file": "gemma-3-1b-it-Q4_K_M.gguf",
+      "directory": "Gemma_3_1B",
+      "quantization": "q4_k_m",
+      "source": "local",
+      "comment": "Auto-generated with standard model name",
+      "commentaire": "Repo: unsloth/gemma-3-1b-it-GGUF"
+    }
+  },
+  "Gemma_3_4B": {
+    "type": "llm",
+    "provider": "google",
+    "file": "gemma-3-4b-it-Q4_K_M.gguf",
+    "original_filename": "gemma-3-4b-it-Q4_K_M.gguf",
+    "directory": "Gemma_3_4B",
+    "manifest": {
+      "model_id": "Gemma_3_4B",
+      "backend": "llama.cpp",
+      "original_filename": "gemma-3-4b-it-Q4_K_M.gguf",
+      "file": "gemma-3-4b-it-Q4_K_M.gguf",
+      "directory": "Gemma_3_4B",
+      "quantization": "q4_k_m",
+      "source": "local",
+      "comment": "Auto-generated with standard model name",
+      "commentaire": "Repo: unsloth/gemma-3-4b-it-GGUF"
+    }
+  },
+  "Gemma_3_Nano": {
+    "type": "llm",
+    "provider": "google",
+    "file": "gemma-3-270m-it-qat-Q4_K_M.gguf",
+    "original_filename": "gemma-3-270m-it-qat-Q4_K_M.gguf",
+    "directory": "Gemma_3_Nano",
+    "manifest": {
+      "model_id": "Gemma_3_Nano",
+      "backend": "llama.cpp",
+      "original_filename": "gemma-3-270m-it-qat-Q4_K_M.gguf",
+      "file": "gemma-3-270m-it-qat-Q4_K_M.gguf",
+      "directory": "Gemma_3_Nano",
+      "quantization": "q4_k_m",
+      "source": "local",
+      "comment": "Auto-generated with standard model name",
+      "commentaire": "Repo: unsloth/gemma-3-270m-it-qat-GGUF"
+    }
+  },
+  "Gemma_7B": {
+    "type": "llm",
+    "provider": "google",
+    "file": "Gemma_7B.gguf",
+    "original_filename": "gemma-7b.Q4_K_M.gguf",
+    "directory": "Gemma_7B",
+    "manifest": {
+      "model_id": "Gemma_7B",
+      "backend": "llama.cpp",
+      "original_filename": "gemma-7b.Q4_K_M.gguf",
+      "quantization": "gemma-7b",
+      "file": "Gemma_7B.gguf",
+      "directory": "Gemma_7B",
+      "source": "local",
+      "comment": "Auto-generated with standard model name",
+      "commentaire": "Analyse de tendances"
+    }
+  },
+  "LLaMA_2_7B": {
+    "type": "llm",
+    "provider": "meta",
+    "file": "LLaMA_2_7B.gguf",
+    "original_filename": "llama-2-7b-chat.Q4_K_M.gguf",
+    "directory": "LLaMA_2_7B",
+    "manifest": {
+      "model_id": "LLaMA_2_7B",
+      "backend": "llama.cpp",
+      "original_filename": "llama-2-7b-chat.Q4_K_M.gguf",
+      "file": "LLaMA_2_7B.gguf",
+      "directory": "LLaMA_2_7B",
+      "quantization": "llama-2-7b-chat",
+      "source": "local",
+      "comment": "Auto-generated with standard model name",
+      "commentaire": "Version chat optimisée du célèbre LLaMA 2 de Meta. Excellent pour le dialogue et l'assistance conversationnelle avec des ressources modérées."
+    }
+  },
+  "LLaMA_3_2_1B": {
+    "type": "llm",
+    "provider": "meta",
+    "file": "Llama-3.2-1B-Instruct-IQ3_M.gguf",
+    "original_filename": "Llama-3.2-1B-Instruct-IQ3_M.gguf",
+    "directory": "LLaMA_3_2_1B",
+    "manifest": {
+      "model_id": "LLaMA_3_2_1B",
+      "backend": "llama.cpp",
+      "original_filename": "Llama-3.2-1B-Instruct-IQ3_M.gguf",
+      "file": "Llama-3.2-1B-Instruct-IQ3_M.gguf",
+      "directory": "LLaMA_3_2_1B",
+      "quantization": "iq3_m",
+      "source": "local",
+      "comment": "Auto-generated with standard model name",
+      "commentaire": "Ajout par script"
+    }
+  },
+  "LLaMA_3_2_3B": {
+    "type": "llm",
+    "provider": "meta",
+    "file": "Llama-3.2-3B-Instruct-IQ3_M.gguf",
+    "original_filename": "Llama-3.2-3B-Instruct-IQ3_M.gguf",
+    "directory": "LLaMA_3_2_3B",
+    "manifest": {
+      "model_id": "LLaMA_3_2_3B",
+      "backend": "llama.cpp",
+      "original_filename": "Llama-3.2-3B-Instruct-IQ3_M.gguf",
+      "file": "Llama-3.2-3B-Instruct-IQ3_M.gguf",
+      "directory": "LLaMA_3_2_3B",
+      "quantization": "iq3_m",
+      "source": "local",
+      "comment": "Auto-generated with standard model name",
+      "commentaire": "Ajout par script"
+    }
+  },
+  "LLaMA_3_8B": {
+    "type": "llm",
+    "provider": "meta",
+    "file": "LLaMA_3_8B.gguf",
+    "original_filename": "Meta-Llama-3-8B-Instruct-Q4_K_M.gguf",
+    "directory": "LLaMA_3_8B",
+    "manifest": {
+      "model_id": "LLaMA_3_8B",
+      "backend": "llama.cpp",
+      "original_filename": "Meta-Llama-3-8B-Instruct-Q4_K_M.gguf",
+      "file": "LLaMA_3_8B.gguf",
+      "directory": "LLaMA_3_8B",
+      "quantization": "4_K_M",
+      "source": "local",
+      "comment": "Auto-generated with standard model name",
+      "commentaire": "Dernière génération LLaMA de Meta avec des performances améliorées. Très polyvalent pour instruction-following et génération créativeRésumés (le plus performant)"
+    }
+  },
+  "MiniCPM_V_2_6": {
+    "type": "llm",
+    "provider": "openbmb",
+    "file": "ggml-model-IQ3_M.gguf",
+    "original_filename": "ggml-model-IQ3_M.gguf",
+    "directory": "MiniCPM_V_2_6",
+    "manifest": {
+      "model_id": "MiniCPM_V_2_6",
+      "backend": "llama.cpp",
+      "original_filename": "ggml-model-IQ3_M.gguf",
+      "file": "ggml-model-IQ3_M.gguf",
+      "directory": "MiniCPM_V_2_6",
+      "quantization": "iq3_m",
+      "source": "local",
+      "comment": "Auto-generated with standard model name",
+      "commentaire": "Repo: openbmb/MiniCPM-V-2_6-gguf"
+    }
+  },
+  "Mistral_7B": {
+    "type": "llm",
+    "provider": "mistral",
+    "file": "Mistral_7B.gguf",
+    "original_filename": "mistral-7b-instruct-v0.1.Q4_0.gguf",
+    "directory": "Mistral_7B",
+    "manifest": {
+      "model_id": "Mistral_7B",
+      "backend": "llama.cpp",
+      "original_filename": "mistral-7b-instruct-v0.1.Q4_0.gguf",
+      "file": "Mistral_7B.gguf",
+      "directory": "Mistral_7B",
+      "quantization": "mistral-7b-instruct-v0",
+      "source": "local",
+      "comment": "Auto-generated with standard model name",
+      "commentaire": "Modèle français haute performance de Mistral AI. Excellent pour les tâches en français et multilingues, très efficace en ressources."
+    }
+  },
+  "Phi_3_Mini_3_8B": {
+    "type": "llm",
+    "provider": "microsoft",
+    "file": "Phi-3-mini-4k-instruct-Q4_K_M.gguf",
+    "original_filename": "Phi-3-mini-4k-instruct-Q4_K_M.gguf",
+    "directory": "Phi_3_Mini_3_8B",
+    "manifest": {
+      "model_id": "Phi_3_Mini_3_8B",
+      "backend": "llama.cpp",
+      "original_filename": "Phi-3-mini-4k-instruct-Q4_K_M.gguf",
+      "file": "Phi-3-mini-4k-instruct-Q4_K_M.gguf",
+      "directory": "Phi_3_Mini_3_8B",
+      "quantization": "q4_k_m",
+      "source": "local",
+      "comment": "Auto-generated with standard model name",
+      "commentaire": "Repo: bartowski/Phi-3-mini-4k-instruct-GGUF"
+    }
+  },
+  "Phi-2_7B": {
+    "type": "llm",
+    "provider": "microsoft",
+    "file": "Phi-2_7B.gguf",
+    "original_filename": "phi-2.Q4_K_M.gguf",
+    "directory": "Phi-2_7B",
+    "manifest": {
+      "model_id": "Phi-2_7B",
+      "backend": "llama.cpp",
+      "original_filename": "phi-2.Q4_K_M.gguf",
+      "file": "Phi-2_7B.gguf",
+      "directory": "Phi-2_7B",
+      "quantization": "phi-2",
+      "source": "local",
+      "comment": "Auto-generated with standard model name",
+      "commentaire": "Petit modèle puissant de Microsoft, spécialisé dans le raisonnement et les tâches de codage. Compact mais performant."
+    }
+  },
+  "Qwen_2_5_0_5B": {
+    "type": "llm",
+    "provider": "qwen",
+    "file": "qwen2.5-0.5b-instruct-q5_k_m.gguf",
+    "original_filename": "qwen2.5-0.5b-instruct-q5_k_m.gguf",
+    "directory": "Qwen_2_5_0_5B",
+    "manifest": {
+      "model_id": "Qwen_2_5_0_5B",
+      "backend": "llama.cpp",
+      "original_filename": "qwen2.5-0.5b-instruct-q5_k_m.gguf",
+      "file": "qwen2.5-0.5b-instruct-q5_k_m.gguf",
+      "directory": "Qwen_2_5_0_5B",
+      "quantization": "q5_k_m",
+      "source": "local",
+      "comment": "Auto-generated with standard model name",
+      "commentaire": "Ajout par script"
+    }
+  },
+  "Qwen_2_5_14B": {
+    "type": "llm",
+    "provider": "qwen",
+    "file": "Qwen2.5-14B-Instruct-Q5_K_M.gguf",
+    "original_filename": "Qwen2.5-14B-Instruct-Q5_K_M.gguf",
+    "directory": "Qwen_2_5_14B",
+    "manifest": {
+      "model_id": "Qwen_2_5_14B",
+      "backend": "llama.cpp",
+      "original_filename": "Qwen2.5-14B-Instruct-Q5_K_M.gguf",
+      "file": "Qwen2.5-14B-Instruct-Q5_K_M.gguf",
+      "directory": "Qwen_2_5_14B",
+      "quantization": "q5_k_m",
+      "source": "local",
+      "comment": "Auto-generated with standard model name",
+      "commentaire": "Ajout par script"
+    }
+  },
+  "SmallThinker_3B": {
+    "type": "llm",
+    "provider": "openaccess-ai",
+    "file": "SmallThinker-3B-Preview-Q4_K_M.gguf",
+    "original_filename": "SmallThinker-3B-Preview-Q4_K_M.gguf",
+    "directory": "SmallThinker_3B",
+    "manifest": {
+      "model_id": "SmallThinker_3B",
+      "backend": "llama.cpp",
+      "original_filename": "SmallThinker-3B-Preview-Q4_K_M.gguf",
+      "file": "SmallThinker-3B-Preview-Q4_K_M.gguf",
+      "directory": "SmallThinker_3B",
+      "quantization": "q4_k_m",
+      "source": "local",
+      "comment": "Auto-generated with standard model name",
+      "commentaire": "Repo: bartowski/SmallThinker-3B-Preview-GGUF"
+    }
+  },
+  "OpenCV_Tesseract_OCR": {
+    "type": "tool",
+    "provider": "local",
+    "directory": "Tesseract",
+    "file": null,
+    "manifest": {
+      "backend": "opencv+tesseract",
+      "tessdata_dir": "Tesseract/tessdata",
+      "languages": [
+        "fra",
+        "eng"
+      ],
+      "comment": "Pipeline OCR (prétraitement OpenCV) + Tesseract 4"
+    }
+  },
+  "Voxtral_Mini_3B_Transformers": {
+    "type": "asr",
+    "provider": "mistral",
+    "directory": "Voxtral/Voxtral-Mini-3B-2507",
+    "file": "model.safetensors.index.json",
+    "manifest": {
+      "model_id": "mistralai/Voxtral-Mini-3B-2507",
+      "size": "3B",
+      "backend": "transformers",
+      "source": "huggingface",
+      "comment": "Modèle audio compact de Mistral pour transcription et instructions vocales. Léger et adapté aux configurations avec ressources limitées."
+    }
+  },
+  "Voxtral_Small_24B_Transformers": {
+    "type": "asr",
+    "provider": "mistral",
+    "directory": "Voxtral/Voxtral-Small-24B-2507",
+    "file": "model.safetensors.index.json",
+    "manifest": {
+      "model_id": "mistralai/Voxtral-Small-24B-2507",
+      "size": "24B",
+      "backend": "transformers",
+      "source": "huggingface",
+      "comment": "Modèle audio avancé de Mistral avec capacités étendues. Requiert une GPU performante mais offre une qualité de transcription supérieure."
+    }
+  },
+  "SmolVLM2_2B": {
+    "type": "llm",
+    "provider": "HuggingFaceTB/ggml-org",
+    "directory": "SmolVLM2_2B",
+    "file": "SmolVLM2-2.2B-Instruct-Q4_K_M.gguf",
+    "original_filename": "SmolVLM2-2.2B-Instruct-Q4_K_M.gguf",
+    "mmproj": "mmproj-SmolVLM2-2.2B-Instruct-f16.gguf",
+    "capabilities": {
+      "vision": true,
+      "text": true
+    },
+    "manifest": {
+      "model_id": "SmolVLM2_2B",
+      "backend": "llama.cpp",
+      "directory": "SmolVLM2_2B",
+      "file": "SmolVLM2-2.2B-Instruct-Q4_K_M.gguf",
+      "mmproj": "mmproj-SmolVLM2-2.2B-Instruct-f16.gguf",
+      "quantization": "q4_k_m",
+      "source": "local",
+      "comment": "Auto-generated VLM entry",
+      "commentaire": "Ajout par script. Repo: ggml-org/SmolVLM2-2.2B-Instruct-GGUF",
+      "notes": ""
+    }
+  },
+  "Qwen2_VL_7B": {
+    "type": "llm",
+    "provider": "Qwen/bartowski",
+    "directory": "Qwen2_VL_7B",
+    "file": "Qwen2-VL-7B-Instruct-Q4_K_M.gguf",
+    "original_filename": "Qwen2-VL-7B-Instruct-Q4_K_M.gguf",
+    "mmproj": "mmproj-Qwen2-VL-7B-Instruct-f16.gguf",
+    "capabilities": {
+      "vision": true,
+      "text": true
+    },
+    "manifest": {
+      "model_id": "Qwen2_VL_7B",
+      "backend": "llama.cpp",
+      "directory": "Qwen2_VL_7B",
+      "file": "Qwen2-VL-7B-Instruct-Q4_K_M.gguf",
+      "mmproj": "mmproj-Qwen2-VL-7B-Instruct-f16.gguf",
+      "quantization": "q4_k_m",
+      "source": "local",
+      "comment": "Auto-generated VLM entry",
+      "commentaire": "Ajout par script. Repo: bartowski/Qwen2-VL-7B-Instruct-GGUF",
+      "notes": ""
+    }
+  },
+  "Pixtral_12B": {
+    "type": "llm",
+    "provider": "mistral-community/ggml-org",
+    "directory": "Pixtral_12B",
+    "file": "pixtral-12b-Q4_K_M.gguf",
+    "original_filename": "pixtral-12b-Q4_K_M.gguf",
+    "mmproj": "mmproj-pixtral-12b-f16.gguf",
+    "capabilities": {
+      "vision": true,
+      "text": true
+    },
+    "manifest": {
+      "model_id": "Pixtral_12B",
+      "backend": "llama.cpp",
+      "directory": "Pixtral_12B",
+      "file": "pixtral-12b-Q4_K_M.gguf",
+      "mmproj": "mmproj-pixtral-12b-f16.gguf",
+      "quantization": "q4_k_m",
+      "source": "local",
+      "comment": "Auto-generated VLM entry",
+      "commentaire": "Ajout par script. Repo: ggml-org/pixtral-12b-GGUF",
+      "notes": ""
+    }
+  },
+  "Phi_3_5_Vision": {
+    "type": "llm",
+    "provider": "microsoft/abetlen",
+    "directory": "Phi_3_5_Vision",
+    "file": "Phi-3.5-3.8B-vision-instruct-Q8_0.gguf",
+    "original_filename": "Phi-3.5-3.8B-vision-instruct-Q8_0.gguf",
+    "mmproj": "Phi-3.5-3.8B-vision-instruct-mmproj-F16.gguf",
+    "capabilities": {
+      "vision": true,
+      "text": true
+    },
+    "manifest": {
+      "model_id": "Phi_3_5_Vision",
+      "backend": "llama.cpp",
+      "directory": "Phi_3_5_Vision",
+      "file": "Phi-3.5-3.8B-vision-instruct-Q8_0.gguf",
+      "mmproj": "Phi-3.5-3.8B-vision-instruct-mmproj-F16.gguf",
+      "quantization": "q8_0",
+      "source": "local",
+      "comment": "Auto-generated VLM entry",
+      "commentaire": "Ajout par script. Repo: abetlen/Phi-3.5-vision-instruct-gguf",
+      "notes": "Repo indiqué comme work-in-progress (compatibilité llama.cpp à vérifier)."
+    }
+  },
+  "Florence_2": {
+    "type": "vision",
+    "provider": "microsoft/onnx-community",
+    "directory": "Florence_2",
+    "backend": "onnxruntime",
+    "capabilities": {
+      "vision": true,
+      "text": true
+    },
+    "manifest": {
+      "model_id": "Florence_2",
+      "backend": "onnxruntime",
+      "directory": "Florence_2",
+      "source": "local",
+      "comment": "Auto-generated Florence-2 ONNX entry",
+      "commentaire": "Ajout par script. Repo: onnx-community/Florence-2-base"
+    }
+  },
+  "GPT_OSS_20B_4BIT": {
+    "type": "llm",
+    "provider": "openai (quant: bartowski)",
+    "directory": "GPT_OSS_20B_4BIT",
+    "file": "openai_gpt-oss-20b-IQ3_M.gguf",
+    "original_filename": "openai_gpt-oss-20b-IQ3_M.gguf",
+    "capabilities": {
+      "vision": false,
+      "text": true
+    },
+    "manifest": {
+      "model_id": "GPT_OSS_20B_4BIT",
+      "backend": "llama.cpp",
+      "directory": "GPT_OSS_20B_4BIT",
+      "file": "openai_gpt-oss-20b-IQ3_M.gguf",
+      "quantization": "iq3_m",
+      "source": "local",
+      "comment": "Auto-generated LLM entry",
+      "commentaire": "Ajout par script. Repo: bartowski/openai_gpt-oss-20b-GGUF",
+      "notes": "LLM texte (pas VLM). Quantification 4-bit MXFP4."
+    }
+  },
+  "Qwen_2_5_3B": {
+    "type": "llm",
+    "provider": "qwen/bartowski",
+    "directory": "Qwen_2_5_3B",
+    "file": "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+    "original_filename": "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+    "capabilities": {
+      "vision": false,
+      "text": true
+    },
+    "manifest": {
+      "model_id": "Qwen_2_5_3B",
+      "backend": "llama.cpp",
+      "directory": "Qwen_2_5_3B",
+      "file": "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+      "quantization": "q4_k_m",
+      "source": "local",
+      "comment": "Auto-generated LLM entry",
+      "commentaire": "Ajout par script. Repo: bartowski/Qwen2.5-3B-Instruct-GGUF",
+      "notes": ""
+    }
+  },
+  "Qwen_2_5_VL_3B": {
+    "type": "llm",
+    "provider": "qwen/ggml-org",
+    "directory": "Qwen_2_5_VL_3B",
+    "file": "Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf",
+    "original_filename": "Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf",
+    "mmproj": "mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf",
+    "capabilities": {
+      "vision": true,
+      "text": true
+    },
+    "manifest": {
+      "model_id": "Qwen_2_5_VL_3B",
+      "backend": "llama.cpp",
+      "directory": "Qwen_2_5_VL_3B",
+      "file": "Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf",
+      "mmproj": "mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf",
+      "quantization": "q4_k_m",
+      "source": "local",
+      "comment": "Auto-generated VLM entry",
+      "commentaire": "Ajout par script. Repo: ggml-org/Qwen2.5-VL-3B-Instruct-GGUF",
+      "notes": ""
+    }
+  },
+  "Mistral_7B_Instruct_v0_3": {
+    "type": "llm",
+    "provider": "mistral (GGUF community)",
+    "directory": "Mistral_7B_Instruct_v0_3",
+    "file": "Mistral-7B-Instruct-v0.3.Q4_K_M.gguf",
+    "original_filename": "Mistral-7B-Instruct-v0.3.Q4_K_M.gguf",
+    "capabilities": {
+      "vision": false,
+      "text": true
+    },
+    "manifest": {
+      "model_id": "Mistral_7B_Instruct_v0_3",
+      "backend": "llama.cpp",
+      "directory": "Mistral_7B_Instruct_v0_3",
+      "file": "Mistral-7B-Instruct-v0.3.Q4_K_M.gguf",
+      "quantization": "q4_k_m",
+      "source": "local",
+      "comment": "Auto-generated LLM entry",
+      "commentaire": "Ajout par script. Repo: MaziyarPanahi/Mistral-7B-Instruct-v0.3-GGUF",
+      "notes": "Mistral-7B-Instruct v0.3 en Q4_K_M (GGUF)."
+    }
+  }
+}

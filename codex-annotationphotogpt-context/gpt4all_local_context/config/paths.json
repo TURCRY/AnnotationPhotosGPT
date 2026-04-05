@@ -1,0 +1,8 @@
+{
+  "MODELS_PATH": "C:/GPT4All_Models",
+  "CHROMA_BASE": "C:/Chroma_DB",
+  "RAG_BASE": "C:/Dossier_RAG",
+  "LOG_DIR": "D:/GPT4All_Local/logs",
+  "SYSTEM_PROMPT_PATH": "C:/LLM_Assistant/config/system_prompt.json",
+  "CONFIG_PATH": "D:/GPT4All_Local/config/config.json"
+}

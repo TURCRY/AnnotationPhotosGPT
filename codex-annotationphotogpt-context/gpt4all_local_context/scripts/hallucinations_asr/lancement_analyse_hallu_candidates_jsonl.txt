@@ -1,0 +1,1 @@
+python D:\GPT4All_Local\scripts\hallucinations_asr\analyse_hallu_candidates_jsonl.py --jsonl "D:\GPT4All_Local\config\hallu_candidates.jsonl" --patterns "D:\GPT4All_Local\config\hallu_patterns_v2.json" --out "D:\GPT4All_Local\config\_hallu_out"

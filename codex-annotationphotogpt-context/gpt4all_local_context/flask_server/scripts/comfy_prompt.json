@@ -1,0 +1,15 @@
+{
+  "prompt": {
+    "1": { "class_type": "CheckpointLoaderSimple", "inputs": { "ckpt_name": "sd15\\v1-5-pruned.safetensors" } },
+    "2": { "class_type": "CLIPTextEncode",        "inputs": { "text": "facade XIXe, morning light", "clip": ["1", 1] } },
+    "3": { "class_type": "CLIPTextEncode",        "inputs": { "text": "blurry, artifacts",          "clip": ["1", 1] } },
+    "4": { "class_type": "EmptyLatentImage",      "inputs": { "width": 768, "height": 768, "batch_size": 1 } },
+    "5": { "class_type": "KSampler",              "inputs": {
+            "seed": 1234, "steps": 20, "cfg": 6.5, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
+            "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["4", 0]
+    } },
+    "6": { "class_type": "VAEDecode",             "inputs": { "samples": ["5", 0], "vae": ["1", 2] } },
+    "7": { "class_type": "SaveImage",             "inputs": { "images": ["6", 0], "filename_prefix": "ps_test_" } }
+  },
+  "client_id": "ps_test"
+}

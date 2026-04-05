@@ -1,0 +1,24 @@
+{
+  "image_id": "img_001.jpg",
+  "observations": [
+    {
+      "fait": "Présence d’une trace d’humidité sombre sur le mur",
+      "categorie": "dégradation",
+      "localisation": "mur bas, partie gauche",
+      "indices_visuels": [
+        "zone plus sombre",
+        "contours irréguliers"
+      ],
+      "certitude": "élevée",
+      "commentaire": "Aucune origine visible sur l’image"
+    }
+  ],
+  "elements_absents_remarquables": [
+    "Aucune fuite apparente",
+    "Aucune canalisation visible à proximité immédiate"
+  ],
+  "limites_analyse": [
+    "Angle de prise de vue partiel",
+    "Éclairage insuffisant"
+  ]
+}

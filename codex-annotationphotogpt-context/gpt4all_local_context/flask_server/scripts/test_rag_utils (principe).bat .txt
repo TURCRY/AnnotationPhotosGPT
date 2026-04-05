@@ -1,0 +1,3 @@
+cd D:\GPT4All_Local\flask_server\scripts
+python test_rag_utils.py --dossier "C:/MonProjet/dossier_rag" --mode texte
+python test_rag_utils.py --dossier "C:/MonProjet/dossier_rag" --mode blocs
