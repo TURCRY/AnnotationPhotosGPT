@@ -3,6 +3,8 @@ import streamlit as st
 import json
 from pathlib import Path
 
+from utils import sauvegarder_infos_projet
+
 INFOS_PROJET_PATH = "data/infos_projet.json"
 
 def init_project_interface():
@@ -66,8 +68,7 @@ def init_project_interface():
                     "temperature": temperature
                 }
                 Path("data").mkdir(exist_ok=True)
-                with open(INFOS_PROJET_PATH, "w", encoding="utf-8") as f:
-                    json.dump(infos, f, ensure_ascii=False, indent=2)
+                sauvegarder_infos_projet(infos)
                 st.success("Paramètres enregistrés avec succès.")
             except Exception as e:
                 st.error(f"Erreur lors de l'enregistrement : {e}")
