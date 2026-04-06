@@ -1,8 +1,0 @@
-{
-  "enabled": true,
-  "hf_token": null,
-  "max_speakers": 8,
-  "min_speaker_duration": 0.35,
-  "collar": 0.1,
-  "allow_overlap": false
-}

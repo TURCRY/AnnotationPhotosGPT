@@ -1,5 +1,0 @@
-/volume1/home/nicolas/Docker/openai-adapter/
-├── docker-compose.yml
-├── .env
-├── requirements.txt
-└── adapter.py

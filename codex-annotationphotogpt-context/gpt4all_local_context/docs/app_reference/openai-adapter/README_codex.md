@@ -1,9 +1,0 @@
-docs/app_reference/openai-adapter/
-    README_codex.md
-    adapter.py
-    config_remote.json
-    adapter_openai_models_priced.json
-    requirements.txt
-    docker-compose.yml
-    Dockerfile
-    architecture.txt

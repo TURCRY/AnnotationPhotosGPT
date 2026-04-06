@@ -1,5 +1,0 @@
-run_all_photos_pcfixe.bat "C:\Affaires\2025-J37\AF_Expert_ASR\transcriptions\accedit-2025-09-02\infos_projet.json" --dry-run 1 --vlm-strict 1
-
-
-
-run_all_photos_pcfixe.bat "C:\Affaires\2025-J37\AF_Expert_ASR\transcriptions\accedit-2025-09-02\infos_projet.json" --vlm-strict 1 --limit 10

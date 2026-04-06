@@ -1,4 +1,0 @@
-python analyse_hallu_ds_1csv.py ^
-  --csv "C:\Affaires\2025-J37\AF_Expert_ASR\transcriptions\accedit-2025-09-02\J37 Touzeau 02 09 2025_mono16_16000Hz(wav).csv" ^
-  --patterns "D:\GPT4All_Local\config\hallu_patterns.json" ^
-  --out "D:\GPT4All_Local\config\_hallu_out"
