@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import os
+import shutil
 from datetime import datetime, timedelta
 from utils import (
     lire_infos_projet, sauvegarder_infos_projet,
@@ -52,6 +53,68 @@ def _save_photos(df, path):
         df.to_excel(p, index=False, engine="openpyxl")
     else:
         df.to_csv(p, sep=";", index=False, encoding="utf-8-sig")
+
+
+def _regularize_photos_outputs_and_copy(infos, fichier_photos, df):
+    src = str(fichier_photos or "").strip()
+    if not src:
+        return
+
+    src_path = Path(src)
+    if not src_path.exists():
+        return
+
+    st.info(f"Fichier effectivement ecrit par la synchro : `{src_path}`")
+
+    canonical_csv = src_path if src_path.suffix.lower() == ".csv" else src_path.with_suffix(".csv")
+    aligned_paths = []
+
+    try:
+        if canonical_csv != src_path:
+            canonical_csv.parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(canonical_csv, sep=";", index=False, encoding="utf-8-sig")
+            aligned_paths.append(canonical_csv)
+    except Exception as e:
+        st.warning(f"Realignement du CSV canonique impossible : {e}")
+
+    xlsx_twin = canonical_csv.with_suffix(".xlsx")
+    try:
+        xlsx_twin.parent.mkdir(parents=True, exist_ok=True)
+        df.to_excel(xlsx_twin, index=False, engine="openpyxl")
+        aligned_paths.append(xlsx_twin)
+        st.info(f"Jumeau Excel de reference : `{xlsx_twin}`")
+    except Exception as e:
+        st.warning(f"Realignement du jumeau Excel de reference impossible : {e}")
+
+    for aligned_path in aligned_paths:
+        st.info(f"Jumeau realigne : `{aligned_path}`")
+
+    pcfixe = infos.get("pcfixe") or {}
+    root_affaires = str(pcfixe.get("root_affaires") or "").strip()
+    if not root_affaires.startswith("\\\\"):
+        root_affaires = r"\\192.168.0.155\Affaires"
+
+    id_affaire = str(infos.get("id_affaire") or "").strip()
+    id_captation = str(infos.get("id_captation") or "").strip()
+    if not id_affaire or not id_captation:
+        return
+
+    dst_path = Path(root_affaires) / id_affaire / "AE_Expert_captations" / id_captation / "photos" / "photos.csv"
+    st.info(f"Cible de copie PC fixe (UNC) : `{dst_path}`")
+
+    copy_src = canonical_csv if canonical_csv.exists() else src_path
+
+    try:
+        if copy_src.resolve() == dst_path.resolve():
+            return
+    except Exception:
+        pass
+
+    try:
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(copy_src, dst_path)
+    except Exception as e:
+        st.warning(f"Copie photos.csv vers PC fixe impossible : {e}")
 
 
 def ss_default(key, value):
@@ -366,6 +429,7 @@ def show_sync_interface():
                     photos_df[col] = pd.to_numeric(photos_df[col], errors="coerce")
 
             _save_photos(photos_df, fichier_photos)
+            _regularize_photos_outputs_and_copy(infos, fichier_photos, photos_df)
 
             # ⚠️ NE PLUS TOUCHER à photo_depart / audio_depart
             # On ne fait que marquer le calibrage comme invalide
@@ -471,6 +535,7 @@ def show_sync_interface():
 
             # 3) Sauvegarde en floats (pas de conversion en texte)
             _save_photos(photos_df, fichier_photos)
+            _regularize_photos_outputs_and_copy(infos, fichier_photos, photos_df)
 
 # -------------------------------------------------------------
 
