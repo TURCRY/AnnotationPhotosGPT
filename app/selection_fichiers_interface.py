@@ -8,6 +8,7 @@ import streamlit as st
 import glob
 
 from utils import lire_infos_projet, sauvegarder_infos_projet
+from affaire_creation_client import create_affaire_server_compatible
 
 from traitement_audio import (
     traiter_fichier_audio_selectionne,
@@ -26,6 +27,7 @@ from datetime import datetime
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 UPLOADS_DIR = os.path.join(BASE_DIR, "data", "uploads")
 TEMP_DIR = os.path.join(BASE_DIR, "data", "temp")
+AFFAIRES_ROOT = r"C:\Affaires"
 AUDIO_EXT = {".wav", ".mp3"}
 UI_DEFAULTS = {
     "photo_rel_native": "",
@@ -118,6 +120,171 @@ def _load_csv_flexible(path: str) -> pd.DataFrame:
         raise last_err
     raise RuntimeError(f"Impossible de lire le CSV : {path}")
 
+def _propose_photos_batch_path(photos_real: str) -> str:
+    """Propose le photos_batch.csv à partir du photos.csv réellement sélectionné."""
+    photos_real = _real_or_empty(photos_real)
+    if not photos_real:
+        return ""
+
+    photos_csv = Path(os.path.abspath(photos_real))
+
+    # Cas canonique attendu : .../<id_captation>/photos/photos.csv -> .../photos/photos_batch.csv
+    try:
+        parts_lower = [part.lower() for part in photos_csv.parts]
+        if (
+            photos_csv.name.lower().endswith(".csv")
+            and "ae_expert_captations" in parts_lower
+            and "photos" in parts_lower
+        ):
+            return str(photos_csv.with_name("photos_batch.csv"))
+    except Exception:
+        pass
+
+    # Fallback simple et sûr : même dossier que le CSV photos courant.
+    return str(photos_csv.with_name("photos_batch.csv"))
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+
+def _build_pcfixe_paths(id_affaire: str, id_captation: str) -> dict:
+    root = Path(AFFAIRES_ROOT) / id_affaire
+    base_cap = root / "AE_Expert_captations" / id_captation
+    trans_dir = root / "AF_Expert_ASR" / "transcriptions" / id_captation
+    return {
+        "root_affaire": root,
+        "photos_dir": base_cap / "photos",
+        "audio_dir": base_cap / "audio",
+        "trans_dir": trans_dir,
+        "config_llm": trans_dir / "config_llm.json",
+        "prompt_gpt": trans_dir / "prompt_gpt.json",
+        "prompt_gpt_batch": trans_dir / "prompt_gpt_batch_only.json",
+        "infos": trans_dir / "infos_projet.json",
+    }
+
+def _list_subdirs(path: Path) -> set[str]:
+    if not path.is_dir():
+        return set()
+    try:
+        return {p.name for p in path.iterdir() if p.is_dir()}
+    except Exception:
+        return set()
+
+def _discover_captations_for_affaire(id_affaire: str) -> list[dict]:
+    root = Path(AFFAIRES_ROOT) / id_affaire
+    ae_root = root / "AE_Expert_captations"
+    af_root = root / "AF_Expert_ASR" / "transcriptions"
+    be_root = root / "BE_Traitement_captations"
+
+    ae_ids = _list_subdirs(ae_root)
+    af_ids = _list_subdirs(af_root)
+    be_ids = _list_subdirs(be_root)
+
+    rows = []
+    for cap in sorted(ae_ids | af_ids | be_ids):
+        has_ae = cap in ae_ids
+        has_af = cap in af_ids
+        has_be = cap in be_ids
+        rows.append({
+            "id_captation": cap,
+            "has_ae": has_ae,
+            "has_af": has_af,
+            "has_be": has_be,
+            "label": f"{cap}  [{'AE' if has_ae else '-'}|{'AF' if has_af else '-'}|{'BE' if has_be else '-'}]",
+        })
+
+    rows.sort(key=lambda r: (not r["has_ae"], r["id_captation"].lower()))
+    return rows
+
+def _build_snapshot_infos(infos: dict, temp: dict, id_affaire: str, id_captation: str) -> dict:
+    snapshot = dict(infos or {})
+    paths = _build_pcfixe_paths(id_affaire, id_captation)
+
+    photos_real = _real_or_empty(temp.get("fichier_photos_reel", "")) or str(snapshot.get("fichier_photos", "") or "").strip()
+    trans_real = _real_or_empty(temp.get("fichier_transcription_reel", "")) or str(snapshot.get("fichier_transcription", "") or "").strip()
+    audio_src_real = _real_or_empty(temp.get("fichier_audio_source", "")) or str(snapshot.get("fichier_audio_source", "") or "").strip()
+    ctx_real = _real_or_empty(temp.get("fichier_contexte_general_reel", "")) or str(snapshot.get("fichier_contexte_general", "") or "").strip()
+    batch_real = str(st.session_state.get("photos_batch_path_candidate", "") or snapshot.get("fichier_photos_batch", "") or "").strip()
+
+    snapshot["id_affaire"] = id_affaire
+    snapshot["id_captation"] = id_captation
+
+    if photos_real:
+        snapshot["fichier_photos"] = photos_real
+    if trans_real:
+        snapshot["fichier_transcription"] = trans_real
+    if audio_src_real:
+        snapshot["fichier_audio_source"] = audio_src_real
+        snapshot["audio_compat_source"] = audio_src_real
+    if ctx_real:
+        snapshot["fichier_contexte_general"] = ctx_real
+    if batch_real:
+        snapshot["fichier_photos_batch"] = batch_real
+
+    pcfixe = dict(snapshot.get("pcfixe", {}) or {})
+    if photos_real:
+        pcfixe["fichier_photos"] = str(paths["photos_dir"] / Path(photos_real).name)
+    if batch_real:
+        pcfixe["fichier_photos_batch"] = str(paths["photos_dir"] / "photos_batch.csv")
+    if trans_real:
+        pcfixe["fichier_transcription"] = str(paths["trans_dir"] / Path(trans_real).name)
+    if ctx_real:
+        pcfixe["fichier_contexte_general"] = str(paths["trans_dir"] / Path(ctx_real).name)
+    if audio_src_real:
+        pcfixe["fichier_audio_source"] = str(paths["audio_dir"] / Path(audio_src_real).name)
+        pcfixe["audio_compat_source"] = str(paths["audio_dir"] / Path(audio_src_real).name)
+
+    pcfixe["fichier_audio"] = str(paths["audio_dir"] / "audio_compatible.wav")
+    pcfixe["fichier_audio_compatible"] = str(paths["audio_dir"] / "audio_compatible.wav")
+    pcfixe["config_llm"] = str(paths["config_llm"])
+
+    snapshot["pcfixe"] = pcfixe
+    return snapshot
+
+def _publish_snapshot_capture(infos: dict, temp: dict, id_affaire: str, id_captation: str) -> Path:
+    pc = dict(infos.get("pcfixe", {}) or {})
+    root_affaires = str(pc.get("root_affaires") or "").strip()
+
+    # Pour la publication snapshot destinée au batch PC fixe,
+    # on force une racine UNC si la valeur est vide ou locale.
+    if (not root_affaires) or re.match(r"^[A-Za-z]:[\\/]", root_affaires):
+        root_affaires = r"\\192.168.0.155\Affaires"
+
+    root = Path(root_affaires) / id_affaire
+    base_cap = root / "AE_Expert_captations" / id_captation
+    trans_dir = root / "AF_Expert_ASR" / "transcriptions" / id_captation
+
+    paths = {
+        "root_affaire": root,
+        "photos_dir": base_cap / "photos",
+        "audio_dir": base_cap / "audio",
+        "trans_dir": trans_dir,
+        "config_llm": trans_dir / "config_llm.json",
+        "prompt_gpt": trans_dir / "prompt_gpt.json",
+        "prompt_gpt_batch": trans_dir / "prompt_gpt_batch_only.json",
+        "infos": trans_dir / "infos_projet.json",
+    }
+
+    config_dir = Path(BASE_DIR) / "config"
+
+    snapshot_infos = _build_snapshot_infos(infos, temp, id_affaire, id_captation)
+
+    # On aligne aussi le bloc pcfixe du snapshot sur la vraie racine cible
+    snapshot_infos.setdefault("pcfixe", {})
+    snapshot_infos["pcfixe"]["root_affaires"] = root_affaires
+    snapshot_infos["pcfixe"]["config_llm"] = str(paths["config_llm"])
+    snapshot_infos["pcfixe"]["fichier_photos_batch"] = str(paths["photos_dir"] / "photos_batch.csv")
+
+    _atomic_write_text(paths["infos"], json.dumps(snapshot_infos, indent=2, ensure_ascii=False))
+    _atomic_write_text(paths["config_llm"], (config_dir / "config.json").read_text(encoding="utf-8"))
+    _atomic_write_text(paths["prompt_gpt"], (config_dir / "prompt_gpt.json").read_text(encoding="utf-8"))
+    _atomic_write_text(paths["prompt_gpt_batch"], (config_dir / "prompt_gpt_batch_only.json").read_text(encoding="utf-8"))
+
+    return paths["trans_dir"]
+
+
 def _detect_audio_candidates_and_dirs():
     """Cherche des .wav/.mp3 autour du CSV de transcription RÉEL."""
     t = st.session_state.get("fichiers_temp", {}) or {}
@@ -192,6 +359,7 @@ def validate_id_captation(s: str) -> tuple[bool, str, str]:
     return True, s, ""
 
 def ensure_photo_rel_native_pcfixe(df: pd.DataFrame, id_captation: str) -> pd.DataFrame:
+    """Construit une cle locale de travail; elle ne vaut pas validation serveur."""
     if "photo_rel_native" not in df.columns:
         df["photo_rel_native"] = ""
 
@@ -282,6 +450,10 @@ def show_selection_interface():
         ),
         language="json",
     )
+    st.caption(
+        "infos_projet.json est un etat local de travail pour l'application. "
+        "Il ne remplace pas la configuration projet ni la validation cote serveur."
+    )
 
     # --- synchronisation initiale ---
     if not temp.get("fichier_photos_reel") and infos.get("fichier_photos"):
@@ -314,6 +486,7 @@ def show_selection_interface():
     st.session_state["fichiers_temp"] = temp
 
     st.divider()
+    
     # ======================================================================
     # PHOTOS
     # ======================================================================
@@ -356,6 +529,23 @@ def show_selection_interface():
         f"**Chemin RÉEL photos courant :** "
         f"`{temp.get('fichier_photos_reel', '') or '—'}`"
     )
+
+    # Fichier batch (photos_batch.csv) : proposition recalculée depuis le CSV photos courant
+    photos_real_current = temp.get("fichier_photos_reel") or infos.get("fichier_photos", "")
+    photos_batch_current = _propose_photos_batch_path(photos_real_current)
+    exists_batch = bool(photos_batch_current) and os.path.exists(photos_batch_current)
+
+    st.caption("📦 Fichier batch proposé (photos_batch.csv)")
+    st.code(photos_batch_current if photos_batch_current else "(non défini)")
+    if photos_batch_current:
+        st.caption("Proposition recalculée à partir du fichier photos réel courant ; validation finale à l’enregistrement.")
+    if exists_batch:
+        st.success("✅ photos_batch.csv présent")
+    else:
+        st.warning("⚠️ photos_batch.csv absent (normal si le batch n’a pas encore tourné)")
+
+    # stocke en session pour réutilisation au moment de l’enregistrement
+    st.session_state["photos_batch_path_candidate"] = photos_batch_current
 
     # 2) Upload -> copie temporaire (optionnelle)
     uploaded_photos = st.file_uploader(
@@ -627,6 +817,7 @@ def show_selection_interface():
         temp["fichier_contexte_general_temp"] = path
         st.info(f"📂 Copie temporaire contexte général : {path}")
 
+
     # -----------------------------------------------------------------
     # Identifiants affaire / captation (utilisés pour les chemins PC fixe + batch)
     # -----------------------------------------------------------------
@@ -643,6 +834,41 @@ def show_selection_interface():
         value=str(infos.get("id_captation", "") or ""),
         key="id_captation_input",
     )
+
+    st.caption("Création affaire (optionnel, compat create_affaire serveur)")
+    affaire_title_input = st.text_input(
+        "Titre affaire (optionnel)",
+        value=str(infos.get("nom_affaire", "") or ""),
+        key="nom_affaire_input",
+    )
+
+    default_root_affaires = str((infos.get("pcfixe", {}) or {}).get("root_affaires") or r"C:\Affaires")
+    affaires_root_input = st.text_input(
+        "Racine affaires côté serveur (optionnel)",
+        value=default_root_affaires,
+        key="affaires_root_input",
+    )
+
+    if st.button("🗂️ Initier l’affaire (serveur)"):
+        ok_a, id_affaire_init, err_a = validate_id_affaire(id_affaire_input)
+        if not ok_a:
+            st.error(f"❌ id_affaire : {err_a}")
+        else:
+            payload = create_affaire_server_compatible(
+                project_id=id_affaire_init,
+                nom=affaire_title_input,
+                affaires_root=affaires_root_input,
+            )
+            if payload.get("ok"):
+                infos["id_affaire"] = id_affaire_init
+                infos["project_id"] = id_affaire_init
+                sauvegarder_infos_projet(infos)
+                if payload.get("created"):
+                    st.success(f"✅ Affaire créée côté serveur: {id_affaire_init}")
+                else:
+                    st.info(f"ℹ️ Affaire déjà existante côté serveur: {id_affaire_init}")
+            else:
+                st.warning(f"⚠️ Création affaire indisponible (fail-safe): {payload.get('error', 'inconnue')}")
 
     # -----------------------------------------------------------------
     # Fichier batch (photos_batch.csv) : affichage + auto-proposition
@@ -689,6 +915,35 @@ def show_selection_interface():
     }
     st.code(json.dumps(preview, indent=2, ensure_ascii=False), language="json")
 
+    st.divider()
+    st.markdown("### Publication PC fixe")
+    target_dir = _build_pcfixe_paths(
+        normalize_id_affaire(id_affaire_input) or "<id_affaire>",
+        normalize_id_captation(id_captation_input) or "<id_captation>",
+    )["trans_dir"]
+    st.caption("Dossier cible du snapshot captation")
+    st.code(str(target_dir))
+
+    if st.button("Publier le snapshot captation (PC fixe)"):
+        ok_a, id_affaire_pub, err_a = validate_id_affaire(id_affaire_input)
+        ok_c, id_captation_pub, err_c = validate_id_captation(id_captation_input)
+
+        if not ok_a or not ok_c:
+            if err_a: st.error(f"❌ id_affaire : {err_a}")
+            if err_c: st.error(f"❌ id_captation : {err_c}")
+            st.stop()
+
+        try:
+            published_dir = _publish_snapshot_capture(
+                infos=infos,
+                temp=st.session_state.get("fichiers_temp", {}) or {},
+                id_affaire=id_affaire_pub,
+                id_captation=id_captation_pub,
+            )
+            st.success(f"✅ Snapshot captation publié dans : {published_dir}")
+        except Exception as e:
+            st.error(f"❌ Publication du snapshot impossible : {e}")
+
     # =====================================================================
     # ENREGISTREMENT DANS infos_projet.json
     # =====================================================================
@@ -726,7 +981,7 @@ def show_selection_interface():
 
         # ⚠️ IMPORTANT : mettre à jour + sauver le CSV photos (photo_rel_native)
         if photos_real:
-            df_photos = _load_csv_flexible(photos_real, sep=";")
+            df_photos = _load_csv_flexible(photos_real)
 
             # 1) clé pivot
             df_photos = ensure_photo_rel_native_pcfixe(df_photos, id_captation)

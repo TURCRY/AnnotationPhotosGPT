@@ -2,6 +2,8 @@ import streamlit as st
 import json
 import os
 
+from utils import sauvegarder_infos_projet
+
 def config_synchro_interface():
     st.title("⚙️ Configuration de la synchronisation")
 
@@ -18,6 +20,5 @@ def config_synchro_interface():
         infos["photo_depart"] = photo_depart
         infos["audio_depart"] = audio_depart
         infos["retour_arriere"] = retour_arriere
-        with open(os.path.join("data", "infos_projet.json"), "w", encoding="utf-8") as f:
-            json.dump(infos, f, ensure_ascii=False, indent=2)
+        sauvegarder_infos_projet(infos)
         st.success("✅ Paramètres enregistrés.")
