@@ -50,6 +50,24 @@ def _check_under(path_str: str, root_abs: str, label: str):
         log.info(f"[ASR][OK] {label}: {p}")
 
 
+def _require_server_project_context(infos: dict) -> tuple[str, dict]:
+    """Valide le minimum requis cote client avant un appel serveur structurel."""
+    project_id = str(infos.get("project_id") or infos.get("id_projet") or "").strip()
+    if not project_id:
+        raise RuntimeError(
+            "project_id absent dans infos_projet.json : appel serveur impossible. "
+            "Renseignez un identifiant de projet serveur valide dans l'etat local."
+        )
+
+    pcfixe = infos.get("pcfixe", {}) or {}
+    if not isinstance(pcfixe, dict) or not pcfixe:
+        raise RuntimeError(
+            "Bloc pcfixe absent dans infos_projet.json : impossible de calculer les chemins serveur attendus."
+        )
+
+    return project_id, pcfixe
+
+
 
 @st.cache_resource
 def charger_prompts():
@@ -63,6 +81,9 @@ def extract_affaire_captation(pcfixe: dict) -> tuple[str, str, str]:
     Retourne (id_affaire, id_captation, base_transcriptions_dir)
     base_transcriptions_dir = ...\AF_Expert_ASR\transcriptions\<id_captation>
     """
+    if not isinstance(pcfixe, dict) or not pcfixe:
+        raise RuntimeError("Bloc pcfixe manquant : impossible d'extraire id_affaire/id_captation.")
+
     candidates = [
         pcfixe.get("fichier_contexte_general", ""),
         pcfixe.get("config_llm", ""),
@@ -99,7 +120,10 @@ def extract_affaire_captation(pcfixe: dict) -> tuple[str, str, str]:
 
     expected = re.compile(rf"[\\/](transcriptions)[\\/]{re.escape(id_captation)}$", re.I)
     if not expected.search(str(base_transcriptions_dir)):
-        base_transcriptions_dir = Path(p).parent.resolve()
+        raise RuntimeError(
+            "Chemin pcfixe incoherent : impossible de confirmer le dossier "
+            f"transcriptions/{id_captation} a partir de {p}"
+        )
 
     return id_affaire, id_captation, str(base_transcriptions_dir)
 
@@ -110,16 +134,22 @@ def compute_dictee_target_dir(pcfixe: dict) -> str:
 
 def compute_asr_subdir_from_pcfixe(pcfixe: dict) -> str:
     id_affaire, id_captation, _ = extract_affaire_captation(pcfixe)
-    return str(
+    subdir = str(
         Path(id_affaire)
         / "AF_Expert_ASR"
         / "transcriptions"
         / id_captation
     )
+    if not id_affaire or not id_captation or subdir in ("", "."):
+        raise RuntimeError("Impossible de calculer le sous-repertoire ASR serveur.")
+    return subdir
 
 def compute_asr_out_dir_from_pcfixe(pcfixe: dict) -> str:
     _, _, base_transcriptions_dir = extract_affaire_captation(pcfixe)
-    return str(Path(base_transcriptions_dir) / "asr_out")
+    out_dir = str(Path(base_transcriptions_dir) / "asr_out")
+    if not os.path.isabs(out_dir):
+        raise RuntimeError("Impossible de calculer le dossier absolu de sortie ASR.")
+    return out_dir
 
 
 # -----------------------------------------------------------------------------
@@ -776,14 +806,14 @@ def cached_vlm(image_path: str, context: str, prompt: str) -> str:
 
 def build_vlm_context(ctx_general: dict) -> str:
     mission = (ctx_general.get("mission") or "").strip()
-    system  = (ctx_general.get("system") or "").strip()
-    user    = (ctx_general.get("user") or "").strip()
+    system  = (ctx_general.get("vlm_system") or ctx_general.get("system") or "").strip()
+    user    = (ctx_general.get("vlm_user") or ctx_general.get("user") or "").strip()
 
     return (
         "CADRE (expertise — photos) :\n"
         f"- Mission : {mission}\n"
-        f"- Finalité : {system}\n"
-        f"- Consigne : {user}\n\n"
+        f"- Cadrage VLM : {system}\n"
+        f"- Guidage VLM : {user}\n\n"
         "INSTRUCTIONS VISION (obligatoires) :\n"
         "1) Décrire UNIQUEMENT ce qui est visible et pertinent pour des constats d'ouvrage.\n"
         "2) Priorité : ouvrages, matériaux, assemblages, finitions, désordres apparents, inachèvements.\n"
@@ -849,7 +879,7 @@ def build_vlm_context_guided(ctx_general: dict, transcription_extrait: str) -> s
         + "\n".join([f"- {it}" for it in items])
     )
 
-def ensure_desc_vlm(i, row_view, guide_src: str, *, photos_df, photos_csv, mission, context_system) -> str:
+def ensure_desc_vlm(i, row_view, guide_src: str, *, photos_df, photos_csv, mission, context_system, context_user="", vlm_system="", vlm_user="") -> str:
     # 1) priorité absolue : UI explicite
     desc = str(row_view.get("description_vlm_ui", "") or "").strip()
     if desc:
@@ -883,7 +913,13 @@ def ensure_desc_vlm(i, row_view, guide_src: str, *, photos_df, photos_csv, missi
             photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
         return ""
 
-    ctx_general = {"mission": mission, "system": context_system}
+    ctx_general = {
+        "mission": mission,
+        "system": context_system,
+        "user": context_user,
+        "vlm_system": vlm_system,
+        "vlm_user": vlm_user,
+    }
     ctx_vlm = build_vlm_context_guided(ctx_general, guide_src)
 
     desc_new = call_vlm_single(image_path, context=ctx_vlm, prompt=VLM_PROMPT)
@@ -975,6 +1011,8 @@ def show_annotation_interface():
     mission = mission_from_infos
     context_system = infos.get("system", "")
     context_user   = infos.get("user", "")
+    vlm_system     = infos.get("vlm_system", "")
+    vlm_user       = infos.get("vlm_user", "")
 
     contexte_path = infos.get("fichier_contexte_general")
     if contexte_path and os.path.exists(contexte_path):
@@ -985,10 +1023,14 @@ def show_annotation_interface():
         mission        = data.get("mission", mission)
         context_system = data.get("system", context_system)
         context_user   = data.get("user", context_user)
+        vlm_system     = data.get("vlm_system", vlm_system)
+        vlm_user       = data.get("vlm_user", vlm_user)
         ctx_general = {
             "mission": mission,
             "system": context_system,
             "user": context_user,
+            "vlm_system": vlm_system,
+            "vlm_user": vlm_user,
         }
 
         # État d’avancement (optionnel)
@@ -1551,7 +1593,13 @@ def show_annotation_interface():
                     if st.button("🔎 Calculer la description VLM", key=f"vlm_only_{i}"):
                         image_path = os.path.join(row["chemin_photo_reduite"], row["nom_fichier_image"])
                         try:
-                            ctx_general = {"mission": mission, "system": context_system}
+                            ctx_general = {
+                                "mission": mission,
+                                "system": context_system,
+                                "user": context_user,
+                                "vlm_system": vlm_system,
+                                "vlm_user": vlm_user,
+                            }
                             guide_src = (texte_com or texte_lib or "").strip()
                             ctx_vlm = build_vlm_context_guided(ctx_general, guide_src)
                             desc_new = call_vlm_single(image_path, context=ctx_vlm, prompt=VLM_PROMPT)
@@ -1743,7 +1791,8 @@ def show_annotation_interface():
                             desc_vlm = ensure_desc_vlm(
                                 i, row_view, guide_src=guide_src,
                                 photos_df=photos_df, photos_csv=photos_csv,
-                                mission=mission, context_system=context_system
+                                mission=mission, context_system=context_system,
+                                context_user=context_user, vlm_system=vlm_system, vlm_user=vlm_user
                             )
                             photo_dirty = True
                             if not desc_vlm:
@@ -1864,7 +1913,8 @@ def show_annotation_interface():
                             desc_vlm = ensure_desc_vlm(
                                 i, row_view, guide_src=guide_src,
                                 photos_df=photos_df, photos_csv=photos_csv,
-                                mission=mission, context_system=context_system
+                                mission=mission, context_system=context_system,
+                                context_user=context_user, vlm_system=vlm_system, vlm_user=vlm_user
                             )
                             if not desc_vlm:
                                 st.warning("VLM a répondu vide : libellé non généré pour cette photo.")
@@ -1922,7 +1972,8 @@ def show_annotation_interface():
                             desc_vlm = ensure_desc_vlm(
                                 i, row_view, guide_src=guide_src,
                                 photos_df=photos_df, photos_csv=photos_csv,
-                                mission=mission, context_system=context_system
+                                mission=mission, context_system=context_system,
+                                context_user=context_user, vlm_system=vlm_system, vlm_user=vlm_user
                             )
                             if not desc_vlm:
                                 st.warning("VLM a répondu vide : commentaire non généré pour cette photo.")
@@ -1985,7 +2036,8 @@ def show_annotation_interface():
                             desc_vlm = ensure_desc_vlm(
                                 i, row_view, guide_src=guide_src,
                                 photos_df=photos_df, photos_csv=photos_csv,
-                                mission=mission, context_system=context_system
+                                mission=mission, context_system=context_system,
+                                context_user=context_user, vlm_system=vlm_system, vlm_user=vlm_user
                             )
                             if not desc_vlm:
                                 st.warning("⚠️ VLM indisponible : recalcul GPT poursuivi sans description photo.")
@@ -2098,11 +2150,13 @@ def show_annotation_interface():
                     # --- Dictée micro : ASR -> aide libellé/commentaire ---
                     with st.expander("🎙️ Dictée micro → proposer libellé & commentaire", expanded=False):
                         audio_in = st.audio_input("Enregistrer (micro)", key=f"mic_{i}")
-                        project_id = str(infos.get("project_id") or infos.get("id_projet") or "").strip()
+                        try:
+                            project_id, _pcfixe_preview = _require_server_project_context(infos)
+                        except Exception as e:
+                            project_id = ""
+                            st.warning(str(e))
 
-                        if not project_id:
-                            st.warning("project_id absent dans infos_projet.json : upload /files impossible.")
-                        else:
+                        if project_id:
                             if st.button("🪄 Utiliser la dictée pour proposer libellé + commentaire", key=f"mic_go_{i}"):
                                 try:
                                     if audio_in is None:
@@ -2126,15 +2180,22 @@ def show_annotation_interface():
                                         texte_dictee = ""
 
                                         if asr_backend == "local":
-                                            pcfixe = infos.get("pcfixe", {}) or {}
+                                            project_id, pcfixe = _require_server_project_context(infos)
 
                                             # (A) subdir relatif sous C:\Affaires pour /files
                                             subdir_base = compute_asr_subdir_from_pcfixe(pcfixe)
+                                            if not subdir_base:
+                                                raise RuntimeError(
+                                                    "Sous-repertoire ASR serveur vide : upload /files annule."
+                                                )
                                             subdir_in   = str(Path(subdir_base) / "asr_in")
 
                                             # (B) chemin ABSOLU côté PC fixe pour la sortie CSV
-                                            _, _, base_trans_dir_abs = extract_affaire_captation(pcfixe)
-                                            out_dir_abs = str(Path(base_trans_dir_abs) / "asr_out")
+                                            out_dir_abs = compute_asr_out_dir_from_pcfixe(pcfixe)
+                                            if not os.path.isabs(out_dir_abs):
+                                                raise RuntimeError(
+                                                    "Chemin de sortie ASR non absolu : appel /asr_voxtral annule."
+                                                )
 
                                             # 1) Upload wav -> asr_in (PC fixe)
                                             audio_path_server = client.upload_file_bytes(

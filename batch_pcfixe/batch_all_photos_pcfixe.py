@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import sys
 import uuid, threading
 import requests
+from openai import OpenAI
 sys.path.insert(0, str(Path(__file__).parent))
 from local_llm_client import LocalLLMClient
 import logging
@@ -286,9 +287,11 @@ def _should_retry_http(status: int | None) -> bool:
 def generate_with_retry(
     client,
     *,
+    llm_backend: str,
     prompt: str,
     system: str,
     model: str,
+    openai_api_key: str,
     temperature: float,
     max_tokens: int,
     task: str,
@@ -314,21 +317,36 @@ def generate_with_retry(
                 throttle(0.8 if which == "LIB" else 2.0)
                 print(f"[BATCH] SEND {request_id}")
 
-                out = client.generate(
-                    prompt=prompt,
-                    system=system,
-                    model=model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    task=task,
-                    expect_json=expect_json,
-                    salient_families=salient_families,
-                    prefer_dictee=prefer_dictee,
-                    request_id=request_id,
-                    overrides=overrides,
-                    marge=marge,
-                    min_prompt_tokens=min_prompt_tokens,
-                ).strip()
+                if llm_backend == "openai":
+                    if not openai_api_key:
+                        raise RuntimeError("OPENAI_API_KEY_MISSING")
+                    oa_client = OpenAI(api_key=openai_api_key)
+                    response = oa_client.chat.completions.create(
+                        model=model or "gpt-4o-mini",
+                        temperature=float(temperature),
+                        max_tokens=int(max_tokens),
+                        messages=[
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": prompt},
+                        ],
+                    )
+                    out = str(response.choices[0].message.content or "").strip()
+                else:
+                    out = client.generate(
+                        prompt=prompt,
+                        system=system,
+                        model=model,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        task=task,
+                        expect_json=expect_json,
+                        salient_families=salient_families,
+                        prefer_dictee=prefer_dictee,
+                        request_id=request_id,
+                        overrides=overrides,
+                        marge=marge,
+                        min_prompt_tokens=min_prompt_tokens,
+                    ).strip()
 
                 print(f"[BATCH] RECV {request_id}")
 
@@ -1094,9 +1112,12 @@ def main() -> int:
     n_done = 0  # nombre de lignes effectivement traitées (OK/ERR/SKIP)
 
 
-    base_url = cfg_llm["local_llm"]["base_url"]
-    api_key  = cfg_llm["local_llm"]["api_key"]
-    model    = cfg_llm["local_llm"]["model"]
+    llm_backend = str(cfg_llm.get("llm_backend", "local") or "local").strip().lower()
+    local_cfg = cfg_llm.get("local_llm", {}) or {}
+    base_url = local_cfg.get("base_url", "")
+    api_key  = local_cfg.get("api_key", "")
+    local_model = local_cfg.get("model", "")
+    openai_api_key = os.getenv("OPENAI_API_KEY", "") or str(cfg_llm.get("openai_api_key", "") or "").strip()
 
     batch_cfg = cfg_llm.get("batch", {})
     mt = (batch_cfg.get("max_tokens") or {})
@@ -1430,11 +1451,17 @@ def main() -> int:
     # 3) fenêtres audio (déjà calculées chez vous : lib_before/lib_after, com_before/com_after)
     #    => on les réutilise
 
-    timeout_s = float(cfg_llm["local_llm"].get("timeout", 240))
+    timeout_s = float(local_cfg.get("timeout", 240))
     timeout_s = max(timeout_s, 600.0)  # test “sécurisé”
 
-    client = LocalLLMClient(base_url=base_url, api_key=api_key, timeout=timeout_s)
-    print(f"[BATCH] client.timeout={timeout_s}s")
+    client = None
+    model = str(cfg_llm.get("model", "gpt-4o-mini") or "gpt-4o-mini") if llm_backend == "openai" else local_model
+    if llm_backend == "local":
+        client = LocalLLMClient(base_url=base_url, api_key=api_key, timeout=timeout_s)
+        print(f"[BATCH] client.timeout={timeout_s}s")
+        log.info("LLM backend=local model=%s base_url=%s", model, base_url)
+    else:
+        log.info("LLM backend=openai model=%s", model)
 
     
     def build_prompt_with_desc_compat(user_template: str, final_prompt: str, desc_vlm: str) -> str:
@@ -1623,9 +1650,11 @@ def main() -> int:
 
             lib = generate_with_retry(
                 client,
+                llm_backend=llm_backend,
                 prompt=final_lib,
                 system=sys_lib,
                 model=model,
+                openai_api_key=openai_api_key,
                 temperature=temp_lib,
                 max_tokens=max_tokens_lib,
                 task="libelle",
@@ -1666,9 +1695,11 @@ def main() -> int:
 
                 com = generate_with_retry(
                     client,
+                    llm_backend=llm_backend,
                     prompt=final_com,
                     system=sys_com,
                     model=model,
+                    openai_api_key=openai_api_key,
                     temperature=temp_com,
                     max_tokens=max_tokens_com,
                     task="commentaire",
