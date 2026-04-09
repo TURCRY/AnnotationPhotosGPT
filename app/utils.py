@@ -14,6 +14,7 @@ import pandas as pd
 from pathlib import Path
 import shutil
 
+from compat_affaire_captation import normalize_infos_aliases
 
 # Fonctions existantes utiles
 
@@ -55,15 +56,19 @@ def convertir_horodatage_en_secondes(horodatage: str) -> float:
         raise ValueError(f"Horodatage invalide : {horodatage}")
 
 def lire_infos_projet():
+    """Lit l'etat local de travail de l'application depuis infos_projet.json."""
     path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "infos_projet.json"))
     if not os.path.exists(path):
         raise FileNotFoundError(f"infos_projet.json introuvable à : {path}")
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        infos = json.load(f)
+    return normalize_infos_aliases(infos)
 
 def sauvegarder_infos_projet(donnees: dict):
+    """Ecrit l'etat local de travail; ce fichier ne remplace pas la configuration projet serveur."""
     path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "infos_projet.json"))
     tmp = path + ".tmp"
+    donnees = normalize_infos_aliases(donnees)
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(donnees, f, ensure_ascii=False, indent=2)
         f.flush()

@@ -127,6 +127,15 @@ class LocalLLMClient:
         Upload vers Flask /files (alias /upload_file).
         Retour: path absolu côté PC fixe.
         """
+        project_id = str(project_id or "").strip()
+        filename = str(filename or "").strip()
+        if not project_id:
+            raise ValueError("Upload /files impossible : project_id manquant ou vide.")
+        if not filename:
+            raise ValueError("Upload /files impossible : filename manquant ou vide.")
+        if not file_bytes:
+            raise ValueError("Upload /files impossible : contenu du fichier vide.")
+
         headers = {}
         if self.api_key:
             headers["x-api-key"] = self.api_key
