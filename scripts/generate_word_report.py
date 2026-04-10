@@ -11,6 +11,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 import unicodedata
+import argparse
 
 # --- Helpers ----------------------------------------------------------------
 def load_photos(path: Path) -> pd.DataFrame:
@@ -30,6 +31,74 @@ def find_latest_annotations(base_dir: Path) -> Path:
     if not cands:
         raise FileNotFoundError("Aucune annotation *_GTP_*.csv trouvée.")
     return cands[0]
+
+def parse_args(project_root: Path):
+    parser = argparse.ArgumentParser(
+        description="Genere le rapport Word photos a partir des sources UI / GTP / Batch."
+    )
+    parser.add_argument(
+        "--infos",
+        default=str(project_root / "data" / "infos_projet.json"),
+        help="Chemin vers infos_projet.json (voie canonique).",
+    )
+    parser.add_argument(
+        "--photos",
+        default="",
+        help="Override explicite pour fichier_photos.",
+    )
+    parser.add_argument(
+        "--batch",
+        default="",
+        help="Override explicite pour fichier_photos_batch.",
+    )
+    parser.add_argument(
+        "--gtp",
+        default="",
+        help="Override explicite pour le CSV GTP.",
+    )
+    return parser.parse_args()
+
+def _resolve_path_like(value: str, *, base_dir: Path) -> Path:
+    p = Path(str(value or "").strip())
+    if not p:
+        return p
+    if p.is_absolute():
+        return p
+    return (base_dir / p).resolve()
+
+def load_runtime_context(project_root: Path, args):
+    infos_path = _resolve_path_like(args.infos, base_dir=project_root)
+    if not infos_path.exists():
+        raise FileNotFoundError(f"infos_projet.json introuvable : {infos_path}")
+
+    with open(infos_path, encoding="utf-8") as f:
+        infos = json.load(f)
+
+    id_affaire = str(infos.get("id_affaire") or "").strip()
+    id_captation = str(infos.get("id_captation") or "").strip()
+
+    photos_value = str(args.photos or infos.get("fichier_photos") or "").strip()
+    if not photos_value:
+        raise FileNotFoundError("fichier_photos manquant dans infos_projet.json")
+    photos_path = _resolve_path_like(photos_value, base_dir=infos_path.parent)
+    if not photos_path.exists():
+        raise FileNotFoundError(f"Fichier photos introuvable : {photos_path}")
+
+    batch_value = str(args.batch or infos.get("fichier_photos_batch") or "").strip()
+    batch_path = _resolve_path_like(batch_value, base_dir=infos_path.parent) if batch_value else None
+
+    gtp_value = str(args.gtp or "").strip()
+    annotations_path = _resolve_path_like(gtp_value, base_dir=photos_path.parent) if gtp_value else None
+
+    return {
+        "infos_path": infos_path,
+        "infos": infos,
+        "id_affaire": id_affaire,
+        "id_captation": id_captation,
+        "photos_path": photos_path,
+        "batch_path": batch_path,
+        "annotations_path": annotations_path,
+    }
 
 def safe_text(val: object) -> str:
     """Convertit proprement une valeur (NaN, float, None...) en texte."""
@@ -132,29 +201,22 @@ ONLY_RETENUE = os.environ.get("REPORT_ONLY_RETENUE", "1").strip().lower() in ("1
 
 # On part de la structure du projet : scripts/ .. / data/
 project_root = Path(__file__).resolve().parents[1]
+args = parse_args(project_root)
+runtime = load_runtime_context(project_root, args)
 
 # 1) infos_projet.json
-infos_path = project_root / "data" / "infos_projet.json"
-if not infos_path.exists():
-    raise FileNotFoundError(f"infos_projet.json introuvable : {infos_path}")
-with open(infos_path, encoding="utf-8") as f:
-    infos = json.load(f)
+infos_path = runtime["infos_path"]
+infos = runtime["infos"]
 
 # 2) CSV photos UI
-photos_path_str = infos.get("fichier_photos", "")
-if not photos_path_str:
-    raise FileNotFoundError("fichier_photos manquant dans infos_projet.json")
-photos_path = Path(photos_path_str)
-if not photos_path.exists():
-    raise FileNotFoundError(f"Fichier photos introuvable : {photos_path}")
+photos_path = runtime["photos_path"]
 photos_df = load_photos(photos_path)
 
 base_dir = photos_path.parent
 
 # 3) Charger GTP si nécessaire (ou si on veut les textes GTP)
-
 try:
-    annotations_path = find_latest_annotations(base_dir)
+    annotations_path = runtime["annotations_path"] or find_latest_annotations(base_dir)
     try:
         annotations_df = pd.read_csv(annotations_path, sep=";", encoding="utf-8-sig")
     except UnicodeDecodeError:
@@ -166,7 +228,7 @@ except FileNotFoundError:
 
 # 4) Charger batch si dispo
 batch_df = None
-photos_batch_path = infos.get("fichier_photos_batch", "")
+photos_batch_path = runtime["batch_path"]
 if photos_batch_path and Path(photos_batch_path).exists():
     batch_df = pd.read_csv(photos_batch_path, sep=";", encoding="utf-8-sig")
 
@@ -406,20 +468,27 @@ for num, row in enumerate(df.itertuples(index=False), start=1):
     doc.add_paragraph("")
 
 # Sortie — nom normalisé
-id_affaire   = str(infos.get("id_affaire") or "").strip()
-id_captation = str(infos.get("id_captation") or "").strip()
+id_affaire   = runtime["id_affaire"]
+id_captation = runtime["id_captation"]
 
 # horodatage de génération (jour_heure)
 ts = datetime.now().strftime("%Y-%m-%d_%H-%M")
 
 report_name = f"annotation_photos_{id_affaire}_{id_captation}_V_{ts}.docx"
 
-# même dossier que le CSV GTP (comportement actuel)
+# dossier cible pipeline BE_Traitements_captations
+pcfixe = infos.get("pcfixe", {}) or {}
+root_affaires = str(pcfixe.get("root_affaires") or "").strip()
+if not root_affaires.startswith("\\\\"):
+    root_affaires = r"\\192.168.0.155\Affaires"
 
-output_path = base_dir / report_name
+output_dir = Path(root_affaires) / id_affaire / "BE_Traitements_captations" / id_captation
+output_dir.mkdir(parents=True, exist_ok=True)
+output_path = output_dir / report_name
 
 
 doc.save(output_path)
+print(f"📁 Dossier de sortie Word : {output_dir}")
 print(f"✅ Rapport généré : {output_path}")
 
 
