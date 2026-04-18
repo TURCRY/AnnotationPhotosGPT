@@ -476,13 +476,19 @@ ts = datetime.now().strftime("%Y-%m-%d_%H-%M")
 
 report_name = f"annotation_photos_{id_affaire}_{id_captation}_V_{ts}.docx"
 
-# dossier cible pipeline BE_Traitements_captations
+# dossier cible canonique BE_Traitement_captations/compte_rendu_LLM
 pcfixe = infos.get("pcfixe", {}) or {}
 root_affaires = str(pcfixe.get("root_affaires") or "").strip()
 if not root_affaires.startswith("\\\\"):
     root_affaires = r"\\192.168.0.155\Affaires"
 
-output_dir = Path(root_affaires) / id_affaire / "BE_Traitements_captations" / id_captation
+output_dir = (
+    Path(root_affaires)
+    / id_affaire
+    / "BE_Traitement_captations"
+    / id_captation
+    / "compte_rendu_LLM"
+)
 output_dir.mkdir(parents=True, exist_ok=True)
 output_path = output_dir / report_name
 

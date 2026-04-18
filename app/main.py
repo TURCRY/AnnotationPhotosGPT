@@ -1,5 +1,8 @@
 import sys
 import os
+import shutil
+import threading
+import logging
 from pathlib import Path
 import pandas as pd
 
@@ -18,6 +21,14 @@ from contextlib import contextmanager
 
 
 print("✅ PYTHONPATH temporaire ajouté :", sys.path[0])
+
+log = logging.getLogger("batch_sync")
+if not log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(message)s"))
+    log.addHandler(_handler)
+log.setLevel(logging.INFO)
+log.propagate = False
 
 
 BATCH_COLS = [
@@ -118,6 +129,46 @@ def _safe_stat(path: str) -> tuple[bool, float]:
     except Exception:
         return (False, 0.0)
 
+
+def _sync_batch_from_nas_impl(infos: dict) -> None:
+    try:
+        pcfixe = infos.get("pcfixe", {}) or {}
+        if not isinstance(pcfixe, dict):
+            return
+
+        # `pcfixe.fichier_photos_batch` est la source canonique produite
+        # par le batch NAS/PC fixe ; `fichier_photos_batch` est la copie
+        # locale consommée par l'application laptop.
+        nas_path = str(pcfixe.get("fichier_photos_batch", "") or "").strip()
+        local_path = str(infos.get("fichier_photos_batch", "") or "").strip()
+        if not nas_path or not local_path:
+            return
+
+        nas_ok, nas_mtime = _safe_stat(nas_path)
+        if not nas_ok:
+            return
+
+        local_ok, local_mtime = _safe_stat(local_path)
+        if local_ok and nas_mtime <= local_mtime:
+            log.info("[BATCH_SYNC] Déjà à jour (copie locale du batch)")
+            return
+
+        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(nas_path, local_path)
+        log.info("[BATCH_SYNC] Copie effectuée source canonique -> copie locale")
+    except Exception as e:
+        log.warning(f"[BATCH_SYNC] Erreur accès NAS (non bloquant): {e}")
+
+
+def sync_batch_from_nas(infos: dict) -> None:
+    worker = threading.Thread(
+        target=_sync_batch_from_nas_impl,
+        args=(dict(infos or {}),),
+        daemon=True,
+        name="batch-sync-from-nas",
+    )
+    worker.start()
+
 def show_batch_status(infos: dict):
     p = str(infos.get("fichier_photos_batch", "") or "").strip()
     ok, mtime = _safe_stat(p)
@@ -127,6 +178,40 @@ def show_batch_status(infos: dict):
         st.success(f"✅ Présent — modifié le {datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')}")
     else:
         st.warning("⚠️ Absent — le batch n’a peut-être pas encore produit le fichier, ou la copie n’a pas été faite.")
+
+
+def _set_ui_return_reason(reason: str) -> None:
+    if reason:
+        st.session_state["selection_return_reason"] = reason
+
+
+def _consume_ui_return_reason() -> str:
+    return str(st.session_state.pop("selection_return_reason", "") or "").strip()
+
+
+def _project_blockers(infos: dict) -> list[str]:
+    blockers = []
+
+    photos = str(infos.get("fichier_photos", "") or "").strip()
+    if not photos or not os.path.exists(photos):
+        blockers.append("fichier_photos manquant")
+
+    transcription = str(infos.get("fichier_transcription", "") or "").strip()
+    if not transcription or not os.path.exists(transcription):
+        blockers.append("fichier_transcription manquant")
+
+    audio_source = str(infos.get("fichier_audio_source", "") or "").strip()
+    audio_compat = str(infos.get("fichier_audio", "") or infos.get("fichier_audio_compatible", "") or "").strip()
+    compat_source = str(infos.get("audio_compat_source", "") or "").strip()
+
+    if not audio_source or not os.path.exists(audio_source):
+        blockers.append("fichier_audio_source manquant")
+    elif not audio_compat or not os.path.exists(audio_compat):
+        blockers.append("audio compatible manquant")
+    elif compat_source and os.path.abspath(compat_source) != os.path.abspath(audio_source):
+        blockers.append("audio compatible incohérent avec la source")
+
+    return blockers
 
 def load_csv(path: str, sep=";") -> pd.DataFrame:
     last_err = None
@@ -172,25 +257,41 @@ def preview_merge(infos: dict):
 # ---------------- UI ----------------
 st.title("🧭 AnnotationPhotosGPT – Étape 2")
 
-st.subheader("📁 Fichiers du projet")
-show_selection_interface()
-st.divider()
-
 infos = lire_infos_projet()
+if not st.session_state.get("_batch_sync_started", False):
+    # Synchronise la copie locale du batch sans retarder l'ouverture de l'UI.
+    sync_batch_from_nas(infos)
+    st.session_state["_batch_sync_started"] = True
+return_reason = _consume_ui_return_reason()
+if return_reason:
+    st.info(f"Retour vers sélection fichiers : {return_reason}")
 
-missing_files = []
-for key in ["fichier_photos", "fichier_transcription", "fichier_audio"]:
-    if not infos.get(key) or not os.path.exists(infos[key]):
-        missing_files.append(key)
+blockers = _project_blockers(infos)
 
-if missing_files:
+if blockers:
+    reason = "état projet incomplet: " + ", ".join(blockers)
+    _set_ui_return_reason(reason)
+    st.subheader("📁 Fichiers du projet")
+    show_selection_interface()
+    st.divider()
     st.warning("Certains fichiers sont manquants ou invalides.")
+    st.caption(f"Cause détectée : {reason}")
     st.stop()
 
 if not infos.get("calibrage_valide", False):
+    reason = "calibrage invalide ou absent"
+    _set_ui_return_reason(reason)
+    st.subheader("📁 Fichiers du projet")
+    show_selection_interface()
+    st.divider()
     st.subheader("🕓 Synchronisation Audio / Photos")
+    st.caption(f"Cause détectée : {reason}")
     show_sync_interface()
 else:
+    if st.toggle("Modifier les fichiers du projet", key="show_project_files_editor"):
+        st.subheader("📁 Fichiers du projet")
+        show_selection_interface()
+        st.divider()
     show_batch_status(infos)      # ✅ nouveau
     preview_merge(infos)          # ✅ optionnel mais très utile pour debug
     show_annotation_interface()

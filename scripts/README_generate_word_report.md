@@ -1,212 +1,301 @@
 # README `generate_word_report.py`
 
-## Finalite
+## Résumé rapide
 
-`generate_word_report.py` produit le document Word de synthese des photographies pour `AnnotationPhotosGPT`.
+`generate_word_report.py` génère un rapport Word d'annotations photos à partir de `infos_projet.json` et des sources de données disponibles autour de la captation.
 
-Le script fabrique un fichier `.docx` a partir :
+Le script :
 
-- de la liste des photos issue du CSV UI ;
-- des textes d'annotation issus du CSV GTP si disponible ;
-- des textes batch si disponibles ;
-- du contexte projet pour enrichir l'en-tete du document.
+- lit `id_affaire` et `id_captation` depuis `infos_projet.json` ;
+- résout le fichier photos UI, le batch et le CSV GTP à partir de `infos_projet.json` et/ou d'overrides CLI ;
+- fabrique un `.docx` à partir du modèle Word du projet ;
+- écrit le document dans le dossier canonique :
+  `<root_affaires>\<id_affaire>\BE_Traitement_captations\<id_captation>\compte_rendu_LLM\`
+  avec `root_affaires = infos["pcfixe"]["root_affaires"]` si cette valeur est une UNC, sinon fallback vers `\\192.168.0.155\Affaires`.
 
-Le rapport genere contient notamment :
+## Objet du script
 
-- un en-tete d'informations generales ;
-- une table des cliches ;
-- une entree par photographie avec :
-  - le commentaire retenu ;
-  - l'image ;
-  - la legende Word de type `Cliche X - ...` ;
-  - la source du texte retenu (`GTP`, `UI`, `BATCH`).
+Le script [generate_word_report.py](C:\CodexWorkspace\AnnotationPhotosGPT\scripts\generate_word_report.py) produit le rapport Word des annotations photos.
 
-## Entrees du script
+La logique réelle est la suivante :
 
-### Entree canonique
+- la base de travail est toujours le fichier UI `fichier_photos` ;
+- les textes GTP sont utilisés si un `*_GTP_*.csv` est fourni ou découvert ;
+- les textes batch sont utilisés si `fichier_photos_batch` est disponible ;
+- les commentaires et libellés finaux sont choisis selon la priorité `GTP > UI > BATCH`.
 
-L'entree principale est `infos_projet.json`, passe de preference via `--infos`.
+`infos_projet.json` joue le rôle de point d'entrée canonique :
 
-Depuis ce fichier, le script lit notamment :
+- il fournit `id_affaire` et `id_captation` ;
+- il fournit les chemins principaux déjà validés côté application ;
+- il permet de retrouver le dossier de sortie canonique via `pcfixe.root_affaires`.
+
+## Paramètres CLI réels
+
+Le script accepte exactement les paramètres suivants :
+
+- `--infos`
+  Chemin vers `infos_projet.json`.
+  Valeur par défaut : `<racine_projet>\data\infos_projet.json`
+- `--photos`
+  Override explicite de `fichier_photos`
+- `--batch`
+  Override explicite de `fichier_photos_batch`
+- `--gtp`
+  Override explicite du CSV GTP
+
+Il n'y a pas d'autre paramètre CLI dans le script.
+
+## Résolution des entrées
+
+### Point d'entrée `--infos`
+
+Le script résout d'abord `--infos` :
+
+- si le chemin est absolu, il est utilisé tel quel ;
+- s'il est relatif, il est résolu par rapport à la racine du projet `AnnotationPhotosGPT` ;
+- le fichier doit exister, sinon le script échoue immédiatement.
+
+Le JSON est ensuite chargé sans normalisation supplémentaire.
+
+### Clés effectivement exploitées dans `infos_projet.json`
+
+Les clés réellement lues par le script sont :
 
 - `id_affaire`
 - `id_captation`
 - `fichier_photos`
 - `fichier_photos_batch`
 - `fichier_contexte_general`
+- `pcfixe.root_affaires`
+- `user`
+- `model`
+- `mission`
 
-### Sources de donnees exploitees
+Le script n'exige pas explicitement que `id_affaire` et `id_captation` soient non vides, mais ils sont utilisés tels quels dans le nom du DOCX et le chemin de sortie.
 
-- `photos.csv` ou `photos.xlsx` : source UI, utilisee comme base de la liste des photos
-- `photos_batch.csv` : source batch, utilisee en complement si presente
-- `*_GTP_*.csv` : source GTP, utilisee si presente
+### Résolution du fichier photos
 
-### Overrides optionnels
+Ordre réel de résolution :
 
-Le script accepte aussi des overrides explicites :
+1. `--photos` si fourni
+2. `infos["fichier_photos"]`
 
-- `--photos`
-- `--batch`
-- `--gtp`
+Règles :
 
-Ces overrides remplacent la valeur issue de `infos_projet.json` pour la source concernee.
+- le chemin est résolu relativement au dossier contenant `infos_projet.json` si besoin ;
+- le fichier est obligatoire ;
+- le script accepte `.csv` ou `.xlsx`.
 
-## Mode d'appel
+### Résolution du fichier batch
 
-### Usage canonique
+Ordre réel de résolution :
 
-```powershell
-python C:\AnnotationPhotosGPT\scripts\generate_word_report.py --infos "C:\chemin\vers\infos_projet.json"
-```
+1. `--batch` si fourni
+2. `infos["fichier_photos_batch"]`
 
-### Usage avec overrides
+Règles :
 
-```powershell
-python C:\AnnotationPhotosGPT\scripts\generate_word_report.py `
-  --infos "\\192.168.0.155\Affaires\2026-J1\AF_Expert_ASR\transcriptions\cap-2026-04-10\infos_projet.json" `
-  --photos "\\192.168.0.155\Affaires\2026-J1\AE_Expert_captations\cap-2026-04-10\photos\photos.csv" `
-  --batch "\\192.168.0.155\Affaires\2026-J1\AE_Expert_captations\cap-2026-04-10\photos\photos_batch.csv"
-```
+- le chemin est résolu relativement au dossier contenant `infos_projet.json` si besoin ;
+- la source batch est optionnelle ;
+- le fichier n'est chargé que s'il existe réellement ;
+- la lecture batch est faite via `pandas.read_csv(..., encoding="utf-8-sig")` sans fallback d'encodage.
 
-### Usage legacy
+### Résolution du CSV GTP
 
-Sans argument, le script conserve un mode legacy :
+Ordre réel de résolution :
 
-```powershell
-python C:\AnnotationPhotosGPT\scripts\generate_word_report.py
-```
+1. `--gtp` si fourni
+2. recherche automatique du fichier le plus récent correspondant à `*_GTP_*.csv` dans le dossier du fichier photos
 
-Dans ce cas, il utilise par defaut :
+Règles :
 
-- `C:\AnnotationPhotosGPT\data\infos_projet.json`
+- si `--gtp` est fourni, le chemin est résolu relativement au dossier du fichier photos ;
+- si aucun GTP n'est trouvé, le script continue avec `annotations_df = None` ;
+- la découverte automatique ne regarde que le dossier du fichier photos, pas d'autres emplacements.
 
-## Resolution des chemins
+### Résolution du contexte JSON
 
-### `infos_projet.json`
+Le contexte n'est pas piloté par un paramètre CLI dédié.
 
-- si `--infos` est fourni, ce chemin est utilise ;
-- sinon, le script utilise `data\infos_projet.json` sous la racine du projet ;
-- un chemin relatif est resolu relativement a la racine du projet.
+Ordre réel de résolution :
 
-### `fichier_photos`
+1. `infos["fichier_contexte_general"]`
+2. fallback texte `contexte_general.json`
 
-- le script prend d'abord `--photos` si fourni ;
-- sinon il prend `infos["fichier_photos"]` ;
-- si le chemin est relatif, il est resolu relativement au dossier contenant `infos_projet.json`.
+Règles :
 
-Ce fichier est obligatoire.
+- si le chemin n'est pas absolu, il est résolu relativement à la racine du projet ;
+- si le fichier n'existe pas, le script continue avec un contexte vide `{}` ;
+- ce contexte sert uniquement à enrichir l'en-tête du document.
 
-### `fichier_photos_batch`
+## Logique de fusion et comportement réel
 
-- le script prend d'abord `--batch` si fourni ;
-- sinon il prend `infos["fichier_photos_batch"]` ;
-- si le chemin est relatif, il est resolu relativement au dossier contenant `infos_projet.json`.
+### Source de vérité principale
 
-Cette source est optionnelle. Si le fichier est absent, le rapport reste generable sans donnees batch.
+Le CSV / XLSX de photos UI est la base de la liste des clichés :
 
-### CSV GTP
-
-- le script prend `--gtp` si fourni ;
-- sinon il cherche le fichier GTP le plus recent dans le dossier du fichier photos ;
-- ce fallback repose sur le motif `*_GTP_*.csv`.
-
-Le fallback actuel GTP est donc base sur le "dernier fichier modifie" dans le dossier des photos.
-
-## Logique metier de rapprochement
-
-## Base de travail
-
-La base du rapport est toujours le CSV photos UI :
-
-- il definit la liste des photos ;
+- il définit la population de photos ;
 - il porte les chemins image ;
-- il porte aussi les champs UI eventuellement proposes.
+- il sert de support au filtrage `retenue`.
 
-## Role des sources
+### Mode GTP
 
-### UI
+Le comportement dépend de la variable d'environnement `REPORT_MODE` :
 
-La source UI sert de socle :
+- valeur par défaut : `UI`
+- autre valeur prévue par le code : `GTP`
 
-- liste des photos ;
-- champs `libelle_propose_ui` et `commentaire_propose_ui` si presents ;
-- colonnes techniques comme `chemin_photo_reduite`, `chemin_photo_native`, `orientation_photo`, `nom_fichier_image`.
+En mode `GTP` :
 
-### GTP
+- le script exige un CSV GTP chargé et non vide ;
+- il filtre les photos sur les `nom_fichier_image` présents dans le GTP ;
+- si la colonne `annotation_validee` existe, seules les lignes avec `annotation_validee == 1` sont retenues ;
+- sinon toutes les lignes GTP sont prises en compte.
 
-La source GTP peut enrichir ou remplacer les textes via :
+### Filtre retenue
 
-- `libelle`
-- `commentaire`
-- `retenue`
+Le comportement dépend de la variable d'environnement `REPORT_ONLY_RETENUE` :
 
-En mode `REPORT_MODE=GTP`, le script filtre la liste des photos pour ne garder que celles presentes dans le GTP, avec prise en compte de `annotation_validee` si cette colonne existe.
+- valeur par défaut : active (`1`)
 
-### Batch
+Si la colonne `retenue` existe dans la source UI :
 
-La source batch est mergee si disponible, principalement sur `photo_rel_native`, avec lecture de :
+- elle est normalisée en booléen ;
+- seules les photos retenues sont gardées quand `REPORT_ONLY_RETENUE` est actif.
 
-- `libelle_propose_batch`
-- `commentaire_propose_batch`
-- `batch_status`
-- `batch_ts`
+Si la colonne est absente :
 
-## Priorite des textes
+- toutes les photos sont considérées retenues.
 
-La priorite actuelle est :
+### Priorité des textes
+
+Le code construit :
+
+- `libelle_final`
+- `commentaire_final`
+- `source_texte`
+
+Priorité réelle :
 
 1. `GTP`
 2. `UI`
 3. `BATCH`
 
-Concretement :
+Les colonnes exploitées sont :
 
-- `libelle_final` prend d'abord `libelle` GTP ;
-- sinon `libelle_propose_ui` ;
-- sinon `libelle_propose_batch`.
+- GTP : `libelle`, `commentaire`, `retenue`
+- UI : `libelle_propose_ui`, `commentaire_propose_ui`
+- batch : `libelle_propose_batch`, `commentaire_propose_batch`, `batch_status`, `batch_ts`
 
-Et de meme pour `commentaire_final`.
+## Emplacement de sortie réel
 
-Le script renseigne aussi une colonne de provenance :
+Le script écrit toujours le DOCX dans le dossier canonique :
 
-- `GTP`
-- `UI`
-- `BATCH`
-- `VIDE`
+`<root_affaires>\<id_affaire>\BE_Traitement_captations\<id_captation>\compte_rendu_LLM\`
 
-## Si une source est absente
+où :
 
-- si le batch est absent : le rapport continue avec UI et/ou GTP ;
-- si le GTP est absent : le rapport continue avec UI et/ou batch ;
-- si les deux sont absents : le rapport peut toujours etre genere a partir du CSV UI, avec des textes eventuellement vides.
+- `id_affaire = infos["id_affaire"]`
+- `id_captation = infos["id_captation"]`
+- `root_affaires = infos["pcfixe"]["root_affaires"]` si cette valeur commence par `\\`
+- sinon fallback forcé vers `\\192.168.0.155\Affaires`
 
-## Sortie produite
+Exemple canonique :
 
-Le fichier genere est un `.docx` nomme selon le schema :
+```text
+\\192.168.0.155\Affaires\2025-J38\BE_Traitement_captations\accedit-2025-07-03\compte_rendu_LLM\
+```
+
+Point important :
+
+- le nom canonique exact est `BE_Traitement_captations` ;
+- le DOCX final est rangé sous `compte_rendu_LLM` ;
+- `AE_Expert_captations` reste la zone source des photos, pas le dossier de sortie du rapport.
+
+## Nommage du DOCX
+
+Le nom de fichier produit est exactement :
 
 ```text
 annotation_photos_<id_affaire>_<id_captation>_V_<YYYY-MM-DD_HH-MM>.docx
 ```
 
-`id_affaire` et `id_captation` sont lus depuis `infos_projet.json`.
+Exemple :
 
-Le document est ecrit dans le meme dossier que le fichier photos utilise comme base.
+```text
+annotation_photos_2025-J38_accedit-2025-07-03_V_2026-04-14_09-42.docx
+```
 
-## Limites actuelles et points de vigilance
+## Exemples de commande
 
-- le GTP repose encore, par defaut, sur une recherche du fichier `*_GTP_*.csv` le plus recent dans le dossier des photos ;
-- si plusieurs exports GTP coexistent, le script peut donc prendre le plus recent sans autre validation metier ;
-- la sortie Word depend de la presence du modele `data\Modele word rapport ver 15 05 2025.docx` ;
-- le script suppose que les colonnes de merge attendues existent dans les sources quand celles-ci sont presentes ;
-- il ne refond pas les donnees : il applique la priorite metier existante sans arbitrage supplementaire ;
-- les chemins d'images doivent etre coherents dans le CSV UI pour que les photos soient inserees correctement ;
-- le rapport est tolerant a l'absence de certaines sources, mais pas a l'absence du CSV photos principal.
+### Exemple minimal avec `--infos`
 
-## Conseils d'usage dans le pipeline global
+```powershell
+python C:\CodexWorkspace\AnnotationPhotosGPT\scripts\generate_word_report.py `
+  --infos "C:\CodexWorkspace\AnnotationPhotosGPT\data\infos_projet.json"
+```
 
-- utiliser `--infos` comme point d'entree standard pour bien cibler un couple `id_affaire` / `id_captation` ;
-- preferer des chemins absolus ou UNC dans `infos_projet.json` quand le script doit fonctionner en contexte reseau ;
-- n'utiliser les overrides `--photos`, `--batch`, `--gtp` que pour du controle ponctuel ou du diagnostic ;
-- pour un usage stable en multi-affaires / multi-captations, verifier que `fichier_photos` et `fichier_photos_batch` pointent bien vers la captation attendue ;
-- si plusieurs CSV GTP sont presents, utiliser `--gtp` pour lever toute ambiguite ;
-- conserver la logique de priorite `GTP > UI > BATCH` comme reference documentaire du script.
+### Exemple avec overrides `--photos`, `--batch`, `--gtp`
+
+```powershell
+python C:\CodexWorkspace\AnnotationPhotosGPT\scripts\generate_word_report.py `
+  --infos "\\192.168.0.155\Affaires\2025-J38\AF_Expert_ASR\transcriptions\accedit-2025-07-03\infos_projet.json" `
+  --photos "\\192.168.0.155\Affaires\2025-J38\AE_Expert_captations\accedit-2025-07-03\photos\photos.csv" `
+  --batch "\\192.168.0.155\Affaires\2025-J38\AE_Expert_captations\accedit-2025-07-03\photos\photos_batch.csv" `
+  --gtp "\\192.168.0.155\Affaires\2025-J38\AE_Expert_captations\accedit-2025-07-03\photos\photos_GTP_2026-04-14.csv"
+```
+
+## Pré-requis
+
+### Dépendances Python utilisées
+
+Le script importe au minimum :
+
+- `python-docx`
+- `pandas`
+- `Pillow`
+- `openpyxl`
+
+### Modèle Word requis
+
+Le modèle attendu est :
+
+```text
+<racine_projet>\data\Modele word rapport ver 15 05 2025.docx
+```
+
+Ce fichier doit exister, sinon le script échoue.
+
+### Structure de données attendue
+
+Côté source UI, le script suppose notamment la présence des colonnes utiles à l'insertion des images et des textes, en particulier :
+
+- `nom_fichier_image`
+- `chemin_photo_reduite` ou `chemin_photo_native`
+- `orientation_photo`
+
+Pour les fusions optionnelles :
+
+- GTP : `nom_fichier_image`
+- batch : `photo_rel_native`
+
+## Notes de robustesse
+
+Comportement réel en cas d'absence partielle des fichiers :
+
+- si `infos_projet.json` est absent : échec immédiat ;
+- si `fichier_photos` est absent : échec immédiat ;
+- si le GTP est absent : le script continue sans GTP ;
+- si le batch est absent : le script continue sans batch ;
+- si le contexte JSON est absent : le script continue avec un contexte vide ;
+- si une image est introuvable : le DOCX est généré avec la mention `[Image introuvable]` pour la photo concernée ;
+- si une image pose erreur à l'ouverture : le DOCX est généré avec la mention `[Erreur image]`.
+
+## Points de vigilance
+
+- le fallback `root_affaires` n'accepte pas une racine locale non UNC : si `pcfixe.root_affaires` ne commence pas par `\\`, le script bascule vers `\\192.168.0.155\Affaires` ;
+- le GTP auto-découvert est le plus récent par date de modification dans le dossier du fichier photos ;
+- la lecture batch n'a pas le fallback d'encodage latin-1 utilisé ailleurs dans le script ;
+- `id_affaire` et `id_captation` sont utilisés tels quels pour nommer le document et construire le répertoire de sortie ;
+- le rapport est généré à partir du comportement réel du code, pas d'une convention documentaire externe.

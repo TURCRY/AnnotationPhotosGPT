@@ -28,16 +28,11 @@ exe/
 ~$*
 *.tmp
 
-# Données lourdes / métier
-data/*.csv
+# Données métier / locales dans data/
+data/*
 !data/README_data.md
-!data/contexte_general.json
-!data/infos_projet.json
-!data/progression_annotation.json
-data/*.docx
-data/*.xlsx
-data/transcription.csv
-data/photos.csv
+!data/*.example.json
+!data/*.example.csv
 
 # Documentation lourde
 docs/**/*.docx
@@ -60,7 +55,6 @@ cd
 # Système
 Thumbs.db
 .DS_Store
-
 
 # Docs / assets optionnels
 docs/**/*.html

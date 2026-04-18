@@ -73,6 +73,57 @@ UI_DEFAULTS = {
     "dictee_audio_size": "",
 }
 
+DERIVED_INFO_DEFAULTS = {
+    "fichier_photos_batch": "",
+    "fichier_audio": "",
+    "fichier_audio_compatible": "",
+    "audio_compat_source": "",
+    "photo_depart": 1,
+    "audio_depart": "00:00:00",
+    "sync_points": [],
+    "dernier_point_sync": None,
+    "last_sync_update": None,
+    "decalage_photo_audio": None,
+    "horodatage_audio": "",
+    "t0_global": "",
+    "decalage_moyen": "",
+    "calibrage_valide": False,
+}
+
+COHERENCE_PATH_KEYS = (
+    "fichier_photos",
+    "fichier_transcription",
+    "fichier_contexte_general",
+    "fichier_audio_source",
+    "audio_compat_source",
+    "fichier_photos_batch",
+)
+
+PCFIXE_REBUILD_KEYS = (
+    "root_affaires",
+    "fichier_photos",
+    "fichier_photos_batch",
+    "fichier_transcription",
+    "fichier_contexte_general",
+    "fichier_audio_source",
+    "audio_compat_source",
+    "fichier_audio",
+    "fichier_audio_compatible",
+    "config_llm",
+    "prompt_gpt",
+    "prompt_gpt_batch",
+    "infos",
+)
+
+SYNC_SESSION_KEYS = (
+    "cursor_audio",
+    "lecture_audio_position",
+    "lecture_active",
+    "timestamp_captured",
+    "photo_index",
+    "photo_index_actuel",
+)
+
 
 
 # ---------------------------------------------------------------------
@@ -104,6 +155,270 @@ def _real_or_empty(p: str) -> str:
     if p_abs.startswith(os.path.abspath(TEMP_DIR) + os.sep):
         return ""
     return p_abs
+
+
+def _clone_default_value(value):
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return value
+
+
+def _sync_selectbox_with_current_path(select_key: str, current_path: str, current_dir: str, candidates: list[str]) -> None:
+    current_name = ""
+    if current_path and current_dir:
+        try:
+            if os.path.abspath(os.path.dirname(current_path)) == os.path.abspath(current_dir):
+                base_name = os.path.basename(current_path)
+                if base_name in candidates:
+                    current_name = base_name
+        except Exception:
+            current_name = ""
+
+    options = [""] + list(candidates)
+    if st.session_state.get(select_key) not in options:
+        st.session_state[select_key] = current_name
+
+
+def _audio_compatible_matches_source(source_path: str, compat_path: str, infos: dict) -> bool:
+    source_abs = _real_or_empty(source_path)
+    compat_abs = str(compat_path or "").strip()
+    if not source_abs or not compat_abs:
+        return False
+    if not os.path.exists(compat_abs):
+        return False
+
+    recorded_source = _real_or_empty(infos.get("audio_compat_source", ""))
+    if recorded_source:
+        return os.path.abspath(recorded_source) == os.path.abspath(source_abs)
+
+    return os.path.abspath(compat_abs) == os.path.abspath(AUDIO_COMPAT)
+
+
+def _extract_affaire_tokens(path_value: str) -> set[str]:
+    tokens = set()
+    if not path_value:
+        return tokens
+    path_upper = str(path_value).upper()
+    for match in re.findall(r"(?<![A-Z0-9])(?:\d{4}-)?J\d{1,3}(?![A-Z0-9])", path_upper):
+        tokens.add(match)
+        short = re.search(r"J\d{1,3}$", match)
+        if short:
+            tokens.add(short.group(0))
+    return tokens
+
+
+def _expected_affaire_tokens(id_affaire: str) -> set[str]:
+    current = normalize_id_affaire(id_affaire)
+    if not current:
+        return set()
+    tokens = {current}
+    short = re.search(r"J\d{1,3}$", current)
+    if short:
+        tokens.add(short.group(0))
+    return tokens
+
+
+def _path_conflicts_with_affaire(path_value: str, id_affaire: str) -> bool:
+    path_str = str(path_value or "").strip()
+    expected = _expected_affaire_tokens(id_affaire)
+    if not path_str or not expected:
+        return False
+    found = _extract_affaire_tokens(path_str)
+    return bool(found and found.isdisjoint(expected))
+
+
+def _path_conflicts_with_captation(path_value: str, id_captation: str) -> bool:
+    path_str = str(path_value or "").strip()
+    current = normalize_id_captation(id_captation)
+    if not path_str or not current:
+        return False
+    path_norm = path_str.replace("/", "\\").lower()
+    current_norm = current.lower()
+    if current_norm in path_norm:
+        return False
+
+    patterns = (
+        r"ae_expert_captations[\\/]+([^\\/]+)",
+        r"transcriptions[\\/]+([^\\/]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, path_norm, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip().lower() != current_norm
+
+    return False
+
+
+def _clear_coherence_path(container: dict, key: str, id_affaire: str, id_captation: str) -> bool:
+    value = str(container.get(key, "") or "").strip()
+    if not value:
+        return False
+    if _path_conflicts_with_affaire(value, id_affaire) or _path_conflicts_with_captation(value, id_captation):
+        container[key] = ""
+        return True
+    return False
+
+
+def _reset_sync_session_state() -> None:
+    for key in SYNC_SESSION_KEYS:
+        st.session_state.pop(key, None)
+
+
+def _reset_derived_project_state(infos: dict) -> None:
+    for key, default in DERIVED_INFO_DEFAULTS.items():
+        infos[key] = _clone_default_value(default)
+    infos["photo_depart"] = max(1, int(infos.get("photo_depart", 1) or 1))
+
+
+def _normalize_sync_floor_values(infos: dict) -> bool:
+    changed = False
+    try:
+        photo_depart = int(infos.get("photo_depart", 1) or 1)
+    except Exception:
+        photo_depart = 1
+    if photo_depart < 1:
+        infos["photo_depart"] = 1
+        changed = True
+    return changed
+
+
+def _rebuild_project_paths(infos: dict, temp: dict, id_affaire: str, id_captation: str) -> None:
+    id_affaire = normalize_id_affaire(id_affaire)
+    id_captation = normalize_id_captation(id_captation)
+    if not id_affaire or not id_captation:
+        return
+
+    existing_pcfixe = dict(infos.get("pcfixe", {}) or {})
+    root_affaires = str(existing_pcfixe.get("root_affaires") or "").strip()
+    paths = _build_pcfixe_paths(id_affaire, id_captation)
+
+    photos_real = _real_or_empty(temp.get("fichier_photos_reel", "")) or str(infos.get("fichier_photos", "") or "").strip()
+    trans_real = _real_or_empty(temp.get("fichier_transcription_reel", "")) or str(infos.get("fichier_transcription", "") or "").strip()
+    audio_src_real = _real_or_empty(temp.get("fichier_audio_source", "")) or str(infos.get("fichier_audio_source", "") or "").strip()
+    ctx_real = _real_or_empty(temp.get("fichier_contexte_general_reel", "")) or str(infos.get("fichier_contexte_general", "") or "").strip()
+    batch_real = _propose_photos_batch_path(photos_real) if photos_real else ""
+
+    infos["id_affaire"] = id_affaire
+    infos["project_id"] = id_affaire
+    infos["id_captation"] = id_captation
+    infos["captation_id"] = id_captation
+
+    if photos_real:
+        infos["fichier_photos"] = photos_real
+    if trans_real:
+        infos["fichier_transcription"] = trans_real
+    if audio_src_real:
+        infos["fichier_audio_source"] = audio_src_real
+    if ctx_real:
+        infos["fichier_contexte_general"] = ctx_real
+    if batch_real:
+        infos["fichier_photos_batch"] = batch_real
+
+    pcfixe = {}
+    if root_affaires:
+        pcfixe["root_affaires"] = root_affaires
+    pcfixe["config_llm"] = str(paths["config_llm"])
+    pcfixe["prompt_gpt"] = str(paths["prompt_gpt"])
+    pcfixe["prompt_gpt_batch"] = str(paths["prompt_gpt_batch"])
+    pcfixe["infos"] = str(paths["infos"])
+    pcfixe["fichier_audio"] = str(paths["audio_dir"] / "audio_compatible.wav")
+    pcfixe["fichier_audio_compatible"] = str(paths["audio_dir"] / "audio_compatible.wav")
+
+    if photos_real:
+        pcfixe["fichier_photos"] = str(paths["photos_dir"] / Path(photos_real).name)
+        pcfixe["fichier_photos_batch"] = str(paths["photos_dir"] / "photos_batch.csv")
+    if trans_real:
+        pcfixe["fichier_transcription"] = str(paths["trans_dir"] / Path(trans_real).name)
+    if ctx_real:
+        pcfixe["fichier_contexte_general"] = str(paths["trans_dir"] / Path(ctx_real).name)
+    if audio_src_real:
+        pcfixe["fichier_audio_source"] = str(paths["audio_dir"] / Path(audio_src_real).name)
+        pcfixe["audio_compat_source"] = str(paths["audio_dir"] / Path(audio_src_real).name)
+
+    infos["pcfixe"] = pcfixe
+
+
+def _sanitize_affaire_captation_state(infos: dict, temp: dict, id_affaire: str, id_captation: str) -> tuple[bool, list[str]]:
+    current_affaire = normalize_id_affaire(id_affaire)
+    current_captation = normalize_id_captation(id_captation)
+    stored_affaire = normalize_id_affaire(infos.get("id_affaire", ""))
+    stored_captation = normalize_id_captation(infos.get("id_captation", ""))
+
+    changed = False
+    reasons = []
+
+    if _normalize_sync_floor_values(infos):
+        changed = True
+        reasons.append("photo_depart normalisé à 1")
+
+    couple_changed = (
+        bool(current_affaire and current_captation)
+        and (current_affaire != stored_affaire or current_captation != stored_captation)
+    )
+    if couple_changed:
+        changed = True
+        reasons.append("couple affaire/captation modifié")
+        _reset_derived_project_state(infos)
+
+    source_pairs = (
+        ("fichier_photos_reel", "fichier_photos"),
+        ("fichier_transcription_reel", "fichier_transcription"),
+        ("fichier_audio_source", "fichier_audio_source"),
+        ("fichier_contexte_general_reel", "fichier_contexte_general"),
+    )
+    source_changed = False
+    for temp_key, info_key in source_pairs:
+        temp_value = _real_or_empty(temp.get(temp_key, ""))
+        info_value = _real_or_empty(infos.get(info_key, ""))
+        if temp_value and info_value and os.path.abspath(temp_value) != os.path.abspath(info_value):
+            source_changed = True
+            reasons.append(f"{info_key} source modifié")
+    if source_changed and not couple_changed:
+        changed = True
+        _reset_derived_project_state(infos)
+
+    for key in COHERENCE_PATH_KEYS:
+        if _clear_coherence_path(infos, key, current_affaire, current_captation):
+            changed = True
+            reasons.append(f"{key} incompatible avec le couple courant")
+
+    for temp_key in (
+        "fichier_photos_reel",
+        "fichier_photos",
+        "fichier_transcription_reel",
+        "fichier_transcription",
+        "fichier_audio_source",
+        "fichier_audio",
+        "fichier_contexte_general_reel",
+        "fichier_contexte_general",
+    ):
+        if _clear_coherence_path(temp, temp_key, current_affaire, current_captation):
+            changed = True
+            reasons.append(f"{temp_key} temporaire incompatible avec le couple courant")
+
+    pcfixe = dict(infos.get("pcfixe", {}) or {})
+    if pcfixe:
+        root_affaires = str(pcfixe.get("root_affaires") or "").strip()
+        rebuilt_pcfixe = {"root_affaires": root_affaires} if root_affaires else {}
+        for key in PCFIXE_REBUILD_KEYS:
+            if key == "root_affaires":
+                continue
+            value = pcfixe.get(key)
+            if value and (_path_conflicts_with_affaire(value, current_affaire) or _path_conflicts_with_captation(value, current_captation)):
+                changed = True
+                reasons.append(f"pcfixe.{key} incompatible avec le couple courant")
+        if changed:
+            infos["pcfixe"] = rebuilt_pcfixe
+
+    if changed:
+        temp["fichier_audio_compatible"] = ""
+        st.session_state["photos_batch_path_candidate"] = ""
+        _reset_sync_session_state()
+        _rebuild_project_paths(infos, temp, current_affaire, current_captation)
+
+    return changed, reasons
 
 def _load_csv_flexible(path: str) -> pd.DataFrame:
     """Lit un CSV en essayant plusieurs encodages usuels (UTF-8, cp1252...)."""
@@ -455,6 +770,26 @@ def show_selection_interface():
         "Il ne remplace pas la configuration projet ni la validation cote serveur."
     )
 
+    audio_source_saved = _real_or_empty(infos.get("fichier_audio_source", ""))
+    audio_compat_saved = str(infos.get("fichier_audio", "") or infos.get("fichier_audio_compatible", "") or "").strip()
+    audio_compat_ok = _audio_compatible_matches_source(audio_source_saved, audio_compat_saved, infos)
+
+    st.markdown("#### État audio du projet")
+    if audio_source_saved:
+        st.caption(f"Source audio validée : `{audio_source_saved}`")
+    else:
+        st.caption("Source audio validée : `—`")
+    if audio_compat_saved and os.path.exists(audio_compat_saved):
+        st.caption(f"Audio compatible validé : `{audio_compat_saved}`")
+    else:
+        st.caption("Audio compatible validé : `—`")
+
+    if audio_source_saved and not audio_compat_ok:
+        st.warning("⚠️ Audio source présent, mais audio compatible manquant ou incohérent. Le projet n'est pas prêt pour l'annotation.")
+        st.info("Enregistrez de nouveau les fichiers pour régénérer l'audio compatible, ou réutilisez le compatible existant s'il correspond à la même source.")
+    elif audio_source_saved and audio_compat_ok:
+        st.success("✅ Audio source et audio compatible cohérents.")
+
     # --- synchronisation initiale ---
     if not temp.get("fichier_photos_reel") and infos.get("fichier_photos"):
         temp["fichier_photos_reel"] = os.path.abspath(infos["fichier_photos"])
@@ -473,8 +808,6 @@ def show_selection_interface():
     if not temp.get("fichier_audio"):
         if infos.get("fichier_audio"):
             temp["fichier_audio"] = os.path.abspath(infos["fichier_audio"])
-        elif temp.get("fichier_audio_source"):
-            temp["fichier_audio"] = temp["fichier_audio_source"]
 
     if not temp.get("fichier_contexte_general_reel") and infos.get("fichier_contexte_general"):
         temp["fichier_contexte_general_reel"] = os.path.abspath(infos["fichier_contexte_general"])
@@ -482,6 +815,9 @@ def show_selection_interface():
 
     if not temp.get("fichier_audio_compatible") and infos.get("fichier_audio"):
         temp["fichier_audio_compatible"] = os.path.abspath(infos["fichier_audio"])
+
+    if not temp.get("fichier_audio") and temp.get("fichier_audio_compatible"):
+        temp["fichier_audio"] = temp["fichier_audio_compatible"]
 
     st.session_state["fichiers_temp"] = temp
 
@@ -503,23 +839,35 @@ def show_selection_interface():
     )
 
     photos_dir = photos_dir_input.strip().strip('"')
+    current_photos_real = _real_or_empty(temp.get("fichier_photos_reel", "")) or _real_or_empty(infos.get("fichier_photos", ""))
     if photos_dir:
         if os.path.isdir(photos_dir):
-            candidates = [
+            candidates = sorted([
                 f for f in os.listdir(photos_dir)
                 if f.lower().endswith((".xlsx", ".csv"))
-            ]
+            ])
             if candidates:
+                _sync_selectbox_with_current_path("photos_file_select", current_photos_real, photos_dir, candidates)
                 photos_file_selected = st.selectbox(
                     "Choisir le fichier de photos dans ce dossier :",
-                    candidates,
+                    [""] + candidates,
                     key="photos_file_select",
+                    format_func=lambda x: x if x else "— conserver le fichier validé actuel —",
                 )
+                if current_photos_real and os.path.exists(current_photos_real):
+                    st.caption(f"Fichier photos validé actuel : `{current_photos_real}`")
                 if photos_file_selected:
                     real_path = os.path.abspath(os.path.join(photos_dir, photos_file_selected))
-                    temp["fichier_photos_reel"] = real_path
-                    temp["fichier_photos"] = real_path
-                    st.success(f"✅ Fichier photos (chemin RÉEL) : {real_path}")
+                    if current_photos_real and os.path.abspath(real_path) == os.path.abspath(current_photos_real):
+                        st.success(f"✅ Fichier photos conservé : {real_path}")
+                    elif st.button("✅ Valider ce fichier photos", key="validate_photos_file"):
+                        temp["fichier_photos_reel"] = real_path
+                        temp["fichier_photos"] = real_path
+                        st.session_state["selection_return_reason"] = f"Fichier photos changé explicitement vers {real_path}"
+                        st.success(f"✅ Fichier photos (chemin RÉEL) : {real_path}")
+                        st.rerun()
+                    else:
+                        st.info("Alternative détectée : elle ne remplacera le fichier validé qu'après validation explicite.")
             else:
                 st.warning("Aucun fichier .xlsx ou .csv trouvé dans ce dossier.")
         else:
@@ -766,6 +1114,21 @@ def show_selection_interface():
 
             st.success(f"Fichier audio source enregistré : {abs_audio}")
 
+    saved_audio_source = _real_or_empty(infos.get("fichier_audio_source", ""))
+    current_audio_source = _real_or_empty(temp.get("fichier_audio_source", "")) or saved_audio_source
+    saved_audio_compat = str(infos.get("fichier_audio", "") or infos.get("fichier_audio_compatible", "") or "").strip()
+    compat_reusable = _audio_compatible_matches_source(current_audio_source, saved_audio_compat, infos)
+
+    if current_audio_source and compat_reusable:
+        temp["fichier_audio_compatible"] = saved_audio_compat
+        temp["fichier_audio"] = saved_audio_compat
+        st.success("✅ Un audio compatible existant correspond à la source courante ; il pourra être conservé.")
+    elif current_audio_source:
+        temp["fichier_audio_compatible"] = ""
+        temp["fichier_audio"] = ""
+        st.warning("⚠️ Audio compatible manquant pour la source courante.")
+        st.caption("L'étape d'enregistrement régénérera `fichier_audio` / `fichier_audio_compatible` à partir de `fichier_audio_source`.")
+
     # =====================================================================
     # Contexte général (JSON)
     # =====================================================================
@@ -834,6 +1197,18 @@ def show_selection_interface():
         value=str(infos.get("id_captation", "") or ""),
         key="id_captation_input",
     )
+
+    state_changed, state_reasons = _sanitize_affaire_captation_state(
+        infos=infos,
+        temp=temp,
+        id_affaire=id_affaire_input,
+        id_captation=id_captation_input,
+    )
+    if state_changed:
+        st.session_state["fichiers_temp"] = temp
+        sauvegarder_infos_projet(infos)
+        st.info("Réinitialisation immédiate des champs dérivés : " + "; ".join(dict.fromkeys(state_reasons)))
+        st.rerun()
 
     st.caption("Création affaire (optionnel, compat create_affaire serveur)")
     affaire_title_input = st.text_input(
@@ -914,6 +1289,8 @@ def show_selection_interface():
         "fichier_contexte_general_temp": temp.get("fichier_contexte_general_temp", ""),
     }
     st.code(json.dumps(preview, indent=2, ensure_ascii=False), language="json")
+    if preview.get("fichier_audio_source") and not preview.get("fichier_audio_compatible"):
+        st.warning("⚠️ Aperçu temporaire incomplet : la source audio est choisie, mais l'audio compatible n'est pas encore disponible.")
 
     st.divider()
     st.markdown("### Publication PC fixe")

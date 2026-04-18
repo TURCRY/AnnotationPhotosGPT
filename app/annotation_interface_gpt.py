@@ -879,22 +879,23 @@ def build_vlm_context_guided(ctx_general: dict, transcription_extrait: str) -> s
         + "\n".join([f"- {it}" for it in items])
     )
 
-def ensure_desc_vlm(i, row_view, guide_src: str, *, photos_df, photos_csv, mission, context_system, context_user="", vlm_system="", vlm_user="") -> str:
-    # 1) priorité absolue : UI explicite
-    desc = str(row_view.get("description_vlm_ui", "") or "").strip()
-    if desc:
-        return desc
+def ensure_desc_vlm(i, row_view, guide_src: str, *, photos_df, photos_csv, mission, context_system, context_user="", vlm_system="", vlm_user="", force: bool = False) -> str:
+    if not force:
+        # 1) priorité absolue : UI explicite
+        desc = str(row_view.get("description_vlm_ui", "") or "").strip()
+        if desc:
+            return desc
 
-    # 2) fallback : colonne UI historique (si encore utilisée)
-    desc = str(row_view.get("description_vlm", "") or "").strip()
-    if desc:
-        return desc
+        # 2) fallback : colonne UI historique (si encore utilisée)
+        desc = str(row_view.get("description_vlm", "") or "").strip()
+        if desc:
+            return desc
 
-    # 3) fallback batch (merge suffix _batch ou colonne native si déjà présente)
-    #    (selon votre merge, c’est souvent "description_vlm_batch")
-    desc = str(row_view.get("description_vlm_batch", "") or "").strip()
-    if desc:
-        return desc
+        # 3) fallback batch (merge suffix _batch ou colonne native si déjà présente)
+        #    (selon votre merge, c’est souvent "description_vlm_batch")
+        desc = str(row_view.get("description_vlm_batch", "") or "").strip()
+        if desc:
+            return desc
 
     # 4) sinon : appel VLM UI
     image_path = os.path.join(
@@ -968,6 +969,7 @@ def show_annotation_interface():
 
     # 1) Audio compatible présent ?
     if not audio_path or not os.path.exists(audio_path):
+        st.session_state["selection_return_reason"] = "annotation bloquée: fichier audio compatible manquant"
         st.error("❌ Aucun fichier audio compatible valide. "
                  "Veuillez revenir à l’étape 1 pour le (re)générer.")
         st.stop()
@@ -975,12 +977,14 @@ def show_annotation_interface():
     # 2) Cohérence source / compatible
     if audio_src_path and audio_compat_source and \
        os.path.abspath(audio_src_path) != os.path.abspath(audio_compat_source):
+        st.session_state["selection_return_reason"] = "annotation bloquée: incohérence entre audio source et audio compatible"
         st.error("❌ Le fichier audio compatible ne correspond plus au fichier audio source. "
                  "Veuillez repasser par l’étape 1 (sélection des fichiers).")
         st.stop()
 
     # 3) Calibrage obligatoire avant annotation
     if not calibrage_valide:
+        st.session_state["selection_return_reason"] = "annotation bloquée: calibrage invalide"
         st.error("❌ Le calibrage n’est pas valide. Veuillez d’abord réaliser la synchronisation (étape 2.1).")
         st.stop()
 
@@ -1591,33 +1595,16 @@ def show_annotation_interface():
                 # 1) calcul si vide (inchangé, mais gardé)
                 with colv1:
                     if st.button("🔎 Calculer la description VLM", key=f"vlm_only_{i}"):
-                        image_path = os.path.join(row["chemin_photo_reduite"], row["nom_fichier_image"])
                         try:
-                            ctx_general = {
-                                "mission": mission,
-                                "system": context_system,
-                                "user": context_user,
-                                "vlm_system": vlm_system,
-                                "vlm_user": vlm_user,
-                            }
                             guide_src = (texte_com or texte_lib or "").strip()
-                            ctx_vlm = build_vlm_context_guided(ctx_general, guide_src)
-                            desc_new = call_vlm_single(image_path, context=ctx_vlm, prompt=VLM_PROMPT)
-
-
+                            desc_new = ensure_desc_vlm(
+                                i, row_view, guide_src=guide_src,
+                                photos_df=photos_df, photos_csv=photos_csv,
+                                mission=mission, context_system=context_system,
+                                context_user=context_user, vlm_system=vlm_system, vlm_user=vlm_user,
+                                force=False,
+                            )
                             if desc_new:
-                                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                if desc_new:
-                                    photos_df.at[i, "description_vlm_ui"] = desc_new
-                                    photos_df.at[i, "vlm_ui_status"] = "OK"
-                                else:
-                                    photos_df.at[i, "vlm_ui_status"] = "EMPTY"  # ou "ERR" si vous considérez “vide” comme erreur
-
-                                photos_df.at[i, "vlm_ui_ts"] = now
-                                photos_df.at[i, "ui_ts"] = now
-                                photo_dirty = True
-                                if photo_dirty:
-                                    photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
                                 st.rerun()
                             else:
                                 st.warning("VLM a répondu vide.")
@@ -1627,25 +1614,17 @@ def show_annotation_interface():
                 # 2) régénération forcée (NOUVEAU)
                 with colv2:
                     if st.button("↻ Régénérer description VLM", key=f"vlm_force_{i}"):
-                        image_path = os.path.join(row["chemin_photo_reduite"], row["nom_fichier_image"])
                         try:
-                            # Option : injecter un contexte court (extrait audio) pour guider les “vérifications”
-                            ctx_src = (texte_com or texte_lib or "").strip()[:1200]
-                            ctx = ""
-                            if ctx_src:
-                                ctx = "TRANSCRIPTION (extrait, pour guider les vérifications — ne pas en déduire des faits) :\n" + ctx_src
-
-                            desc_new = call_vlm_single(image_path, context=ctx, prompt=VLM_PROMPT)
+                            guide_src = (texte_com or texte_lib or "").strip()
+                            desc_new = ensure_desc_vlm(
+                                i, row_view, guide_src=guide_src,
+                                photos_df=photos_df, photos_csv=photos_csv,
+                                mission=mission, context_system=context_system,
+                                context_user=context_user, vlm_system=vlm_system, vlm_user=vlm_user,
+                                force=True,
+                            )
                             if desc_new:
-                                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                photos_df.at[i, "description_vlm_ui"] = desc_new
-                                photos_df.at[i, "vlm_ui_status"] = "OK"
-                                photos_df.at[i, "vlm_ui_ts"] = now
-                                photos_df.at[i, "ui_ts"] = now
-                                photo_dirty = True
                                 st.success("Description VLM régénérée et enregistrée.")
-                                if photo_dirty:
-                                    photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
                                 st.rerun()
                             else:
                                 st.warning("VLM a répondu vide.")

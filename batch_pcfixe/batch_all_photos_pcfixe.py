@@ -131,7 +131,7 @@ def die(code: int, msg: str) -> int:
     return code
 
 def read_json(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8-sig") as f:
         return json.load(f)
 
 def norm_bool(v: Any) -> bool:
@@ -453,6 +453,64 @@ def apply_template(s: str, mapping: Dict[str, str]) -> str:
     return out
 
 
+GENERIC_LABEL_PATTERNS = (
+    r"^vue générale\b",
+    r"^vue d[' ]ensemble\b",
+    r"^vue globale\b",
+)
+
+BOILERPLATE_LABEL_PATTERNS = (
+    r"^(vérifie|verifie|répare|repare|réparation terminée|reparation terminee|contrôle|controle|observe|remplace|redémarre|redemarre)\b",
+    r"\b(connexion internet|redémarre appareil|redemarre appareil|s'il te plaît|svp|veuillez|merci)\b",
+    r"\bassistant\b",
+)
+
+
+def is_label_generic_or_invalid(label: str) -> bool:
+    txt = (label or "").strip()
+    if not txt:
+        return True
+    low = txt.lower()
+    if any(re.search(p, low) for p in GENERIC_LABEL_PATTERNS):
+        return True
+    if any(re.search(p, low) for p in BOILERPLATE_LABEL_PATTERNS):
+        return True
+    return False
+
+
+def build_libelle_retry_prompt(commentaire: str, description_vlm: str) -> str:
+    commentaire = (commentaire or "").strip()
+    description_vlm = (description_vlm or "").strip()
+    return (
+        "Tu dois produire uniquement un libelle photo.\n"
+        "Contraintes obligatoires :\n"
+        "- une seule ligne ;\n"
+        "- formulation courte, descriptive et nominale ;\n"
+        "- pas d'impératif, pas de consigne, pas de formulation assistant ;\n"
+        "- pas de 'vue générale', pas d'élément non précisé, pas de commentaire complet ;\n"
+        "- s'ancrer d'abord sur le commentaire ci-dessous, puis sur la description visuelle si utile.\n\n"
+        "Commentaire :\n"
+        f"{commentaire}\n\n"
+        "Description visuelle :\n"
+        f"{description_vlm}\n\n"
+        "Réponds uniquement par le libelle."
+    )
+
+
+def extract_vlm_prompt_fields(ctx_general: Dict[str, Any]) -> tuple[str, str]:
+    """
+    PASS 1 VLM:
+    - utilise les champs dédiés `vlm_system` / `vlm_user` si présents ;
+    - reste rétrocompatible avec les anciens JSON en renvoyant des chaînes vides.
+    PASS 2 LLM continue d'utiliser `system` / `user` via les prompts batch/UI.
+    """
+    if not isinstance(ctx_general, dict):
+        return "", ""
+    vlm_system = str(ctx_general.get("vlm_system") or "").strip()
+    vlm_user = str(ctx_general.get("vlm_user") or "").strip()
+    return vlm_system, vlm_user
+
+
 def compute_pcfixe_dirs_from_photo_rel(photo_rel_native: str, pc_root_affaires: str, id_affaire: str) -> tuple[str, str]:
     """
     photo_rel_native attendu: AE_Expert_captations/<id_captation>/photos/JPG/<nom>
@@ -502,7 +560,7 @@ def extract_transcript_window(trs, center, before, after, max_chars=2000) -> str
 # VLM batch
 # -------------------------
 
-def post_vision_describe_batch(base_url, api_key, images, *, mode="quality", timeout):
+def post_vision_describe_batch(base_url, api_key, images, *, mode="quality", timeout, context_global="", prompt=""):
     url = base_url.rstrip("/") + "/vision/describe_batch"
     headers = {"x-api-key": api_key} if api_key else {}
 
@@ -521,6 +579,10 @@ def post_vision_describe_batch(base_url, api_key, images, *, mode="quality", tim
             "mode": mode,
             "contexts_json": json.dumps(ctx, ensure_ascii=False),
         }
+        if context_global:
+            data["context"] = context_global
+        if prompt:
+            data["prompt"] = prompt
 
         r = requests.post(url, headers=headers, files=files, data=data, timeout=timeout)
         r.raise_for_status()
@@ -598,7 +660,7 @@ def mark_vlm_err_batch(b: dict, reason: str, *, batch_id: str,
         b["description_vlm_batch"] = ""
 
 
-def flush_vlm_batch(batch, *, batch_index, base_url, api_key, mode, current_batch_id):
+def flush_vlm_batch(batch, *, batch_index, base_url, api_key, mode, current_batch_id, context_global="", prompt=""):
     """
     batch: list[tuple[str, Path, str]] = (photo_key, img_path, ctx)
     """
@@ -621,6 +683,8 @@ def flush_vlm_batch(batch, *, batch_index, base_url, api_key, mode, current_batc
             [(p, c) for (_, p, c) in batch],
             mode=mode,
             timeout=timeout,
+            context_global=context_global,
+            prompt=prompt,
         )
         if not isinstance(results, list) or len(results) != len(batch):
             for (photo_key, _, _) in batch:
@@ -1065,6 +1129,8 @@ def main() -> int:
     trans_csv  = Path(pc["fichier_transcription"])
     ctx_path   = Path(pc["fichier_contexte_general"])
     cfg_llm    = read_json(Path(pc["config_llm"]))
+    ctx_general = read_json(ctx_path)
+    vlm_context_global, vlm_prompt = extract_vlm_prompt_fields(ctx_general)
 
     vlm_log_path = photos_csv.with_suffix(f".vlm_{run_id}.jsonl")
     def log_vlm_event(event: dict):
@@ -1367,7 +1433,9 @@ def main() -> int:
                     base_url=base_url,
                     api_key=api_key,
                     mode=vlm_mode,
-                    current_batch_id=current_batch_id
+                    current_batch_id=current_batch_id,
+                    context_global=vlm_context_global,
+                    prompt=vlm_prompt,
                 )
 
                 vlm_fail_streak = 0 if ok > 0 else (vlm_fail_streak + 1)
@@ -1388,7 +1456,9 @@ def main() -> int:
                 base_url=base_url,
                 api_key=api_key,
                 mode=vlm_mode,
-                current_batch_id=current_batch_id
+                current_batch_id=current_batch_id,
+                context_global=vlm_context_global,
+                prompt=vlm_prompt,
             )
             vlm_fail_streak = 0 if ok > 0 else (vlm_fail_streak + 1)
             vlm_backoff_sleep(vlm_fail_streak)
@@ -1431,7 +1501,6 @@ def main() -> int:
 
 
     # 0) contexte/mission (inchangé)
-    ctx_general = read_json(ctx_path)
     contexte_general_str = json.dumps(ctx_general, ensure_ascii=False, indent=2)
     mission = str(infos.get("mission") or ctx_general.get("mission") or "")
 
@@ -1644,6 +1713,7 @@ def main() -> int:
 
         # --- LIBELLÉ (obligatoire) ---
         lib_ok = False
+        lib_needs_retry = False
         try:
             actual_llm_calls += 1
             actual_llm_lib += 1
@@ -1676,6 +1746,7 @@ def main() -> int:
             b["llm_trace_lib"] = ""
             b["batch_status"] = "OK_LIB"
             lib_ok = True
+            lib_needs_retry = is_label_generic_or_invalid(lib)
 
         except Exception as e:
             # generate_with_retry a déjà appelé _set_llm_err dans la plupart des cas
@@ -1721,6 +1792,58 @@ def main() -> int:
                 b["llm_trace_com"] = ""
                 b["batch_status"] = "OK_LIB_COM"
                 com_ok = True
+
+                if lib_needs_retry and (b.get("commentaire_propose_batch") or "").strip():
+                    prev_err_lib = b.get("llm_err_lib", "")
+                    prev_http_lib = b.get("llm_http_status_lib", "")
+                    prev_trace_lib = b.get("llm_trace_lib", "")
+                    try:
+                        retry_prompt = build_libelle_retry_prompt(
+                            commentaire=b.get("commentaire_propose_batch", ""),
+                            description_vlm=description_vlm_batch,
+                        )
+                        actual_llm_calls += 1
+                        actual_llm_lib += 1
+                        lib_retry = generate_with_retry(
+                            client,
+                            llm_backend=llm_backend,
+                            prompt=retry_prompt,
+                            system=sys_lib,
+                            model=model,
+                            openai_api_key=openai_api_key,
+                            temperature=temp_lib,
+                            max_tokens=max_tokens_lib,
+                            task="libelle",
+                            expect_json=True,
+                            salient_families=[],
+                            prefer_dictee=False,
+                            b=b,
+                            which="LIB",
+                            max_attempts=1,
+                            base_sleep=0.6,
+                        )
+                        if lib_retry and not is_label_generic_or_invalid(lib_retry):
+                            b["libelle_propose_batch"] = lib_retry
+                            b["llm_err_lib"] = ""
+                            b["llm_http_status_lib"] = ""
+                            b["llm_trace_lib"] = (
+                                (prev_trace_lib + "\n[lib_retry_from_comment=ok]").strip()
+                                if prev_trace_lib else "[lib_retry_from_comment=ok]"
+                            )
+                        else:
+                            b["llm_err_lib"] = prev_err_lib
+                            b["llm_http_status_lib"] = prev_http_lib
+                            b["llm_trace_lib"] = (
+                                (prev_trace_lib + "\n[lib_retry_from_comment=ignored]").strip()
+                                if prev_trace_lib else "[lib_retry_from_comment=ignored]"
+                            )
+                    except Exception:
+                        b["llm_err_lib"] = prev_err_lib
+                        b["llm_http_status_lib"] = prev_http_lib
+                        b["llm_trace_lib"] = (
+                            (prev_trace_lib + "\n[lib_retry_from_comment=failed]").strip()
+                            if prev_trace_lib else "[lib_retry_from_comment=failed]"
+                        )
 
             except Exception as e:
                 # on garde OK_LIB et on marque l’échec commentaire
