@@ -2,6 +2,7 @@ import json
 import os
 
 from compat_affaire_captation import normalize_infos_aliases
+from path_migration import migrate_local_user_paths
 
 
 def charger_infos_projet():
@@ -9,7 +10,12 @@ def charger_infos_projet():
     chemin_json = os.path.join("data", "infos_projet.json")
     if os.path.exists(chemin_json):
         with open(chemin_json, "r", encoding="utf-8") as f:
-            return normalize_infos_aliases(json.load(f))
+            infos = json.load(f)
+        infos, changed = migrate_local_user_paths(infos)
+        infos = normalize_infos_aliases(infos)
+        if changed:
+            sauvegarder_infos_projet(infos)
+        return infos
     else:
         return {}
 
