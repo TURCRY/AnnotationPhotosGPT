@@ -66,6 +66,97 @@ def _resolve_path_like(value: str, *, base_dir: Path) -> Path:
         return p
     return (base_dir / p).resolve()
 
+
+PROFILE_PREFIX_REWRITES = [
+    (Path(r"C:\Users\Utilisateur"), Path(r"C:\Users\User")),
+]
+
+
+def _build_photo_candidate(base_dir_img: str, nom_fichier: str) -> Path | None:
+    base_dir_clean = str(base_dir_img or "").strip()
+    nom_fichier_clean = str(nom_fichier or "").strip()
+    if not nom_fichier_clean:
+        return None
+    if not base_dir_clean:
+        return Path(nom_fichier_clean)
+    return Path(os.path.normpath(os.path.join(base_dir_clean, nom_fichier_clean)))
+
+
+def _rewrite_path_prefix(path: Path) -> list[Path]:
+    rewrites: list[Path] = []
+    path_parts = path.parts
+    for old_prefix, new_prefix in PROFILE_PREFIX_REWRITES:
+        old_parts = old_prefix.parts
+        if len(path_parts) < len(old_parts):
+            continue
+        if tuple(part.lower() for part in path_parts[: len(old_parts)]) != tuple(
+            part.lower() for part in old_parts
+        ):
+            continue
+        candidate = Path(*new_prefix.parts, *path_parts[len(old_parts) :])
+        if candidate not in rewrites:
+            rewrites.append(candidate)
+    return rewrites
+
+
+def resolve_photo_path(row, photos_path: Path) -> tuple[Path | None, dict]:
+    nom_fichier = safe_text(getattr(row, "nom_fichier_image", "")).strip()
+    reduced_dir = safe_text(getattr(row, "chemin_photo_reduite", "")).strip()
+    native_dir = safe_text(getattr(row, "chemin_photo_native", "")).strip()
+    base_dir_img = reduced_dir or native_dir
+    photos_dir = photos_path.parent
+
+    debug_info = {
+        "nom_fichier_image": nom_fichier,
+        "csv_base_dir": base_dir_img,
+        "attempted_paths": [],
+        "resolution": None,
+    }
+
+    def _remember(candidate: Path | None, label: str) -> tuple[bool, Path | None]:
+        if candidate is None:
+            return False, None
+        candidate = Path(os.path.normpath(str(candidate)))
+        candidate_str = str(candidate)
+        if candidate_str not in debug_info["attempted_paths"]:
+            debug_info["attempted_paths"].append(candidate_str)
+        if candidate.exists():
+            debug_info["resolution"] = label
+            return True, candidate
+        return False, candidate
+
+    direct_candidate = _build_photo_candidate(base_dir_img, nom_fichier)
+    found, resolved_path = _remember(direct_candidate, "direct")
+    if found:
+        return resolved_path, debug_info
+
+    if direct_candidate is not None:
+        for rewritten_candidate in _rewrite_path_prefix(direct_candidate):
+            found, resolved_path = _remember(rewritten_candidate, "fallback_profile")
+            if found:
+                return resolved_path, debug_info
+
+    for folder_name, resolution_label in [
+        ("JPG reduit", "fallback_photos_dir_jpg_reduit"),
+        ("JPG", "fallback_photos_dir_jpg"),
+    ]:
+        found, resolved_path = _remember(photos_dir / folder_name / nom_fichier, resolution_label)
+        if found:
+            return resolved_path, debug_info
+
+    portable_dir_name = ""
+    if base_dir_img:
+        portable_dir_name = Path(os.path.normpath(base_dir_img)).name
+    if portable_dir_name:
+        found, resolved_path = _remember(
+            photos_dir / portable_dir_name / nom_fichier,
+            "fallback_photos_dir_portable",
+        )
+        if found:
+            return resolved_path, debug_info
+
+    return None, debug_info
+
 def load_runtime_context(project_root: Path, args):
     infos_path = _resolve_path_like(args.infos, base_dir=project_root)
     if not infos_path.exists():
@@ -406,11 +497,8 @@ for num, row in enumerate(df.itertuples(index=False), start=1):
     commentaire = safe_text(getattr(row, "commentaire_final", ""))
     libelle = safe_text(getattr(row, "libelle_final", ""))
     orientation = str(getattr(row, "orientation_photo", "0") or "0")
-    base_dir_img = safe_text(getattr(row, "chemin_photo_reduite", "")) or safe_text(getattr(row, "chemin_photo_native", ""))
-    nom_fichier = safe_text(getattr(row, "nom_fichier_image", ""))
-
-
-    photo_path = os.path.normpath(os.path.join(base_dir_img, nom_fichier))
+    photo_path, photo_debug = resolve_photo_path(row, photos_path)
+    nom_fichier = photo_debug["nom_fichier_image"]
 
     table = doc.add_table(rows=1, cols=2)
     table.autofit = False
@@ -435,7 +523,18 @@ for num, row in enumerate(df.itertuples(index=False), start=1):
     cell_photo = table.cell(0, 1)
     paragraph = cell_photo.paragraphs[0]
     run = paragraph.add_run()
-    if os.path.exists(photo_path):
+    if photo_path is not None:
+        resolution = photo_debug["resolution"]
+        if resolution == "direct":
+            print(f"[IMG] direct OK : {photo_path}")
+        elif resolution == "fallback_profile":
+            print(f"[IMG] fallback profile OK : {photo_path}")
+        elif resolution == "fallback_photos_dir_jpg_reduit":
+            print(f"[IMG] fallback photos_dir/JPG reduit OK : {photo_path}")
+        elif resolution == "fallback_photos_dir_jpg":
+            print(f"[IMG] fallback photos_dir/JPG OK : {photo_path}")
+        elif resolution == "fallback_photos_dir_portable":
+            print(f"[IMG] fallback photos_dir/{Path(photo_path).parent.name} OK : {photo_path}")
         try:
             img = Image.open(photo_path)
             if orientation in ["90", "270", "180"]:
@@ -450,6 +549,12 @@ for num, row in enumerate(df.itertuples(index=False), start=1):
         except Exception:
             paragraph.add_run("[Erreur image]").bold = True
     else:
+        print(
+            "[IMG][WARN] introuvable : "
+            f"nom_fichier_image={nom_fichier} | "
+            f"chemin_csv_initial={photo_debug['csv_base_dir'] or '<vide>'} | "
+            f"fallbacks_essayes={photo_debug['attempted_paths']}"
+        )
         paragraph.add_run("[Image introuvable]").bold = True
 
     # Légende (avec timecode si dispo)
