@@ -6,13 +6,19 @@ from datetime import datetime, timedelta
 from utils import (
     lire_infos_projet, sauvegarder_infos_projet,
     convertir_hms_en_secondes, convertir_secondes_en_hms,
-    get_audio_duration, get_photo_datetime
+    get_audio_duration, get_photo_datetime,
+    get_canonical_affaires_root
 
+)
+from path_migration import (
+    migrate_photo_dataframe_paths,
+    resolve_migrated_user_profile_path,
 )
 
 from streamlit_wavesurfer import wavesurfer
 import requests
 #----------------------------------------------------------------------------
+from traitement_audio import start_audio_server_if_needed
 from pathlib import Path
 from pandas import Timestamp
 import numpy as np
@@ -45,7 +51,15 @@ def _load_photos(path):
         return s.strip()
 
     df.columns = [_clean_col(c) for c in df.columns]
+    df, changed = migrate_photo_dataframe_paths(df)
+    if changed:
+        _save_photos(df, path)
     return df
+
+
+def _resolve_existing_local_path(path_value: str) -> str:
+    resolved, _ = resolve_migrated_user_profile_path(path_value)
+    return resolved or str(path_value or "")
 
 def _save_photos(df, path):
     p = Path(path)
@@ -90,9 +104,7 @@ def _regularize_photos_outputs_and_copy(infos, fichier_photos, df):
         st.info(f"Jumeau realigne : `{aligned_path}`")
 
     pcfixe = infos.get("pcfixe") or {}
-    root_affaires = str(pcfixe.get("root_affaires") or "").strip()
-    if not root_affaires.startswith("\\\\"):
-        root_affaires = r"\\192.168.0.155\Affaires"
+    root_affaires = get_canonical_affaires_root()
 
     id_affaire = str(infos.get("id_affaire") or "").strip()
     id_captation = str(infos.get("id_captation") or "").strip()
@@ -101,6 +113,9 @@ def _regularize_photos_outputs_and_copy(infos, fichier_photos, df):
 
     dst_path = Path(root_affaires) / id_affaire / "AE_Expert_captations" / id_captation / "photos" / "photos.csv"
     st.info(f"Cible de copie PC fixe (UNC) : `{dst_path}`")
+    if not Path(root_affaires).exists():
+        st.error(f"Partage canonique indisponible ou inaccessible, copie UNC annulée : `{root_affaires}`")
+        return
 
     copy_src = canonical_csv if canonical_csv.exists() else src_path
 
@@ -287,6 +302,12 @@ def show_sync_interface():
     if not audio_path or not os.path.exists(audio_path):
         st.error("❌ Aucun fichier audio compatible valide. "
                  "Veuillez revenir à l’étape 1 pour le (re)générer.")
+        st.stop()
+
+    try:
+        start_audio_server_if_needed(audio_path)
+    except Exception as e:
+        st.error(f"❌ Serveur audio local indisponible : {e}")
         st.stop()
 
     # --- 2) Cohérence source / compatible ---
@@ -637,8 +658,14 @@ def show_sync_interface():
 
 
     st.subheader(f"📸 Photo à synchroniser maintenant : {photo_courante['nom_fichier_image']} (Photo {i+1})")
-    chemin_complet = os.path.join(photo_courante['chemin_photo_reduite'], photo_courante['nom_fichier_image'])
-    st.image(chemin_complet, width=500)
+    chemin_complet = os.path.join(
+        _resolve_existing_local_path(photo_courante["chemin_photo_reduite"]),
+        photo_courante["nom_fichier_image"],
+    )
+    if os.path.exists(chemin_complet):
+        st.image(chemin_complet, width=500)
+    else:
+        st.warning(f"Image introuvable : {chemin_complet}")
     st.write(f"🕒 Horodatage photo : {photo_courante['horodatage_photo']}")
     
     # 🔧 Bloc technique repliable
@@ -770,7 +797,9 @@ def show_sync_interface():
                 t_audio_valide = float(st.session_state.timestamp_captured)
                 horodatage_audio_absolu = heure_creation_audio + timedelta(seconds=t_audio_valide)
                 chemin_native = os.path.join(
-                    photo_courante.get("chemin_photo_native", photo_courante["chemin_photo_reduite"]),
+                    _resolve_existing_local_path(
+                        photo_courante.get("chemin_photo_native", photo_courante["chemin_photo_reduite"])
+                    ),
                     photo_courante["nom_fichier_image"]
                 )
                 horodatage_photo = get_photo_datetime(chemin_native)

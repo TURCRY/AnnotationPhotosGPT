@@ -1,13 +1,22 @@
 import os
 import json
 import subprocess
+import shutil
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 import glob
 
-from utils import lire_infos_projet, sauvegarder_infos_projet
+from utils import (
+    lire_infos_projet,
+    sauvegarder_infos_projet,
+    get_canonical_affaires_root,
+    build_canonical_snapshot_paths,
+    detect_canonical_snapshot,
+    load_canonical_snapshot_infos,
+    canonicalize_infos_paths,
+)
 from affaire_creation_client import create_affaire_server_compatible
 
 from traitement_audio import (
@@ -27,7 +36,8 @@ from datetime import datetime
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 UPLOADS_DIR = os.path.join(BASE_DIR, "data", "uploads")
 TEMP_DIR = os.path.join(BASE_DIR, "data", "temp")
-AFFAIRES_ROOT = r"C:\Affaires"
+LOCAL_BATCH_CACHE_DIR = os.path.join(BASE_DIR, "data", "batch_cache")
+AFFAIRES_ROOT = get_canonical_affaires_root()
 AUDIO_EXT = {".wav", ".mp3"}
 UI_DEFAULTS = {
     "photo_rel_native": "",
@@ -284,6 +294,116 @@ def _normalize_sync_floor_values(infos: dict) -> bool:
     return changed
 
 
+def _clear_local_progression_file() -> None:
+    prog_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "data", "progression_annotation.json")
+    )
+    if os.path.exists(prog_path):
+        try:
+            os.remove(prog_path)
+        except OSError:
+            pass
+
+
+def _seed_temp_from_infos(temp: dict, infos: dict) -> None:
+    mapping = {
+        "fichier_photos_reel": "fichier_photos",
+        "fichier_transcription_reel": "fichier_transcription",
+        "fichier_audio_source": "fichier_audio_source",
+        "fichier_contexte_general_reel": "fichier_contexte_general",
+    }
+    for temp_key, info_key in mapping.items():
+        temp[temp_key] = _real_or_empty(infos.get(info_key, ""))
+    temp["id_affaire"] = str(infos.get("id_affaire", "") or "").strip()
+    temp["id_captation"] = str(infos.get("id_captation", "") or "").strip()
+
+
+def _hydrate_local_audio_from_snapshot(infos: dict) -> list[str]:
+    messages = []
+    source_path = str(infos.get("fichier_audio_source", "") or "").strip()
+    compat_path = str(infos.get("fichier_audio_compatible", "") or infos.get("fichier_audio", "") or "").strip()
+    if not compat_path:
+        return messages
+
+    try:
+        compat_abs = os.path.abspath(AUDIO_COMPAT)
+        os.makedirs(os.path.dirname(compat_abs), exist_ok=True)
+        shutil.copy2(compat_path, compat_abs)
+        infos["fichier_audio"] = compat_abs
+        infos["fichier_audio_compatible"] = compat_abs
+        if source_path:
+            infos["audio_compat_source"] = source_path
+        messages.append(f"audio compatible local réhydraté depuis le snapshot canonique : {compat_path}")
+    except Exception as e:
+        infos["fichier_audio"] = ""
+        infos["fichier_audio_compatible"] = ""
+        infos["audio_compat_source"] = ""
+        infos["calibrage_valide"] = False
+        messages.append(f"audio compatible canonique inaccessible ou non copiable : {e}")
+    return messages
+
+
+def _apply_affaire_captation_change(
+    action: str,
+    infos: dict,
+    temp: dict,
+    id_affaire: str,
+    id_captation: str,
+) -> list[str]:
+    notes: list[str] = []
+    id_affaire = normalize_id_affaire(id_affaire)
+    id_captation = normalize_id_captation(id_captation)
+    probe = detect_canonical_snapshot(id_affaire, id_captation)
+    local_batch_path = _build_local_batch_copy_path(id_affaire, id_captation)
+
+    stop_audio_server_if_any()
+    purge_audio_temp()
+    _clear_local_progression_file()
+    _reset_sync_session_state()
+
+    if action == "reprendre":
+        loaded_infos, probe = load_canonical_snapshot_infos(id_affaire, id_captation)
+        infos.clear()
+        infos.update(loaded_infos)
+        infos["fichier_photos_batch"] = local_batch_path
+        infos.setdefault("pcfixe", {})
+        infos["pcfixe"]["root_affaires"] = get_canonical_affaires_root()
+        infos["pcfixe"]["fichier_photos_batch"] = str(probe["paths"]["photos_batch_csv"])
+        notes.extend(_hydrate_local_audio_from_snapshot(infos))
+        _seed_temp_from_infos(temp, infos)
+        notes.append("snapshot canonique chargé dans l'état local de travail")
+        return notes
+
+    if action == "repartir" and probe["infos_exists"]:
+        loaded_infos, probe = load_canonical_snapshot_infos(id_affaire, id_captation)
+        infos.clear()
+        infos.update(loaded_infos)
+        notes.append("snapshot canonique chargé comme base locale avant remise à zéro prudente")
+    else:
+        current_infos = canonicalize_infos_paths(dict(infos or {}))
+        infos.clear()
+        infos.update(current_infos)
+        infos["id_affaire"] = id_affaire
+        infos["project_id"] = id_affaire
+        infos["id_captation"] = id_captation
+        infos["captation_id"] = id_captation
+        notes.append("aucun snapshot canonique complet détecté ; conservation prudente des sources déjà choisies")
+
+    _reset_derived_project_state(infos)
+    _rebuild_project_paths(infos, temp, id_affaire, id_captation)
+    infos["calibrage_valide"] = False
+    infos["fichier_audio"] = ""
+    infos["fichier_audio_compatible"] = ""
+    infos["audio_compat_source"] = ""
+    infos["fichier_photos_batch"] = local_batch_path
+    infos.setdefault("pcfixe", {})
+    infos["pcfixe"]["root_affaires"] = get_canonical_affaires_root()
+    infos["pcfixe"]["fichier_photos_batch"] = str(build_canonical_snapshot_paths(id_affaire, id_captation)["photos_batch_csv"])
+    _seed_temp_from_infos(temp, infos)
+    notes.append("remise à zéro locale appliquée sans suppression des fichiers canoniques UNC")
+    return notes
+
+
 def _rebuild_project_paths(infos: dict, temp: dict, id_affaire: str, id_captation: str) -> None:
     id_affaire = normalize_id_affaire(id_affaire)
     id_captation = normalize_id_captation(id_captation)
@@ -298,7 +418,7 @@ def _rebuild_project_paths(infos: dict, temp: dict, id_affaire: str, id_captatio
     trans_real = _real_or_empty(temp.get("fichier_transcription_reel", "")) or str(infos.get("fichier_transcription", "") or "").strip()
     audio_src_real = _real_or_empty(temp.get("fichier_audio_source", "")) or str(infos.get("fichier_audio_source", "") or "").strip()
     ctx_real = _real_or_empty(temp.get("fichier_contexte_general_reel", "")) or str(infos.get("fichier_contexte_general", "") or "").strip()
-    batch_real = _propose_photos_batch_path(photos_real) if photos_real else ""
+    batch_real = _build_local_batch_copy_path(id_affaire, id_captation)
 
     infos["id_affaire"] = id_affaire
     infos["project_id"] = id_affaire
@@ -458,14 +578,24 @@ def _propose_photos_batch_path(photos_real: str) -> str:
     # Fallback simple et sûr : même dossier que le CSV photos courant.
     return str(photos_csv.with_name("photos_batch.csv"))
 
+
+def _build_local_batch_copy_path(id_affaire: str, id_captation: str) -> str:
+    id_affaire = str(id_affaire or "").strip()
+    id_captation = str(id_captation or "").strip()
+    if id_affaire and id_captation:
+        return str(Path(LOCAL_BATCH_CACHE_DIR) / id_affaire / id_captation / "photos_batch.csv")
+    if id_affaire:
+        return str(Path(LOCAL_BATCH_CACHE_DIR) / id_affaire / "photos_batch.csv")
+    return str(Path(LOCAL_BATCH_CACHE_DIR) / "photos_batch.csv")
+
 def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(content, encoding="utf-8")
     os.replace(tmp, path)
 
-def _build_pcfixe_paths(id_affaire: str, id_captation: str) -> dict:
-    root = Path(AFFAIRES_ROOT) / id_affaire
+def _build_pcfixe_paths(id_affaire: str, id_captation: str, root_affaires: str | None = None) -> dict:
+    root = Path(root_affaires or get_canonical_affaires_root()) / id_affaire
     base_cap = root / "AE_Expert_captations" / id_captation
     trans_dir = root / "AF_Expert_ASR" / "transcriptions" / id_captation
     return {
@@ -488,7 +618,7 @@ def _list_subdirs(path: Path) -> set[str]:
         return set()
 
 def _discover_captations_for_affaire(id_affaire: str) -> list[dict]:
-    root = Path(AFFAIRES_ROOT) / id_affaire
+    root = Path(get_canonical_affaires_root()) / id_affaire
     ae_root = root / "AE_Expert_captations"
     af_root = root / "AF_Expert_ASR" / "transcriptions"
     be_root = root / "BE_Traitement_captations"
@@ -521,7 +651,12 @@ def _build_snapshot_infos(infos: dict, temp: dict, id_affaire: str, id_captation
     trans_real = _real_or_empty(temp.get("fichier_transcription_reel", "")) or str(snapshot.get("fichier_transcription", "") or "").strip()
     audio_src_real = _real_or_empty(temp.get("fichier_audio_source", "")) or str(snapshot.get("fichier_audio_source", "") or "").strip()
     ctx_real = _real_or_empty(temp.get("fichier_contexte_general_reel", "")) or str(snapshot.get("fichier_contexte_general", "") or "").strip()
-    batch_real = str(st.session_state.get("photos_batch_path_candidate", "") or snapshot.get("fichier_photos_batch", "") or "").strip()
+    batch_real = str(
+        st.session_state.get("photos_batch_path_candidate", "")
+        or snapshot.get("fichier_photos_batch", "")
+        or _build_local_batch_copy_path(id_affaire, id_captation)
+        or ""
+    ).strip()
 
     snapshot["id_affaire"] = id_affaire
     snapshot["id_captation"] = id_captation
@@ -559,14 +694,13 @@ def _build_snapshot_infos(infos: dict, temp: dict, id_affaire: str, id_captation
     return snapshot
 
 def _publish_snapshot_capture(infos: dict, temp: dict, id_affaire: str, id_captation: str) -> Path:
-    pc = dict(infos.get("pcfixe", {}) or {})
-    root_affaires = str(pc.get("root_affaires") or "").strip()
+    probe = detect_canonical_snapshot(id_affaire, id_captation)
+    root_affaires = get_canonical_affaires_root()
+    if not probe["root_exists"]:
+        raise RuntimeError(f"Partage canonique indisponible ou inaccessible : {root_affaires}")
 
     # Pour la publication snapshot destinée au batch PC fixe,
     # on force une racine UNC si la valeur est vide ou locale.
-    if (not root_affaires) or re.match(r"^[A-Za-z]:[\\/]", root_affaires):
-        root_affaires = r"\\192.168.0.155\Affaires"
-
     root = Path(root_affaires) / id_affaire
     base_cap = root / "AE_Expert_captations" / id_captation
     trans_dir = root / "AF_Expert_ASR" / "transcriptions" / id_captation
@@ -878,15 +1012,27 @@ def show_selection_interface():
         f"`{temp.get('fichier_photos_reel', '') or '—'}`"
     )
 
-    # Fichier batch (photos_batch.csv) : proposition recalculée depuis le CSV photos courant
-    photos_real_current = temp.get("fichier_photos_reel") or infos.get("fichier_photos", "")
-    photos_batch_current = _propose_photos_batch_path(photos_real_current)
+    current_id_affaire = str(
+        temp.get("id_affaire")
+        or infos.get("id_affaire")
+        or infos.get("project_id")
+        or ""
+    ).strip()
+    current_id_captation = str(
+        temp.get("id_captation")
+        or infos.get("id_captation")
+        or infos.get("captation_id")
+        or ""
+    ).strip()
+
+    # Fichier batch (photos_batch.csv) : copie locale laptop dédiée
+    photos_batch_current = _build_local_batch_copy_path(current_id_affaire, current_id_captation)
     exists_batch = bool(photos_batch_current) and os.path.exists(photos_batch_current)
 
     st.caption("📦 Fichier batch proposé (photos_batch.csv)")
     st.code(photos_batch_current if photos_batch_current else "(non défini)")
     if photos_batch_current:
-        st.caption("Proposition recalculée à partir du fichier photos réel courant ; validation finale à l’enregistrement.")
+        st.caption("Copie locale laptop dédiée ; la synchronisation au lancement la réalimente depuis la source canonique du bloc pcfixe.")
     if exists_batch:
         st.success("✅ photos_batch.csv présent")
     else:
@@ -1198,6 +1344,78 @@ def show_selection_interface():
         key="id_captation_input",
     )
 
+    stored_id_affaire = normalize_id_affaire(str(infos.get("id_affaire", "") or infos.get("project_id", "") or ""))
+    stored_id_captation = normalize_id_captation(str(infos.get("id_captation", "") or infos.get("captation_id", "") or ""))
+    pending_switch = (
+        bool(id_affaire_input.strip() and id_captation_input.strip())
+        and (
+            normalize_id_affaire(id_affaire_input) != stored_id_affaire
+            or normalize_id_captation(id_captation_input) != stored_id_captation
+        )
+    )
+
+    if pending_switch:
+        ok_a_switch, id_affaire_switch, err_a_switch = validate_id_affaire(id_affaire_input)
+        ok_c_switch, id_captation_switch, err_c_switch = validate_id_captation(id_captation_input)
+        st.warning("Le couple affaire/captation saisi diffère de l'état local actuellement chargé.")
+        if not ok_a_switch or not ok_c_switch:
+            if err_a_switch:
+                st.error(f"❌ id_affaire : {err_a_switch}")
+            if err_c_switch:
+                st.error(f"❌ id_captation : {err_c_switch}")
+            st.info("Aucune remise à zéro implicite n'est effectuée tant que le nouveau couple n'est pas validé explicitement.")
+            st.stop()
+
+        probe = detect_canonical_snapshot(id_affaire_switch, id_captation_switch)
+        st.caption("Snapshot canonique visé")
+        st.code(str(probe["paths"]["infos"]))
+        if probe["root_exists"]:
+            st.success(f"✅ Partage canonique détecté : {probe['root']}")
+        else:
+            st.error(f"⛔ Partage canonique indisponible ou inaccessible : {probe['root']}")
+
+        if probe["snapshot_exists"]:
+            st.info("Un snapshot canonique existe déjà pour cette captation.")
+            st.write(
+                {
+                    "infos_projet_json": probe["infos_exists"],
+                    "photos.csv": probe["photos_csv_exists"],
+                    "photos_batch.csv": probe["photos_batch_exists"],
+                    "annotations_GTP": len(probe["gtp_files"]),
+                }
+            )
+            switch_action = st.radio(
+                "Décision avant bascule",
+                options=["reprendre", "repartir"],
+                format_func=lambda x: (
+                    "Option A — reprendre l'existant"
+                    if x == "reprendre"
+                    else "Option B — repartir à plat (localement, sans effacer le canonique)"
+                ),
+                key=f"switch_action_{id_affaire_switch}_{id_captation_switch}",
+            )
+        else:
+            st.info("Aucun snapshot canonique complet détecté pour ce couple. La bascule créera seulement un nouvel état local de travail.")
+            switch_action = "repartir"
+
+        if st.button("Appliquer ce changement d'affaire / captation", key="apply_affaire_captation_switch"):
+            try:
+                notes = _apply_affaire_captation_change(
+                    action=switch_action,
+                    infos=infos,
+                    temp=temp,
+                    id_affaire=id_affaire_switch,
+                    id_captation=id_captation_switch,
+                )
+                st.session_state["fichiers_temp"] = temp
+                sauvegarder_infos_projet(infos)
+                st.session_state["selection_return_reason"] = "; ".join(notes)
+                st.success("✅ Bascule appliquée avec décision explicite.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ Changement affaire/captation impossible : {e}")
+        st.stop()
+
     state_changed, state_reasons = _sanitize_affaire_captation_state(
         infos=infos,
         temp=temp,
@@ -1217,7 +1435,7 @@ def show_selection_interface():
         key="nom_affaire_input",
     )
 
-    default_root_affaires = str((infos.get("pcfixe", {}) or {}).get("root_affaires") or r"C:\Affaires")
+    default_root_affaires = get_canonical_affaires_root()
     affaires_root_input = st.text_input(
         "Racine affaires côté serveur (optionnel)",
         value=default_root_affaires,
@@ -1250,10 +1468,7 @@ def show_selection_interface():
     # -----------------------------------------------------------------
     photos_batch_current = str(infos.get("fichier_photos_batch", "") or "").strip()
     if not photos_batch_current:
-        # propose par défaut dans le même dossier que fichier_photos réel (quand connu)
-        photos_real = temp.get("fichier_photos_reel") or infos.get("fichier_photos", "")
-        if photos_real:
-            photos_batch_current = str(Path(os.path.abspath(photos_real)).parent / "photos_batch.csv")
+        photos_batch_current = _build_local_batch_copy_path(id_affaire_input, id_captation_input)
 
     exists_batch = bool(photos_batch_current) and os.path.exists(photos_batch_current)
 

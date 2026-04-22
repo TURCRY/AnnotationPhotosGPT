@@ -3,6 +3,8 @@ import os
 import json
 import uuid
 import shutil
+import glob
+import re
 from datetime import datetime
 from PIL import Image
 from PIL.ExifTags import TAGS
@@ -15,8 +17,119 @@ from pathlib import Path
 import shutil
 
 from compat_affaire_captation import normalize_infos_aliases
+from path_migration import migrate_local_user_paths, migrate_photo_dataframe_paths
+
+CANONICAL_UNC_AFFAIRES_ROOT = r"\\192.168.1.20\Affaires"
+_AFFAIRES_ROOT_RE = re.compile(
+    r"^(?P<root>(?:[A-Za-z]:|\\\\[^\\]+\\[^\\]+)\\Affaires)(?:\\(?P<suffix>.*))?$",
+    re.IGNORECASE,
+)
 
 # Fonctions existantes utiles
+
+def get_canonical_affaires_root() -> str:
+    return CANONICAL_UNC_AFFAIRES_ROOT
+
+
+def _normalize_windows_path_string(path_value: str) -> str:
+    return str(path_value or "").strip().replace("/", "\\").rstrip("\\")
+
+
+def split_affaires_root_and_suffix(path_value: str) -> tuple[str, str]:
+    raw = _normalize_windows_path_string(path_value)
+    if not raw:
+        return "", ""
+    match = _AFFAIRES_ROOT_RE.match(raw)
+    if not match:
+        return "", ""
+    return match.group("root") or "", (match.group("suffix") or "").strip("\\")
+
+
+def path_uses_noncanonical_affaires_root(path_value: str) -> bool:
+    root, _ = split_affaires_root_and_suffix(path_value)
+    if not root:
+        return False
+    return root.lower() != CANONICAL_UNC_AFFAIRES_ROOT.lower()
+
+
+def canonicalize_affaires_path(path_value: str) -> str:
+    raw = str(path_value or "").strip()
+    if not raw:
+        return ""
+    root, suffix = split_affaires_root_and_suffix(raw)
+    if not root:
+        return raw
+    if suffix:
+        return str(Path(CANONICAL_UNC_AFFAIRES_ROOT) / Path(suffix))
+    return CANONICAL_UNC_AFFAIRES_ROOT
+
+
+def canonicalize_infos_paths(data):
+    if isinstance(data, dict):
+        return {key: canonicalize_infos_paths(value) for key, value in data.items()}
+    if isinstance(data, list):
+        return [canonicalize_infos_paths(value) for value in data]
+    if isinstance(data, str):
+        return canonicalize_affaires_path(data)
+    return data
+
+
+def build_canonical_snapshot_paths(id_affaire: str, id_captation: str) -> dict[str, Path]:
+    root = Path(CANONICAL_UNC_AFFAIRES_ROOT) / str(id_affaire or "").strip()
+    base_cap = root / "AE_Expert_captations" / str(id_captation or "").strip()
+    trans_dir = root / "AF_Expert_ASR" / "transcriptions" / str(id_captation or "").strip()
+    photos_dir = base_cap / "photos"
+    return {
+        "root_affaire": root,
+        "base_cap": base_cap,
+        "photos_dir": photos_dir,
+        "audio_dir": base_cap / "audio",
+        "trans_dir": trans_dir,
+        "infos": trans_dir / "infos_projet.json",
+        "photos_csv": photos_dir / "photos.csv",
+        "photos_batch_csv": photos_dir / "photos_batch.csv",
+    }
+
+
+def detect_canonical_snapshot(id_affaire: str, id_captation: str) -> dict:
+    paths = build_canonical_snapshot_paths(id_affaire, id_captation)
+    photos_dir = paths["photos_dir"]
+    pattern_csv = str(photos_dir / "*_GTP_*.csv")
+    pattern_xlsx = str(photos_dir / "*_GTP_*.xlsx")
+    gtp_files = sorted(glob.glob(pattern_csv)) + sorted(glob.glob(pattern_xlsx))
+    return {
+        "root": CANONICAL_UNC_AFFAIRES_ROOT,
+        "root_exists": Path(CANONICAL_UNC_AFFAIRES_ROOT).exists(),
+        "paths": paths,
+        "infos_exists": paths["infos"].exists(),
+        "photos_csv_exists": paths["photos_csv"].exists(),
+        "photos_batch_exists": paths["photos_batch_csv"].exists(),
+        "gtp_files": gtp_files,
+        "snapshot_exists": bool(
+            paths["infos"].exists()
+            or paths["photos_csv"].exists()
+            or paths["photos_batch_csv"].exists()
+            or gtp_files
+        ),
+    }
+
+
+def load_canonical_snapshot_infos(id_affaire: str, id_captation: str) -> tuple[dict, dict]:
+    probe = detect_canonical_snapshot(id_affaire, id_captation)
+    infos_path = probe["paths"]["infos"]
+    if not probe["infos_exists"]:
+        raise FileNotFoundError(f"Snapshot canonique introuvable : {infos_path}")
+    with open(infos_path, "r", encoding="utf-8") as f:
+        infos = json.load(f)
+    infos = normalize_infos_aliases(canonicalize_infos_paths(infos))
+    infos.setdefault("pcfixe", {})
+    if isinstance(infos["pcfixe"], dict):
+        infos["pcfixe"]["root_affaires"] = CANONICAL_UNC_AFFAIRES_ROOT
+    infos["id_affaire"] = str(id_affaire or "").strip()
+    infos["project_id"] = infos["id_affaire"]
+    infos["id_captation"] = str(id_captation or "").strip()
+    infos["captation_id"] = infos["id_captation"]
+    return infos, probe
 
 def init_session_state(defaults: dict):
     for k, v in defaults.items():
@@ -62,13 +175,20 @@ def lire_infos_projet():
         raise FileNotFoundError(f"infos_projet.json introuvable à : {path}")
     with open(path, "r", encoding="utf-8") as f:
         infos = json.load(f)
-    return normalize_infos_aliases(infos)
+    infos, changed = migrate_local_user_paths(infos)
+    canonical_infos = canonicalize_infos_paths(infos)
+    changed = changed or (canonical_infos != infos)
+    infos = canonical_infos
+    infos = normalize_infos_aliases(infos)
+    if changed:
+        sauvegarder_infos_projet(infos)
+    return infos
 
 def sauvegarder_infos_projet(donnees: dict):
     """Ecrit l'etat local de travail; ce fichier ne remplace pas la configuration projet serveur."""
     path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "infos_projet.json"))
     tmp = path + ".tmp"
-    donnees = normalize_infos_aliases(donnees)
+    donnees = normalize_infos_aliases(canonicalize_infos_paths(donnees))
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(donnees, f, ensure_ascii=False, indent=2)
         f.flush()
@@ -203,12 +323,20 @@ def charger_photos(path: str) -> pd.DataFrame:
     if not p.exists():
         raise FileNotFoundError(f"Fichier introuvable: {p}")
     if p.suffix.lower() == ".xlsx":
-        return pd.read_excel(p, engine="openpyxl")
+        df = pd.read_excel(p, engine="openpyxl")
+        df, changed = migrate_photo_dataframe_paths(df)
+        if changed:
+            sauver_photos(df, str(p))
+        return df
 
     last_err = None
     for enc in ("utf-8-sig", "cp1252", "latin1"):
         try:
-            return pd.read_csv(p, sep=";", encoding=enc)
+            df = pd.read_csv(p, sep=";", encoding=enc)
+            df, changed = migrate_photo_dataframe_paths(df)
+            if changed:
+                sauver_photos(df, str(p))
+            return df
         except UnicodeDecodeError as e:
             last_err = e
     raise last_err or RuntimeError(f"Impossible de lire le CSV : {p}")

@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import soundfile as sf
 import time
 import os
@@ -13,6 +14,8 @@ from utils import (
     sauvegarder_infos_projet,
     convertir_horodatage_en_secondes,
 )
+from path_migration import migrate_photo_dataframe_paths
+from traitement_audio import start_audio_server_if_needed
 from streamlit_wavesurfer import wavesurfer
 import requests
 from pathlib import Path
@@ -27,6 +30,214 @@ import uuid
 import io
 import hashlib
 import logging
+
+log = logging.getLogger("dictée_asr")
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_CONFIG_DIR = _REPO_ROOT / "config"
+_LOCAL_LLM_BUSY_RESULT = "[LLM local occupe, reessayez dans quelques secondes.]"
+
+
+def _load_env_for_runtime_config() -> None:
+    candidates = [
+        os.getenv("ANNOTATIONPHOTOSGPT_ENV", ""),
+        str(_CONFIG_DIR / ".env"),
+        str(_REPO_ROOT / ".env"),
+    ]
+    for p in candidates:
+        p = (p or "").strip()
+        if p and Path(p).exists():
+            load_dotenv(p, override=False)
+
+
+def _is_local_llm_busy_result(value: str) -> bool:
+    return str(value or "").strip() == _LOCAL_LLM_BUSY_RESULT
+
+
+def _is_llm_runtime_message(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text.startswith("[") or not text.endswith("]"):
+        return False
+    prefixes = (
+        "[Erreur LLM local:",
+        "[Erreur GPT OpenAI :",
+        "[Erreur config LLM:",
+        "[RÃ©ponse LLM local vide ou inexploitable]",
+        "[LLM local occupÃ©,",
+        "[LLM local ok=False:",
+    )
+    return any(text.startswith(prefix) for prefix in prefixes)
+
+
+def _is_placeholder_secret(value: str, names: set[str] | None = None) -> bool:
+    v = str(value or "").strip()
+    if not v:
+        return True
+    u = v.upper()
+    if "PLACEHOLDER" in u:
+        return True
+    if names and u in {name.upper() for name in names}:
+        return True
+    return False
+
+
+def _deep_merge_dict(base: dict, override: dict) -> dict:
+    merged = dict(base or {})
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dict(merged.get(key, {}), value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_json_file(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _resolve_project_config_llm_path(infos: dict | None = None) -> Path | None:
+    infos = infos or {}
+    candidates: list[Path] = []
+
+    transcription = str(infos.get("fichier_transcription") or "").strip()
+    if transcription:
+        candidates.append(Path(transcription).resolve().parent / "config_llm.json")
+
+    contexte = str(infos.get("fichier_contexte_general") or "").strip()
+    if contexte:
+        candidates.append(Path(contexte).resolve().parent / "config_llm.json")
+
+    explicit_local = str(infos.get("config_llm") or "").strip()
+    if explicit_local:
+        candidates.append(Path(explicit_local))
+
+    for candidate in candidates:
+        try:
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_openai_api_key(appcfg: dict) -> str:
+    _load_env_for_runtime_config()
+    env_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if env_key and not _is_placeholder_secret(env_key, {"OPENAI_API_KEY"}):
+        return env_key
+    cfg_key = str(appcfg.get("openai_api_key") or "").strip()
+    if cfg_key and not _is_placeholder_secret(cfg_key, {"OPENAI_API_KEY"}):
+        return cfg_key
+    return ""
+
+
+def _resolve_local_llm_settings(appcfg: dict) -> dict:
+    _load_env_for_runtime_config()
+    local_cfg = dict(appcfg.get("local_llm") or {})
+
+    server_url = (os.getenv("SERVER_URL") or "").strip()
+    base_url_env = (os.getenv("LOCAL_LLM_BASE_URL") or "").strip()
+    base_url_cfg = str(local_cfg.get("base_url") or "").strip()
+    local_cfg["base_url"] = (server_url or base_url_env or base_url_cfg or "http://127.0.0.1:5050").rstrip("/")
+
+    env_key = (os.getenv("LOCAL_LLM_API_KEY") or "").strip()
+    cfg_key = str(local_cfg.get("api_key") or "").strip()
+    if env_key and not _is_placeholder_secret(env_key, {"LOCAL_LLM_API_KEY", "LOCAL_LLM_API_KEY_PLACEHOLDER"}):
+        local_cfg["api_key"] = env_key
+    elif cfg_key and not _is_placeholder_secret(cfg_key, {"LOCAL_LLM_API_KEY", "LOCAL_LLM_API_KEY_PLACEHOLDER"}):
+        local_cfg["api_key"] = cfg_key
+    else:
+        local_cfg["api_key"] = ""
+
+    return local_cfg
+
+
+def _resolve_local_asr_model_key(appcfg: dict) -> str:
+    _load_env_for_runtime_config()
+    for candidate in (
+        os.getenv("LOCAL_ASR_MODEL_KEY"),
+        os.getenv("ASR_MODEL_KEY"),
+        str((appcfg.get("local_llm") or {}).get("asr_model_key") or "").strip(),
+        str(appcfg.get("local_asr_model_key") or "").strip(),
+    ):
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return "Voxtral_Mini_3B_Transformers"
+
+
+def _ensure_photo_text_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df
+    for col in columns:
+        if col not in out.columns:
+            out[col] = ""
+        else:
+            out[col] = out[col].astype("string")
+    return out
+
+
+def _ui_text(value) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
+
+
+def _analyze_audio_bytes(audio_bytes: bytes) -> dict:
+    if not audio_bytes:
+        raise RuntimeError("Audio dicté vide.")
+
+    try:
+        audio_data, sample_rate = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
+    except Exception as e:
+        raise RuntimeError(f"Audio dicté illisible ou non décodable : {e}") from e
+
+    frames = int(audio_data.shape[0]) if audio_data.ndim >= 1 else 0
+    channels = int(audio_data.shape[1]) if audio_data.ndim >= 2 else 1
+    duration_s = float(frames / sample_rate) if sample_rate and frames else 0.0
+
+    if frames <= 0 or channels <= 0:
+        return {
+            "sample_rate": int(sample_rate or 0),
+            "channels": channels,
+            "frames": frames,
+            "duration_s": duration_s,
+            "rms": 0.0,
+            "peak": 0.0,
+            "is_effectively_silent": True,
+        }
+
+    peak = float(np.max(np.abs(audio_data)))
+    rms = float(np.sqrt(np.mean(np.square(audio_data))))
+    is_effectively_silent = (peak < 1e-4) or (rms < 1e-5)
+
+    return {
+        "sample_rate": int(sample_rate or 0),
+        "channels": channels,
+        "frames": frames,
+        "duration_s": duration_s,
+        "rms": rms,
+        "peak": peak,
+        "is_effectively_silent": bool(is_effectively_silent),
+    }
+
+
+def _audio_diag_verdict(audio_diag: dict) -> tuple[str, str]:
+    peak = float(audio_diag.get("peak") or 0.0)
+    rms = float(audio_diag.get("rms") or 0.0)
+    if audio_diag.get("is_effectively_silent"):
+        return "audio silencieux", "error"
+    if peak < 5e-3 or rms < 5e-4:
+        return "audio trop faible", "warning"
+    return "audio exploitable", "success"
 
 
 # -----------------------------------------------------------------------------
@@ -150,6 +361,162 @@ def compute_asr_out_dir_from_pcfixe(pcfixe: dict) -> str:
     if not os.path.isabs(out_dir):
         raise RuntimeError("Impossible de calculer le dossier absolu de sortie ASR.")
     return out_dir
+
+
+def _preferred_transcription_csv(csv_path: str) -> Path:
+    p = Path(str(csv_path or "").strip())
+    if not p:
+        return p
+    if "(photo)" in p.name:
+        alt = p.with_name(p.name.replace("(photo)", ""))
+        if alt.exists():
+            return alt
+    return p
+
+
+def _dictation_csv_candidates(audio_path_server: str, out_dir_abs: str) -> tuple[Path, Path]:
+    audio_name = Path(str(audio_path_server or "").strip()).name
+    if not audio_name:
+        return Path(""), Path("")
+
+    out_dir = Path(out_dir_abs)
+    stem = Path(audio_name).stem
+    suffix = Path(audio_name).suffix.lstrip(".")
+
+    raw_candidates = [
+        out_dir / f"{audio_name}.csv",
+        out_dir / f"{stem}({suffix}).csv" if suffix else out_dir / f"{stem}.csv",
+        out_dir / f"{stem}.csv",
+    ]
+    photo_candidates = [
+        out_dir / f"{audio_name}(photo).csv",
+        out_dir / f"{stem}({suffix})(photo).csv" if suffix else out_dir / f"{stem}(photo).csv",
+        out_dir / f"{stem}(photo).csv",
+    ]
+
+    raw_csv = next((p for p in raw_candidates if p.exists()), raw_candidates[1])
+    photo_csv = next((p for p in photo_candidates if p.exists()), photo_candidates[1])
+    return raw_csv, photo_csv
+
+
+def _read_dictee_text_from_csv(csv_path: str) -> str:
+    p = _preferred_transcription_csv(csv_path)
+    if not p or not p.exists():
+        return ""
+    try:
+        df = read_csv_fallback(str(p), sep=";")
+    except Exception:
+        return ""
+    if df is None or df.empty or "text" not in df.columns:
+        return ""
+    parts = [str(v).strip() for v in df["text"].tolist() if str(v or "").strip() and str(v).strip().lower() != "nan"]
+    return "\n".join(parts).strip()
+
+
+def _refresh_pending_dictee(
+    i: int,
+    row,
+    *,
+    photos_df: pd.DataFrame,
+    photos_csv: str,
+    infos: dict,
+) -> tuple[str, str, str, str]:
+    status = _ui_text(row.get("dictee_asr_status"))
+    audio_path = _ui_text(row.get("dictee_audio_path_pcfixe"))
+    text = _ui_text(row.get("dictee_asr_text"))
+    csv_path = _ui_text(row.get("dictee_asr_csv_path_pcfixe"))
+    photo_csv_path = _ui_text(row.get("dictee_asr_photo_csv_path_pcfixe"))
+
+    if status != "PENDING" or not audio_path:
+        return status, text, csv_path, photo_csv_path
+
+    try:
+        _, pcfixe = _require_server_project_context(infos)
+        out_dir_abs = compute_asr_out_dir_from_pcfixe(pcfixe)
+    except Exception:
+        return status, text, csv_path, photo_csv_path
+
+    if not csv_path or not photo_csv_path:
+        raw_csv, photo_csv = _dictation_csv_candidates(audio_path, out_dir_abs)
+        csv_path = str(raw_csv) if raw_csv else csv_path
+        photo_csv_path = str(photo_csv) if photo_csv else photo_csv_path
+
+    reloaded_text = _read_dictee_text_from_csv(csv_path or photo_csv_path)
+    if reloaded_text:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        photos_df.at[i, "dictee_asr_text"] = reloaded_text
+        photos_df.at[i, "dictee_asr_status"] = "OK"
+        photos_df.at[i, "dictee_asr_ts"] = now
+        if csv_path:
+            photos_df.at[i, "dictee_asr_csv_path_pcfixe"] = csv_path
+        if photo_csv_path:
+            photos_df.at[i, "dictee_asr_photo_csv_path_pcfixe"] = photo_csv_path
+        photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+        st.session_state[f"dictee_{i}"] = reloaded_text
+        return "OK", reloaded_text, csv_path, photo_csv_path
+
+    csv_exists = bool((csv_path and Path(csv_path).exists()) or (photo_csv_path and Path(photo_csv_path).exists()))
+    if csv_exists:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        photos_df.at[i, "dictee_asr_status"] = "ERR"
+        photos_df.at[i, "dictee_asr_ts"] = now
+        if csv_path:
+            photos_df.at[i, "dictee_asr_csv_path_pcfixe"] = csv_path
+        if photo_csv_path:
+            photos_df.at[i, "dictee_asr_photo_csv_path_pcfixe"] = photo_csv_path
+        photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+        return "ERR", text, csv_path, photo_csv_path
+
+    return status, text, csv_path, photo_csv_path
+
+
+def _is_dictee_pending(value) -> bool:
+    return _ui_text(value).upper() == "PENDING"
+
+
+def _refresh_all_pending_dictees(
+    photos_df: pd.DataFrame,
+    *,
+    photos_csv: str,
+    infos: dict,
+) -> None:
+    if "dictee_asr_status" not in photos_df.columns:
+        return
+    pending_indices = [
+        idx
+        for idx in range(len(photos_df))
+        if _is_dictee_pending(photos_df.iloc[idx].get("dictee_asr_status"))
+    ]
+    for idx in pending_indices:
+        _refresh_pending_dictee(
+            idx,
+            photos_df.iloc[idx],
+            photos_df=photos_df,
+            photos_csv=photos_csv,
+            infos=infos,
+        )
+
+
+def _next_actionable_photo_index(
+    photos_df: pd.DataFrame,
+    annoted_names: set[str],
+    *,
+    start_after: int | None = None,
+) -> int | None:
+    total = len(photos_df)
+    if total <= 0:
+        return None
+
+    start_idx = 0 if start_after is None else max(0, int(start_after) + 1)
+    for idx in range(start_idx, total):
+        row = photos_df.iloc[idx]
+        nom_image = str(row.get("nom_fichier_image") or "").strip()
+        if nom_image in annoted_names:
+            continue
+        if _is_dictee_pending(row.get("dictee_asr_status")):
+            continue
+        return idx
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -325,7 +692,11 @@ def read_csv_fallback(path, sep=";"):
     last_err = None
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
         try:
-            return pd.read_csv(path, sep=sep, encoding=enc)
+            df = pd.read_csv(path, sep=sep, encoding=enc)
+            df, changed = migrate_photo_dataframe_paths(df)
+            if changed:
+                df.to_csv(path, sep=sep, encoding="utf-8-sig", index=False)
+            return df
         except Exception as e:
             last_err = e
     raise RuntimeError(f"Impossible de lire {path}. Dernière erreur: {last_err}")
@@ -555,7 +926,8 @@ def generer_texte_gpt(role_systeme: str, prompt_user: str) -> str:
         return "[Transcription vide – GPT non sollicité]"
 
     try:
-        appcfg = _load_app_config()
+        infos = lire_infos_projet()
+        appcfg = _load_app_config(infos)
     except Exception as e:
         return f"[Erreur config LLM: {e}]"
 
@@ -564,6 +936,7 @@ def generer_texte_gpt(role_systeme: str, prompt_user: str) -> str:
     if backend == "local":
         local_cfg = appcfg.get("local_llm", {}) or {}
         wol_cfg   = appcfg.get("wol", {}) or {}
+        busy_key  = "llm_local_request_inflight"
 
         base_url  = local_cfg.get("base_url", "http://127.0.0.1:5050")
         api_key   = local_cfg.get("api_key", "")
@@ -578,8 +951,12 @@ def generer_texte_gpt(role_systeme: str, prompt_user: str) -> str:
         ping_path     = wol_cfg.get("ping_path", "/ping")
         poll_interval = int(wol_cfg.get("poll_interval_sec", 3))
 
+        if st.session_state.get(busy_key):
+            return _LOCAL_LLM_BUSY_RESULT
+
         status = st.empty()
         try:
+            st.session_state[busy_key] = True
             # (1) deux checks rapides avant WOL
             if not is_server_up(base_url, ping_path=ping_path, timeout=2.0):
                 time.sleep(1.0)
@@ -663,6 +1040,16 @@ def generer_texte_gpt(role_systeme: str, prompt_user: str) -> str:
 
                         status.empty()
 
+                        if j.get("ok") is False:
+                            reason = (
+                                j.get("error")
+                                or j.get("detail")
+                                or j.get("message")
+                                or j.get("reponse")
+                                or "RÃ©ponse rejetÃ©e par le serveur."
+                            )
+                            return f"[LLM local ok=False: {reason}]"
+
                         rj = j.get("reponse_json")
                         if isinstance(rj, dict) and "texte" in rj:
                             return str(rj.get("texte") or "").strip()
@@ -674,6 +1061,14 @@ def generer_texte_gpt(role_systeme: str, prompt_user: str) -> str:
 
                         return "[Réponse LLM local vide ou inexploitable]"
 
+                    except requests.HTTPError as e:
+                        response = getattr(e, "response", None)
+                        if getattr(response, "status_code", None) == 503:
+                            status.warning("LLM local occupe : reessayez dans quelques secondes.")
+                            return _LOCAL_LLM_BUSY_RESULT
+                        if attempt == 2:
+                            raise
+                        time.sleep(1.0)
                     except Exception:
                         if attempt == 2:
                             raise
@@ -687,9 +1082,11 @@ def generer_texte_gpt(role_systeme: str, prompt_user: str) -> str:
                 backend = "openai"
             else:
                 return f"[Erreur LLM local: {e}]"
+        finally:
+            st.session_state[busy_key] = False
 
     # ---- OpenAI (fallback possible)
-    api_key = os.getenv("OPENAI_API_KEY", "") or appcfg.get("openai_api_key", "")
+    api_key = appcfg.get("openai_api_key", "")
     if not api_key:
         return "[Erreur GPT : Clé API OpenAI introuvable (env OPENAI_API_KEY ou config.openai_api_key).]"
     try:
@@ -708,10 +1105,37 @@ def generer_texte_gpt(role_systeme: str, prompt_user: str) -> str:
         return f"[Erreur GPT OpenAI : {e}]"
 
 
-def _load_app_config() -> dict:
-    cfg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "config", "config.json"))
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def _load_app_config(infos: dict | None = None) -> dict:
+    cfg_path = _CONFIG_DIR / "config.json"
+    cfg = _load_json_file(cfg_path)
+
+    project_cfg_path = _resolve_project_config_llm_path(infos)
+    if project_cfg_path:
+        cfg = _deep_merge_dict(cfg, _load_json_file(project_cfg_path))
+
+    backend_from_infos = str((infos or {}).get("llm_backend") or "").strip().lower()
+    if backend_from_infos in {"local", "openai"}:
+        cfg["llm_backend"] = backend_from_infos
+
+    cfg["local_llm"] = _resolve_local_llm_settings(cfg)
+    cfg["openai_api_key"] = _resolve_openai_api_key(cfg)
+    return cfg
+
+
+def _persist_llm_backend(infos: dict, backend: str) -> tuple[bool, str]:
+    backend = str(backend or "").strip().lower()
+    if backend not in {"local", "openai"}:
+        return False, ""
+
+    infos["llm_backend"] = backend
+    config_path = _resolve_project_config_llm_path(infos)
+    if not config_path:
+        return False, ""
+
+    cfg = _load_json_file(config_path)
+    cfg["llm_backend"] = backend
+    config_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    return True, str(config_path)
 
 def pick_libelle(row):
     v = str(row.get("libelle_propose_ui", "") or "").strip()
@@ -742,7 +1166,7 @@ def asr_dictee(audio_bytes: bytes, audio_path_server: str | None, lang: str = "f
 
     if asr_backend == "openai":
         asr_model = str(appcfg.get("asr_model", "gpt-4o-mini-transcribe")).strip()
-        api_key = os.getenv("OPENAI_API_KEY", "") or appcfg.get("openai_api_key", "")
+        api_key = appcfg.get("openai_api_key", "")
         if not api_key:
             raise RuntimeError("ASR OpenAI: clé API absente (OPENAI_API_KEY ou config.openai_api_key).")
 
@@ -789,10 +1213,30 @@ def call_vlm_single(image_path: str, context: str = "", prompt: str = "", model_
 
     with open(image_path, "rb") as f:
         files = {"file": (Path(image_path).name, f, mime)}
-        r = requests.post(url, files=files, data=data, headers=headers, timeout=180)
+        try:
+            r = requests.post(url, files=files, data=data, headers=headers, timeout=180)
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            response = getattr(e, "response", None)
+            if response is not None:
+                try:
+                    payload = response.json() or {}
+                except Exception:
+                    payload = {}
+                detail = (
+                    payload.get("error")
+                    or payload.get("detail")
+                    or payload.get("message")
+                    or (response.text or "").strip()
+                )
+                if detail:
+                    raise RuntimeError(f"VLM /vision/describe HTTP {response.status_code}: {detail}") from e
+            raise
 
-    r.raise_for_status()
-    return str(r.json().get("description", "")).strip()
+    payload = r.json()
+    if payload.get("error"):
+        raise RuntimeError(f"VLM /vision/describe: {payload['error']}")
+    return str(payload.get("description", "")).strip()
 
 def merge_vlm_audio(desc_vlm: str, extrait_audio: str) -> str:
     if desc_vlm:
@@ -952,6 +1396,7 @@ def show_annotation_interface():
     doit être indenté sous cette signature.
     """
     infos = lire_infos_projet()
+    appcfg = _load_app_config(infos)
 
     photos_csv              = infos.get("fichier_photos")
     transcription_csv_photo = infos.get("fichier_transcription")  # CSV choisi dans l’interface
@@ -996,6 +1441,11 @@ def show_annotation_interface():
         decalage = 0.0
 
     st.title("🖋️ Annotation guidée avec GPT")
+
+    current_backend = str(infos.get("llm_backend") or appcfg.get("llm_backend") or "local").strip().lower()
+    if current_backend not in {"local", "openai"}:
+        current_backend = "local"
+    st.session_state.setdefault("llm_backend_input", current_backend)
 
     # ─────────────────────────────────────────────────────────────
     # 🔗 Vérifications de base
@@ -1091,11 +1541,20 @@ def show_annotation_interface():
     # ---verification serveur audio --------------------------------------------------
 
     audio_url = "http://127.0.0.1:5000/audio/audio_compatible.wav"
+    audio_compat = str(infos.get("fichier_audio", "") or infos.get("fichier_audio_compatible", "") or "").strip()
+    audio_server_start_error = ""
+    if audio_compat and os.path.exists(audio_compat):
+        try:
+            start_audio_server_if_needed(audio_compat)
+        except Exception as e:
+            audio_server_start_error = str(e)
 
 
 
 
     with st.expander("🔧 Serveur audio", expanded=False):
+        if audio_server_start_error:
+            st.error(f"❌ Relance du serveur audio impossible : {audio_server_start_error}")
         try:
             # HEAD d’abord (léger), sinon GET sur un octet avec Range
             r = requests.get(audio_url, headers={"Range": "bytes=0-0"}, timeout=4)
@@ -1187,6 +1646,17 @@ def show_annotation_interface():
     # 🔄 Gestion de session d’annotation : chargement des photos
     # ─────────────────────────────────────────────────────────────
     photos_df = read_csv_fallback(photos_csv, sep=";")
+    photos_df = _ensure_photo_text_columns(
+        photos_df,
+        [
+            "dictee_asr_status",
+            "dictee_asr_ts",
+            "dictee_asr_text",
+            "dictee_audio_path_pcfixe",
+            "dictee_asr_csv_path_pcfixe",
+            "dictee_asr_photo_csv_path_pcfixe",
+        ],
+    )
     photos_df["sec_of_day"] = photos_df["horodatage_photo"].apply(_sec_of_day)
 
     if "orientation_photo" in photos_df.columns:
@@ -1241,7 +1711,15 @@ def show_annotation_interface():
         if st.session_state.get("debug"):
             st.write("LocalLLMClient loaded from:", inspect.getfile(LocalLLMClient))
             st.write("Has STOP_LIBELLE:", hasattr(LocalLLMClient, "STOP_LIBELLE"))
-    
+
+        llm_backend_ui = st.selectbox(
+            "Backend LLM",
+            ["local", "openai"],
+            index=0 if st.session_state.get("llm_backend_input", current_backend) == "local" else 1,
+            key="llm_backend_input",
+        )
+        st.caption("`local` utilise SERVER_URL/LOCAL_LLM_API_KEY ; `openai` utilise OPENAI_API_KEY.")
+
         st.markdown("Cliquez sur le bouton ci-dessous pour sauvegarder les durées actuellement utilisées.")
         if st.button("💾 Enregistrer les durées dans le fichier projet"):
             infos["plages_utilisees"] = {
@@ -1252,9 +1730,13 @@ def show_annotation_interface():
                 }
             infos["audio_av"] = float(st.session_state.get("audio_av_input", 10))
             infos["audio_ap"] = float(st.session_state.get("audio_ap_input", 10))
+            infos["llm_backend"] = llm_backend_ui
 
             sauvegarder_infos_projet(infos)
+            persisted_cfg, cfg_path = _persist_llm_backend(infos, llm_backend_ui)
             st.success("✅ Les durées ont été enregistrées dans `infos_projet.json`.")
+            if persisted_cfg:
+                st.caption(f"Backend LLM aussi répercuté dans `{cfg_path}`.")
 
             
     # ─────────────────────────────────────────────────────────────
@@ -1295,6 +1777,7 @@ def show_annotation_interface():
         if st.button("💾 Mettre à jour ces durées", key="save_durees"):
             projet["audio_av"] = audio_av
             projet["audio_ap"] = audio_ap
+            projet["llm_backend"] = st.session_state.get("llm_backend_input", current_backend)
             projet.setdefault("plages_utilisees", {})
             projet["plages_utilisees"].setdefault("libelle", {})
             projet["plages_utilisees"].setdefault("commentaire", {})
@@ -1303,6 +1786,7 @@ def show_annotation_interface():
             projet["plages_utilisees"]["commentaire"]["avant"] = com_av
             projet["plages_utilisees"]["commentaire"]["apres"] = com_ap
             sauvegarder_infos_projet(projet)
+            _persist_llm_backend(projet, projet["llm_backend"])
             st.success("✅ Durées globales mises à jour.")
 
     # 📷 Affichage du numéro de photo courant
@@ -1318,23 +1802,48 @@ def show_annotation_interface():
         key="edit_mode",
     )
 
+    _refresh_all_pending_dictees(
+        photos_df,
+        photos_csv=photos_csv,
+        infos=infos,
+    )
+
     # --- Déterminer la première photo non annotée ---
     annoted_names = set(annotations_df["nom_fichier_image"].astype(str))
-    first_non = next(
-        (idx for idx, r in photos_df.iterrows() if str(r["nom_fichier_image"]) not in annoted_names),
-        None
+    first_non = _next_actionable_photo_index(photos_df, annoted_names)
+    has_pending_unannotated = any(
+        str(photos_df.iloc[idx].get("nom_fichier_image") or "").strip() not in annoted_names
+        and _is_dictee_pending(photos_df.iloc[idx].get("dictee_asr_status"))
+        for idx in range(len(photos_df))
     )
+    seq_override_index = st.session_state.pop("seq_override_index", None)
+
     if edit_mode == "Séquentiel (sécurisé)":
-        if first_non is None:
-            st.info("Toutes les photos sont déjà annotées ...")
+        if isinstance(seq_override_index, int):
+            override_ok = 0 <= seq_override_index < len(photos_df)
+            if override_ok:
+                target_indices = [seq_override_index]
+            elif first_non is not None:
+                target_indices = [first_non]
+            else:
+                target_indices = []
+        elif first_non is not None:
+            target_indices = [first_non]
+        else:
+            if has_pending_unannotated:
+                st.info("Toutes les photos restantes sont en attente de transcription. Vous pouvez continuer plus tard ou passer en Réédition libre (expert).")
+            else:
+                st.info("Toutes les photos sont déjà annotées ...")
             return
-        target_indices = [first_non]
     else:
         target_indices = list(range(len(photos_df)))
 
     # En mode séquentiel : si tout est déjà annoté, on informe et on s’arrête proprement
     if edit_mode == "Séquentiel (sécurisé)" and first_non is None:
-        st.info("Toutes les photos sont déjà annotées. Passez en **Réédition libre (expert)** pour modifier des annotations existantes.")
+        if has_pending_unannotated:
+            st.info("Toutes les photos restantes sont en attente de transcription. Revenez plus tard ou passez en **Réédition libre (expert)** pour consulter une photo précise.")
+        else:
+            st.info("Toutes les photos sont déjà annotées. Passez en **Réédition libre (expert)** pour modifier des annotations existantes.")
         return
     
     # ─────────────────────────────────────────────────────────────
@@ -1403,20 +1912,24 @@ def show_annotation_interface():
         row_view = photos_view_df.iloc[i]    # lecture (UI + batch)
         photo_dirty = False
 
+        current_seq_target = i if edit_mode == "Séquentiel (sécurisé)" else first_non
 
         if edit_mode == "Séquentiel (sécurisé)":
             # On n'affiche qu'une seule photo : la première non annotée
-            if first_non is None:
-                st.info("Toutes les photos sont déjà annotées.")
+            if current_seq_target is None:
+                if has_pending_unannotated:
+                    st.info("Toutes les photos restantes sont en attente de transcription.")
+                else:
+                    st.info("Toutes les photos sont déjà annotées.")
                 return
-            if i != first_non:
+            if i != current_seq_target:
                 continue
 
         nom_image = row["nom_fichier_image"]
         is_annotated = str(nom_image) in annoted_names
 
         if edit_mode == "Séquentiel (sécurisé)":
-            if is_annotated and i != first_non:
+            if is_annotated and i != current_seq_target:
                 st.caption(f"✅ {nom_image} déjà annotée — édition verrouillée.")
                 continue
         else:
@@ -1596,18 +2109,27 @@ def show_annotation_interface():
                 with colv1:
                     if st.button("🔎 Calculer la description VLM", key=f"vlm_only_{i}"):
                         try:
-                            guide_src = (texte_com or texte_lib or "").strip()
-                            desc_new = ensure_desc_vlm(
-                                i, row_view, guide_src=guide_src,
-                                photos_df=photos_df, photos_csv=photos_csv,
-                                mission=mission, context_system=context_system,
-                                context_user=context_user, vlm_system=vlm_system, vlm_user=vlm_user,
-                                force=False,
-                            )
-                            if desc_new:
-                                st.rerun()
+                            existing_desc = pick_desc_vlm(row_view)
+                            if existing_desc:
+                                st.info("Une description VLM est déjà disponible pour cette photo. Utilisez « Régénérer description VLM » pour forcer un nouveau calcul.")
                             else:
-                                st.warning("VLM a répondu vide.")
+                                guide_src = (texte_com or texte_lib or "").strip()
+                                desc_new = ensure_desc_vlm(
+                                    i, row_view, guide_src=guide_src,
+                                    photos_df=photos_df, photos_csv=photos_csv,
+                                    mission=mission, context_system=context_system,
+                                    context_user=context_user, vlm_system=vlm_system, vlm_user=vlm_user,
+                                    force=False,
+                                )
+                                if desc_new:
+                                    st.success("Description VLM calculée et enregistrée.")
+                                    st.rerun()
+                                else:
+                                    vlm_status_now = str(photos_df.at[i, "vlm_ui_status"] if "vlm_ui_status" in photos_df.columns else "").strip()
+                                    if vlm_status_now == "ERR_IMAGE_NOT_FOUND":
+                                        st.warning("Impossible de calculer la description VLM : image introuvable côté laptop.")
+                                    else:
+                                        st.warning("VLM a répondu vide.")
                         except Exception as e:
                             st.error(f"Erreur VLM : {e}")
 
@@ -1928,11 +2450,21 @@ def show_annotation_interface():
                                 st.warning("Transcription vide après normalisation (libellé).")
 
                             raw = generer_texte_gpt(system_lib, prompt_lib)
-                            new_lib = _post_clean_llm(raw, "libelle")
-
-                            if not new_lib or new_lib in ("*", "**"):
-                                st.warning("⚠️ Libellé vide ou tronqué.")
+                            runtime_message_handled = False
+                            if _is_local_llm_busy_result(raw):
+                                st.warning("LLM local occupe, reessayez dans quelques secondes.")
+                                runtime_message_handled = True
+                                new_lib = ""
+                            elif _is_llm_runtime_message(raw):
+                                st.warning(raw.strip()[1:-1])
+                                runtime_message_handled = True
+                                new_lib = ""
                             else:
+                                new_lib = _post_clean_llm(raw, "libelle")
+
+                            if (not runtime_message_handled) and (not new_lib or new_lib in ("*", "**")):
+                                st.warning("⚠️ Libellé vide ou tronqué.")
+                            elif not runtime_message_handled:
                                 st.session_state[f"libelle_{i}"] = new_lib
                                 st.session_state[f"libelle_input_{i}"] = new_lib
                                 st.rerun()
@@ -1990,11 +2522,21 @@ def show_annotation_interface():
                                 prompt_com += "\n\n[DICTÉE MICRO]\n" + dictee
 
                             raw = generer_texte_gpt(system_com, prompt_com)
-                            new_com = _post_clean_llm(raw, "commentaire")
+                            runtime_message_handled = False
+                            if _is_local_llm_busy_result(raw):
+                                st.warning("LLM local occupe, reessayez dans quelques secondes.")
+                                runtime_message_handled = True
+                                new_com = ""
+                            elif _is_llm_runtime_message(raw):
+                                st.warning(raw.strip()[1:-1])
+                                runtime_message_handled = True
+                                new_com = ""
+                            elif not runtime_message_handled:
+                                new_com = _post_clean_llm(raw, "commentaire")
 
-                            if not new_com or new_com in ("*", "**"):
+                            if (not runtime_message_handled) and (not new_com or new_com in ("*", "**")):
                                 st.warning("⚠️ Commentaire vide ou tronqué.")
-                            else:
+                            elif not runtime_message_handled:
                                 st.session_state[f"commentaire_{i}"] = new_com
                                 st.session_state[f"commentaire_input_{i}"] = new_com
                                 st.rerun()
@@ -2029,6 +2571,7 @@ def show_annotation_interface():
 
 
                         dictee = (st.session_state.get(f"dictee_{i}") or "").strip()
+                        local_request_blocked = False
 
                         # --- Libellé ---
                         if extrait_lib:
@@ -2056,7 +2599,16 @@ def show_annotation_interface():
                                 prompt_lib += "\n\n[DICTÉE MICRO]\n" + dictee
 
                             raw = generer_texte_gpt(system_lib, prompt_lib)
-                            new_lib = _post_clean_llm(raw, "libelle")
+                            if _is_local_llm_busy_result(raw):
+                                st.warning("LLM local occupe, reessayez dans quelques secondes.")
+                                local_request_blocked = True
+                                new_lib = ""
+                            elif _is_llm_runtime_message(raw):
+                                st.warning(raw.strip()[1:-1])
+                                local_request_blocked = True
+                                new_lib = ""
+                            elif not local_request_blocked:
+                                new_lib = _post_clean_llm(raw, "libelle")
 
                             if new_lib and new_lib not in ("*", "**"):
                                 st.session_state[f"libelle_{i}"] = new_lib
@@ -2067,13 +2619,13 @@ def show_annotation_interface():
                                 photos_df.at[i, "libelle_ui_ts"] = now
                                 photos_df.at[i, "ui_ts"] = now
                                 photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
-                            else:
+                            elif not local_request_blocked:
                                 st.warning("⛔ Libellé non recalculé : sortie vide / tronquée.")
                         else:
                             st.warning("⛔ Libellé non recalculé : extrait vide.")
 
                         # --- Commentaire ---
-                        if extrait_com:
+                        if (not local_request_blocked) and extrait_com:
                             system_com = _compose_system(prompts["commentaire"].get("system"), context_system)
                             tpl_com = str(prompts.get("commentaire", {}).get("user", "") or "")
 
@@ -2103,11 +2655,20 @@ def show_annotation_interface():
                                 prompt_com += "\n\n[DICTÉE MICRO]\n" + dictee
 
                             raw = generer_texte_gpt(system_com, prompt_com)
-                            new_com = _post_clean_llm(raw, "commentaire")
-
-                            if not new_com or new_com in ("*", "**"):
-                                st.warning("⚠️ Commentaire vide ou tronqué.")
+                            if _is_local_llm_busy_result(raw):
+                                st.warning("LLM local occupe, reessayez dans quelques secondes.")
+                                local_request_blocked = True
+                                new_com = ""
+                            elif _is_llm_runtime_message(raw):
+                                st.warning(raw.strip()[1:-1])
+                                local_request_blocked = True
+                                new_com = ""
                             else:
+                                new_com = _post_clean_llm(raw, "commentaire")
+
+                            if (not local_request_blocked) and (not new_com or new_com in ("*", "**")):
+                                st.warning("⚠️ Commentaire vide ou tronqué.")
+                            elif not local_request_blocked:
                                 st.session_state[f"commentaire_{i}"] = new_com
                                 st.session_state[f"commentaire_input_{i}"] = new_com
                                 photos_df.at[i, "commentaire_propose_ui"] = new_com
@@ -2120,15 +2681,124 @@ def show_annotation_interface():
                                     photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
                                 st.rerun()                                
 
-                        else:
+                        elif not local_request_blocked:
                             st.warning("⛔ Aucun texte utilisable pour le commentaire (extrait vide).")
 
-                        st.rerun()
-
-
                     # --- Dictée micro : ASR -> aide libellé/commentaire ---
-                    with st.expander("🎙️ Dictée micro → proposer libellé & commentaire", expanded=False):
+                    dictee_expanded = _is_dictee_pending(row.get("dictee_asr_status")) or (
+                        _ui_text(st.session_state.get(f"dictee_feedback_{i}")) == "pending"
+                    )
+                    with st.expander("🎙️ Dictée micro → proposer libellé & commentaire", expanded=dictee_expanded):
+                        refreshed_status, refreshed_text, refreshed_csv_path, refreshed_photo_csv_path = _refresh_pending_dictee(
+                            i,
+                            row,
+                            photos_df=photos_df,
+                            photos_csv=photos_csv,
+                            infos=infos,
+                        )
+                        persisted_dictee_text = _ui_text(refreshed_text or row.get("dictee_asr_text"))
+                        persisted_dictee_status = _ui_text(refreshed_status or row.get("dictee_asr_status"))
+                        persisted_dictee_ts = _ui_text(row.get("dictee_asr_ts"))
+                        persisted_audio_path = _ui_text(row.get("dictee_audio_path_pcfixe"))
+                        persisted_dictee_csv_path = _ui_text(refreshed_csv_path or row.get("dictee_asr_csv_path_pcfixe"))
+                        persisted_dictee_photo_csv_path = _ui_text(refreshed_photo_csv_path or row.get("dictee_asr_photo_csv_path_pcfixe"))
+                        has_persisted_audio = bool(persisted_audio_path)
+                        has_persisted_text = bool(persisted_dictee_text)
+
+                        current_dictee_text = _ui_text(
+                            st.session_state.get(f"dictee_{i}") or persisted_dictee_text
+                        )
+                        st.session_state[f"dictee_{i}"] = current_dictee_text
+                        has_current_dictee_text = bool(current_dictee_text)
+
+                        dictee_feedback = _ui_text(st.session_state.pop(f"dictee_feedback_{i}", ""))
+                        if dictee_feedback == "success":
+                            st.success("Dictée transcrite.")
+                        elif dictee_feedback == "pending":
+                            st.info("⏳ Dictée envoyée au serveur. La transcription sera rechargée automatiquement dès qu'elle sera disponible.")
+                        elif dictee_feedback == "empty":
+                            st.warning("Dictee traitee, mais aucun texte ASR n'a ete renvoye.")
+
+                        if persisted_dictee_status or has_persisted_audio or has_persisted_text:
+                            meta = []
+                            if persisted_dictee_status:
+                                meta.append(f"statut={persisted_dictee_status}")
+                            if persisted_dictee_ts:
+                                meta.append(f"horodatage={persisted_dictee_ts}")
+                            if has_persisted_audio:
+                                meta.append("audio serveur present")
+                            if has_persisted_text:
+                                meta.append("texte ASR disponible")
+                            st.caption("Derniere dictee connue : " + " | ".join(meta))
+
+                        st.text_area("Texte dicté (ASR)", value=current_dictee_text, height=120, disabled=True)
+                        if persisted_dictee_status == "PENDING":
+                            st.info("⏳ Transcription en cours (serveur). Vous pouvez passer à une autre photo et revenir plus tard.")
+                        elif persisted_dictee_status == "OK" and has_current_dictee_text:
+                            st.success("✅ Transcription disponible")
+                            st.info("Le texte dicté affiché ci-dessus est la source actuellement réutilisée dans les prompts GPT pour proposer le libellé et le commentaire.")
+                        elif persisted_dictee_status == "ERR":
+                            st.error("❌ Transcription échouée")
+                            if persisted_dictee_csv_path or persisted_dictee_photo_csv_path:
+                                st.caption("Des fichiers ASR existent côté serveur, mais aucun texte exploitable n'a pu être relu.")
+                        elif has_persisted_audio:
+                            st.warning("Une ancienne dictée audio existe, mais aucun texte transcrit n'est actuellement disponible.")
+                        else:
+                            st.caption("Aucune dictée exploitable n'est actuellement disponible.")
+
+                        next_actionable_idx = _next_actionable_photo_index(
+                            photos_df,
+                            annoted_names,
+                            start_after=i,
+                        )
+                        if edit_mode == "Séquentiel (sécurisé)" and persisted_dictee_status == "PENDING":
+                            if st.button(
+                                "➡️ Passer à la photo suivante (ASR en cours)",
+                                key=f"skip_pending_{i}",
+                                disabled=next_actionable_idx is None,
+                                help="La photo courante reste en attente de transcription côté serveur. Vous pourrez y revenir plus tard pour récupérer le texte.",
+                            ):
+                                if next_actionable_idx is not None:
+                                    st.session_state["seq_override_index"] = int(next_actionable_idx)
+                                    st.rerun()
+                            if next_actionable_idx is None:
+                                st.caption("Aucune autre photo actionnable n'est disponible pour l'instant. Revenez plus tard dès qu'une transcription sera terminée.")
+
                         audio_in = st.audio_input("Enregistrer (micro)", key=f"mic_{i}")
+                        has_new_audio = audio_in is not None
+                        live_audio_diag = None
+                        live_audio_diag_error = ""
+                        if has_new_audio:
+                            try:
+                                live_audio_diag = _analyze_audio_bytes(audio_in.getvalue())
+                            except Exception as e:
+                                live_audio_diag_error = str(e)
+
+                        if live_audio_diag_error:
+                            st.error(f"Diagnostic audio impossible : {live_audio_diag_error}")
+                        elif live_audio_diag:
+                            verdict_text, verdict_level = _audio_diag_verdict(live_audio_diag)
+                            diag_msg = (
+                                f"Diagnostic micro : durée={live_audio_diag['duration_s']:.2f}s | "
+                                f"fréquence={live_audio_diag['sample_rate']} Hz | "
+                                f"canaux={live_audio_diag['channels']} | "
+                                f"RMS={live_audio_diag['rms']:.6f} | "
+                                f"peak={live_audio_diag['peak']:.6f} | "
+                                f"verdict={verdict_text}"
+                            )
+                            if verdict_level == "success":
+                                st.success(diag_msg)
+                            elif verdict_level == "warning":
+                                st.warning(diag_msg)
+                            else:
+                                st.error(diag_msg)
+                                st.info(
+                                    "Le problème vient probablement de la capture micro côté navigateur : "
+                                    "vérifiez le micro sélectionné dans le navigateur, les permissions micro du site, "
+                                    "testez un autre périphérique d'entrée et fermez les autres applications "
+                                    "susceptibles de monopoliser le micro."
+                                )
+                        st.caption("Le bouton ci-dessous sert uniquement à transcrire un nouvel enregistrement micro. Le texte affiché ci-dessus, s'il existe, est déjà réutilisé automatiquement par les boutons GPT de libellé/commentaire.")
                         try:
                             project_id, _pcfixe_preview = _require_server_project_context(infos)
                         except Exception as e:
@@ -2136,16 +2806,42 @@ def show_annotation_interface():
                             st.warning(str(e))
 
                         if project_id:
-                            if st.button("🪄 Utiliser la dictée pour proposer libellé + commentaire", key=f"mic_go_{i}"):
+                            if st.button(
+                                "🪄 Transcrire cet enregistrement et l'ajouter aux prompts GPT",
+                                key=f"mic_go_{i}",
+                                disabled=not has_new_audio,
+                                help="Enregistrez d'abord un nouvel audio micro pour lancer une nouvelle transcription.",
+                            ):
                                 try:
                                     if audio_in is None:
-                                        st.warning("Aucun audio enregistré.")
+                                        if has_current_dictee_text:
+                                            st.info("Aucun nouvel audio enregistré. Le dernier texte dicté persistant reste affiché ci-dessus. Il restera réutilisable par les prompts GPT, mais aucune nouvelle transcription n'est lancée sans nouvel enregistrement.")
+                                        elif has_persisted_audio:
+                                            st.warning("Aucun nouvel audio enregistré. Une ancienne dictée audio existe, mais aucun texte transcrit n'est actuellement disponible.")
+                                        else:
+                                            st.warning("Aucune dictée exploitable n'est actuellement disponible.")
                                     else:
                                         audio_bytes = audio_in.getvalue()
+                                        audio_diag = _analyze_audio_bytes(audio_bytes)
+                                        log.info(
+                                            "[ASR][DICTEE] sr=%sHz channels=%s frames=%s duration=%.3fs rms=%.8f peak=%.8f silent=%s",
+                                            audio_diag["sample_rate"],
+                                            audio_diag["channels"],
+                                            audio_diag["frames"],
+                                            audio_diag["duration_s"],
+                                            audio_diag["rms"],
+                                            audio_diag["peak"],
+                                            audio_diag["is_effectively_silent"],
+                                        )
+                                        if audio_diag["is_effectively_silent"]:
+                                            raise RuntimeError(
+                                                "Audio dicté silencieux ou inexploitable. Vérifiez le micro, le niveau d'entrée et réessayez."
+                                            )
                                         fname = f"mic_{uuid.uuid4().hex}.wav"
 
-                                        appcfg = _load_app_config()
+                                        appcfg = _load_app_config(infos)
                                         local_cfg = appcfg.get("local_llm", {}) or {}
+                                        local_asr_model_key = _resolve_local_asr_model_key(appcfg)
 
                                         client = LocalLLMClient(
                                             base_url=(local_cfg.get("base_url") or "http://127.0.0.1:5050"),
@@ -2160,14 +2856,21 @@ def show_annotation_interface():
 
                                         if asr_backend == "local":
                                             project_id, pcfixe = _require_server_project_context(infos)
+                                            dictation_duration_s = float(audio_diag.get("duration_s") or 0.0)
+                                            dictation_is_long = dictation_duration_s >= (45 * 60)
+                                            asr_chunk = 120 if dictation_is_long else 30
+                                            asr_stride = 5 if dictation_is_long else 10
+                                            asr_auto_chunk = bool(dictation_is_long)
 
-                                            # (A) subdir relatif sous C:\Affaires pour /files
+                                            # (A) sous-répertoire relatif sous la racine canonique Affaires pour /files
+                                            #     area="asr_in" pointe déjà vers le dossier asr_in ;
+                                            #     subdir ne doit donc PAS le rajouter une seconde fois.
                                             subdir_base = compute_asr_subdir_from_pcfixe(pcfixe)
                                             if not subdir_base:
                                                 raise RuntimeError(
                                                     "Sous-repertoire ASR serveur vide : upload /files annule."
                                                 )
-                                            subdir_in   = str(Path(subdir_base) / "asr_in")
+                                            subdir_in = subdir_base
 
                                             # (B) chemin ABSOLU côté PC fixe pour la sortie CSV
                                             out_dir_abs = compute_asr_out_dir_from_pcfixe(pcfixe)
@@ -2186,38 +2889,50 @@ def show_annotation_interface():
                                                 subdir=subdir_in,   # ✅ aiguillage
                                             )
 
-                                            # 2) ASR -> /asr_voxtral (UN SEUL appel) + export CSV dans asr_out
-                                            payload = client.asr_voxtral(
+                                            raw_csv_candidate, photo_csv_candidate = _dictation_csv_candidates(audio_path_server, out_dir_abs)
+
+                                            # 2) ASR -> /asr_voxtral en mode non bloquant + export CSV dans asr_out
+                                            client.asr_voxtral(
                                                 audio_path_server,
+                                                model_key=local_asr_model_key,
                                                 lang="fr",
-                                                timestamps=False,
-                                                auto_chunk=True,
+                                                timestamps=True,
+                                                auto_chunk=asr_auto_chunk,
+                                                chunk=asr_chunk,
+                                                stride=asr_stride,
+                                                diarize=False,
                                                 output_csv_dir=out_dir_abs,     # ✅ ABSOLU PC fixe
                                                 export_raw_csv=True,
                                                 export_photo_csv=True,
                                                 export_chat_csv=False,
-                                                return_payload=True,
+                                                export_chat_docx=False,
+                                                temperature=0.0,
+                                                top_p=0.9,
+                                                max_new_tokens=768,
+                                                batch_size=1,
+                                                client_tag="annotationphotogpt_dictation_ui",
+                                                return_payload=False,
+                                                request_timeout=8,
+                                                allow_timeout_success=True,
                                             )
 
-
-                                            texte_dictee = (payload.get("text") or "").strip()
-                                            dictee_csv_path = payload.get("csv_path") or ""
-                                            dictee_photo_csv_path = payload.get("photo_csv_path") or ""
+                                            texte_dictee = ""
+                                            dictee_csv_path = str(raw_csv_candidate) if raw_csv_candidate else ""
+                                            dictee_photo_csv_path = str(photo_csv_candidate) if photo_csv_candidate else ""
 
                                             # --- après client.asr_voxtral(..., return_payload=True) ---
-                                            pcfixe_root = (pcfixe.get("root_affaires") or r"C:\Affaires")
-                                            root_in_abs = str(Path(pcfixe_root) / subdir_in)
+                                            root_in_abs = compute_dictee_target_dir(pcfixe)
                                             _check_under(audio_path_server, root_in_abs, "WAV dictée (asr_in)")
-                                            if dictee_csv_path:
+                                            if dictee_csv_path and Path(dictee_csv_path).exists():
                                                 _check_under(dictee_csv_path, out_dir_abs, "CSV ASR brut (asr_out)")
 
-                                            if dictee_photo_csv_path:
+                                            if dictee_photo_csv_path and Path(dictee_photo_csv_path).exists():
                                                 _check_under(dictee_photo_csv_path, out_dir_abs, "CSV ASR photo (asr_out)")
 
                                             # 3) Persist dans le CSV photos (laptop)
                                             photos_df.at[i, "dictee_audio_path_pcfixe"] = audio_path_server
                                             photos_df.at[i, "dictee_asr_text"] = texte_dictee
-                                            photos_df.at[i, "dictee_asr_status"] = "OK"
+                                            photos_df.at[i, "dictee_asr_status"] = "PENDING"
                                             photos_df.at[i, "dictee_asr_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                                             if dictee_csv_path:
@@ -2245,11 +2960,14 @@ def show_annotation_interface():
                                         photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
 
                                         st.session_state[f"dictee_{i}"] = texte_dictee
-                                        st.success("Dictée transcrite.")
-                                        st.text_area("Texte dicté (ASR)", texte_dictee, height=120, key=f"dictee_view_{i}")
+                                        st.session_state[f"dictee_feedback_{i}"] = "pending" if asr_backend == "local" else ("success" if texte_dictee else "empty")
+                                        if asr_backend == "local":
+                                            st.session_state["seq_override_index"] = int(i)
+                                        st.rerun()
 
                                 except Exception as e:
-                                    photos_df.at[i, "dictee_asr_status"] = "ERR"
+                                    err_text = str(e)
+                                    photos_df.at[i, "dictee_asr_status"] = "ERR_SILENT_AUDIO" if "silencieux ou inexploitable" in err_text else "ERR"
                                     photos_df.at[i, "dictee_asr_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                     photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
                                     st.error(f"Erreur dictée/ASR : {e}")

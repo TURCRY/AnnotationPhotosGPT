@@ -1,14 +1,11 @@
 import streamlit as st
-import json
-import os
 
-from utils import sauvegarder_infos_projet
+from utils import lire_infos_projet, sauvegarder_infos_projet
 
 def config_synchro_interface():
     st.title("⚙️ Configuration de la synchronisation")
 
-    with open(os.path.join("data", "infos_projet.json"), "r", encoding="utf-8") as f:
-        infos = json.load(f)
+    infos = lire_infos_projet()
 
     st.subheader("🔢 Paramètres de départ")
 
