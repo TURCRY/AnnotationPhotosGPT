@@ -144,6 +144,11 @@ Automatisation Windows disponible dans le depot :
 - `serveur_flask_task.bat`
 - `serveur_flask_auto.ps1`
 
+## Architecture globale
+
+Voir :
+- README_PIPELINE_GLOBAL.md — vue d’ensemble du pipeline (Laptop / NAS / PC fixe / rapport)
+
 ## Capacites exposees
 
 - generation LLM locale
