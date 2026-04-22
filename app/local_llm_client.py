@@ -8,6 +8,14 @@ from typing import Optional, Dict, Any, List, Union
 from pathlib import Path
 
 
+def _is_placeholder_api_key(value: str) -> bool:
+    v = (value or "").strip()
+    if not v:
+        return True
+    u = v.upper()
+    return ("PLACEHOLDER" in u) or (u in {"LOCAL_LLM_API_KEY", "LOCAL_LLM_API_KEY_PLACEHOLDER"})
+
+
 class LocalLLMClient:
     """
     Client minimal pour un serveur Flask type gpt4all_flask.py.
@@ -25,8 +33,17 @@ class LocalLLMClient:
         api_key: Optional[str] = None,
         timeout: float = 30.0,
     ):
-        self.base_url = (base_url or os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:5050")).rstrip("/")
-        self.api_key = api_key or os.getenv("LOCAL_LLM_API_KEY", "")
+        env_base = os.getenv("SERVER_URL") or os.getenv("LOCAL_LLM_BASE_URL") or "http://127.0.0.1:5050"
+        self.base_url = (base_url or env_base).rstrip("/")
+
+        passed_key = (api_key or "").strip()
+        env_key = (os.getenv("LOCAL_LLM_API_KEY") or "").strip()
+        if passed_key and not _is_placeholder_api_key(passed_key):
+            self.api_key = passed_key
+        elif env_key and not _is_placeholder_api_key(env_key):
+            self.api_key = env_key
+        else:
+            self.api_key = ""
         self.timeout = float(timeout)
 
     def _h(self) -> Dict[str, str]:
@@ -174,6 +191,8 @@ class LocalLLMClient:
         excel_encoding: str = "utf-8-sig",
         excel_decimal: str = "comma",
         return_payload: bool = False,
+        request_timeout: Optional[float] = None,
+        allow_timeout_success: bool = False,
         **kwargs: Any,
     ) -> Union[str, Dict[str, Any]]:
         """
@@ -186,6 +205,10 @@ class LocalLLMClient:
         - output_csv_dir: chemin ABSOLU côté PC fixe où écrire les CSV (ex: ...\\asr_out)
         - export_* : contrôle quels exports sont écrits
         """
+
+        audio_path = str(audio_path or "").strip()
+        if not audio_path:
+            raise ValueError("ASR /asr_voxtral impossible : audio_path vide.")
 
         payload: Dict[str, Any] = {
             "audio_path": audio_path,
@@ -206,13 +229,36 @@ class LocalLLMClient:
         # permet de passer model_key, chunk, diarize, etc.
         payload.update(kwargs)
 
-        r = requests.post(
-            self._url("/asr_voxtral"),
-            json=payload,
-            headers=self._h(),
-            timeout=max(self.timeout, 600),
-        )
-        r.raise_for_status()
+        try:
+            r = requests.post(
+                self._url("/asr_voxtral"),
+                json=payload,
+                headers=self._h(),
+                timeout=float(request_timeout) if request_timeout is not None else max(self.timeout, 600),
+            )
+            r.raise_for_status()
+        except requests.Timeout as e:
+            if allow_timeout_success:
+                if return_payload:
+                    return {"ok": True, "pending": True, "audio_path": audio_path}
+                return ""
+            raise RuntimeError("ASR /asr_voxtral timeout") from e
+        except requests.HTTPError as e:
+            response = getattr(e, "response", None)
+            if response is not None:
+                try:
+                    data = response.json() or {}
+                except Exception:
+                    data = {}
+                detail = (
+                    data.get("error")
+                    or data.get("detail")
+                    or data.get("message")
+                    or (response.text or "").strip()
+                )
+                if detail:
+                    raise RuntimeError(f"ASR /asr_voxtral HTTP {response.status_code}: {detail}") from e
+            raise
         j = r.json()
 
         if j.get("error"):

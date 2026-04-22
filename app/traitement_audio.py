@@ -1,6 +1,7 @@
 import os
 import subprocess
 import shutil
+import sys
 from datetime import datetime
 import time
 import json
@@ -225,18 +226,37 @@ def start_audio_server_if_needed(audio_path: str):
     env["AUDIO_FILE_PATH"] = wanted
 
     base_dir = os.path.abspath(os.path.dirname(__file__))
-    script = os.path.join(base_dir, "app", "audio_server.py")
+    script = os.path.join(base_dir, "audio_server.py")
+    if not os.path.exists(script):
+        raise RuntimeError(f"Serveur audio introuvable : {script}")
 
-    proc = subprocess.Popen(["python", script], cwd=base_dir, env=env)
+    proc = subprocess.Popen(
+        [sys.executable, script],
+        cwd=base_dir,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     st.session_state["_audio_srv"] = proc
 
     for _ in range(30):
+        if proc.poll() is not None:
+            st.session_state["_audio_srv"] = None
+            raise RuntimeError(
+                "Le serveur audio local s'est arrêté immédiatement après son lancement."
+            )
         if _port_open("127.0.0.1", 5000):
             # option : vérifier que le serveur sert bien le bon fichier
             served = _get_server_audio_path()
             if served and os.path.abspath(served) == wanted:
-                break
+                return
         time.sleep(0.1)
+
+    if not _port_open("127.0.0.1", 5000):
+        st.session_state["_audio_srv"] = None
+        raise RuntimeError(
+            "Impossible de démarrer le serveur audio local sur 127.0.0.1:5000."
+        )
 
 
 def stop_audio_server_if_any():
