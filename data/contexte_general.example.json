@@ -1,0 +1,9 @@
+{
+  "mission": "Description synthétique de la mission d'expertise judiciaire (périmètre, objectifs, cadre procédural).",
+
+  "etat_avancement": "Description de l’état d’avancement des opérations (réunion initiale, visite, phase contradictoire, etc.).",
+
+  "system": "Instructions système LLM : rôle de l’expert, cadre judiciaire, règles de rédaction (neutralité, absence d’interprétation, structure attendue des sorties).",
+
+  "user": "Contexte détaillé de l’affaire : nature du litige, mission confiée, points à traiter, consignes spécifiques pour la production (compte rendu, tableau des sujets, etc.)."
+}

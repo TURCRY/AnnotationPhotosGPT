@@ -1,0 +1,10 @@
+{
+  "mission": "Mission de rédaction du compte rendu.",
+  "etat_avancement": "Phase d’avancement de la réunion.",
+  "system": "Cadre procédural et technique.",
+  "user": "Consignes de rédaction factuelle.",
+  "duree_reunion_estimee_sec": 3600,
+  "duree_reunion_estimee_hms": "01:00:00",
+  "source_duree": "estimation",
+  "csv_max_end_sec": null
+}

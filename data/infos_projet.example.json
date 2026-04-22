@@ -1,0 +1,32 @@
+{
+  "id_affaire": "YYYY-XXX",
+  "id_captation": "nom_captation",
+
+  "profil_execution": "laptop",
+
+  "fichier_photos": "C:\\chemin\\vers\\photos.csv",
+  "fichier_photos_batch": "C:\\chemin\\vers\\photos_batch.csv",
+  "fichier_transcription": "C:\\chemin\\vers\\transcription.csv",
+  "fichier_contexte_general": "C:\\chemin\\vers\\contexte_general_photos.json",
+
+  "pcfixe": {
+    "fichier_photos": "\\\\NAS\\Affaires\\YYYY-XXX\\AE_Expert_captations\\nom_captation\\photos\\photos.csv",
+    "fichier_photos_batch": "\\\\NAS\\Affaires\\YYYY-XXX\\AE_Expert_captations\\nom_captation\\photos\\photos_batch.csv",
+    "fichier_transcription": "C:\\Affaires\\YYYY-XXX\\AF_Expert_ASR\\transcriptions\\nom_captation\\transcription.csv",
+    "fichier_contexte_general": "C:\\Affaires\\YYYY-XXX\\AF_Expert_ASR\\transcriptions\\nom_captation\\contexte_general_photos.json",
+    "config_llm": "\\\\NAS\\Affaires\\YYYY-XXX\\AF_Expert_ASR\\transcriptions\\nom_captation\\config_llm.json"
+  },
+
+  "plages_utilisees": {
+    "libelle": {
+      "avant": 45.0,
+      "apres": 30.0
+    },
+    "commentaire": {
+      "avant": 90.0,
+      "apres": 60.0
+    }
+  },
+
+  "horodatage_reference": "exif"
+}

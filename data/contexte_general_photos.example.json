@@ -1,0 +1,8 @@
+{
+  "mission": "Description de la mission d’observation photographique.",
+  "etat_avancement": "Contexte de la captation photographique.",
+  "system": "Règles de description factuelle des images.",
+  "user": "Consignes de production des libellés et commentaires.",
+  "vlm_system": "Description strictement visuelle.",
+  "vlm_user": "Priorisation des éléments d’ouvrage et désordres."
+}
