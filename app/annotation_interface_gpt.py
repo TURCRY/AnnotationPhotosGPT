@@ -168,6 +168,77 @@ def _resolve_local_asr_model_key(appcfg: dict) -> str:
     return "Voxtral_Mini_3B_Transformers"
 
 
+def _config_bool(appcfg: dict, key: str, default: bool) -> bool:
+    value = appcfg.get(key, default)
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "y", "oui", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "non", "off"}:
+        return False
+    return default
+
+
+def _config_positive_int(appcfg: dict, key: str, default: int) -> int:
+    value = appcfg.get(key, default)
+    try:
+        value = int(value)
+    except Exception:
+        return default
+    return value if value > 0 else default
+
+
+def _build_dictation_local_asr_options(appcfg: dict, duration_s: float) -> dict:
+    dictation_is_long = float(duration_s or 0.0) >= (45 * 60)
+    default_chunk = 120 if dictation_is_long else 30
+    default_stride = 5 if dictation_is_long else 10
+    default_auto_chunk = bool(dictation_is_long)
+
+    client_tag = str(appcfg.get("dictation_asr_client_tag") or "annotationphotogpt_dictation_ui").strip()
+    if not client_tag:
+        client_tag = "annotationphotogpt_dictation_ui"
+
+    return {
+        "model_key": str(appcfg.get("dictation_asr_model") or _resolve_local_asr_model_key(appcfg)).strip(),
+        "cpu": _config_bool(appcfg, "dictation_asr_force_cpu", False),
+        "no4bit": _config_bool(appcfg, "dictation_asr_no4bit", False),
+        "chunk": _config_positive_int(appcfg, "dictation_asr_chunk", default_chunk),
+        "stride": _config_positive_int(appcfg, "dictation_asr_stride", default_stride),
+        "batch_size": _config_positive_int(appcfg, "dictation_asr_batch_size", 1),
+        "auto_chunk": _config_bool(appcfg, "dictation_asr_auto_chunk", default_auto_chunk),
+        "client_tag": client_tag,
+    }
+
+
+def _resolve_libelle_transcript_fallback(
+    *,
+    extrait_lib: str,
+    extrait_com: str,
+    dictee_text: str,
+    dictee_status: str,
+    commentaire_value: str,
+) -> tuple[str, str]:
+    extrait_lib = _normalize_text(extrait_lib, "libelle")
+    if extrait_lib:
+        return extrait_lib, "extrait_lib"
+
+    dictee_status = str(dictee_status or "").strip().upper()
+    dictee_text = _normalize_text(dictee_text, "commentaire")
+    if dictee_status == "OK" and dictee_text:
+        return dictee_text, "dictee_asr"
+
+    commentaire_value = _normalize_text(commentaire_value, "commentaire")
+    if commentaire_value:
+        return commentaire_value, "commentaire_existant"
+
+    extrait_com = _normalize_text(extrait_com, "commentaire")
+    if extrait_com:
+        return extrait_com, "extrait_com"
+
+    return "", ""
+
+
 def _ensure_photo_text_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -2402,15 +2473,34 @@ def show_annotation_interface():
                 # --- Boutons GPT (utiliser bien texte_lib / texte_com) ---
                 gen_col, _ = st.columns(2)
                 with gen_col:
+                    current_dictee_for_gpt = _ui_text(
+                        st.session_state.get(f"dictee_{i}") or row.get("dictee_asr_text")
+                    )
+                    current_dictee_status = _ui_text(row.get("dictee_asr_status"))
+                    current_commentaire_for_gpt = _ui_text(
+                        st.session_state.get(f"commentaire_input_{i}")
+                        or st.session_state.get(f"commentaire_{i}")
+                        or row.get("commentaire_propose_ui")
+                        or row.get("commentaire_propose")
+                        or row.get("commentaire_propose_batch")
+                    )
 
                     # --- Regénérer LIBELLÉ ---
                     if st.button("↻ Regénérer libellé", key=f"regen_lab_{i}"):
 
                         extrait_lib = _normalize_text(texte_lib, "libelle")
+                        extrait_com = _normalize_text(texte_com, "commentaire")
+                        libelle_source_text, libelle_source_kind = _resolve_libelle_transcript_fallback(
+                            extrait_lib=extrait_lib,
+                            extrait_com=extrait_com,
+                            dictee_text=current_dictee_for_gpt,
+                            dictee_status=current_dictee_status,
+                            commentaire_value=current_commentaire_for_gpt,
+                        )
                         desc_vlm = pick_desc_vlm(row_view)
 
                         if not desc_vlm:
-                            guide_src = (texte_lib or "").strip()
+                            guide_src = (libelle_source_text or texte_lib or texte_com or "").strip()
                             desc_vlm = ensure_desc_vlm(
                                 i, row_view, guide_src=guide_src,
                                 photos_df=photos_df, photos_csv=photos_csv,
@@ -2422,19 +2512,19 @@ def show_annotation_interface():
                                 pass  # ou: pass, puis la logique externe ne génère pas
 
 
-                        if extrait_lib:
+                        if libelle_source_text:
                             system_lib = _compose_system(prompts["libelle"].get("system"), context_system)
                             tpl_lib = str(prompts.get("libelle", {}).get("user", "") or "")
 
                             desc_vlm_safe = (desc_vlm or "").strip()
-                            trans_safe    = (extrait_lib or "").strip()
+                            trans_safe    = (libelle_source_text or "").strip()
                             mission_safe  = (mission or "").strip()
                             ctx_safe      = (context_user or "").strip()
 
                             if "{{description_vlm}}" not in tpl_lib and desc_vlm_safe:
                                 tpl_lib = "Description de la photo (éléments visibles uniquement) :\n{{description_vlm}}\n\n" + tpl_lib
 
-                            dictee = (st.session_state.get(f"dictee_{i}") or "").strip()
+                            dictee = (current_dictee_for_gpt or "").strip()
 
                             prompt_lib = (tpl_lib
                                 .replace("{{description_vlm}}", desc_vlm_safe)
@@ -2448,6 +2538,9 @@ def show_annotation_interface():
 
                             if "{{transcription}}" in tpl_lib and not trans_safe:
                                 st.warning("Transcription vide après normalisation (libellé).")
+
+                            if libelle_source_kind != "extrait_lib":
+                                st.info(f"Libellé généré avec source de secours : {libelle_source_kind}.")
 
                             raw = generer_texte_gpt(system_lib, prompt_lib)
                             runtime_message_handled = False
@@ -2469,7 +2562,7 @@ def show_annotation_interface():
                                 st.session_state[f"libelle_input_{i}"] = new_lib
                                 st.rerun()
                         else:
-                            st.warning("⛔ Aucun texte utilisable pour le libellé (extrait vide).")
+                            st.warning("⛔ Aucun texte utilisable pour le libellé : extrait, dictée, commentaire et extrait commentaire sont vides.")
 
 
                     # --- Regénérer COMMENTAIRE ---
@@ -2550,10 +2643,17 @@ def show_annotation_interface():
 
                         extrait_lib = _normalize_text(texte_lib, "libelle")
                         extrait_com = _normalize_text(texte_com, "commentaire")
+                        libelle_source_text, libelle_source_kind = _resolve_libelle_transcript_fallback(
+                            extrait_lib=extrait_lib,
+                            extrait_com=extrait_com,
+                            dictee_text=current_dictee_for_gpt,
+                            dictee_status=current_dictee_status,
+                            commentaire_value=current_commentaire_for_gpt,
+                        )
                         desc_vlm = pick_desc_vlm(row_view)
                         # (1) VLM si description absente
                         if not desc_vlm:
-                            guide_src = (extrait_com or extrait_lib or "").strip()
+                            guide_src = (libelle_source_text or extrait_com or extrait_lib or "").strip()
                             desc_vlm = ensure_desc_vlm(
                                 i, row_view, guide_src=guide_src,
                                 photos_df=photos_df, photos_csv=photos_csv,
@@ -2569,16 +2669,15 @@ def show_annotation_interface():
                         mission_safe  = (mission or "").strip()
                         ctx_safe      = (context_user or "").strip()
 
-
-                        dictee = (st.session_state.get(f"dictee_{i}") or "").strip()
+                        dictee = (current_dictee_for_gpt or "").strip()
                         local_request_blocked = False
 
                         # --- Libellé ---
-                        if extrait_lib:
+                        if libelle_source_text:
                             system_lib = _compose_system(prompts["libelle"].get("system"), context_system)
                             tpl_lib = str(prompts.get("libelle", {}).get("user", "") or "")
 
-                            trans_lib_safe = (extrait_lib or "").strip()
+                            trans_lib_safe = (libelle_source_text or "").strip()
 
                             # Compat : si le template ne prévoit pas description_vlm, on le préfixe
                             if "{{description_vlm}}" not in tpl_lib and desc_vlm_safe:
@@ -2619,10 +2718,12 @@ def show_annotation_interface():
                                 photos_df.at[i, "libelle_ui_ts"] = now
                                 photos_df.at[i, "ui_ts"] = now
                                 photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+                                if libelle_source_kind != "extrait_lib":
+                                    st.info(f"Libellé recalculé avec source de secours : {libelle_source_kind}.")
                             elif not local_request_blocked:
                                 st.warning("⛔ Libellé non recalculé : sortie vide / tronquée.")
                         else:
-                            st.warning("⛔ Libellé non recalculé : extrait vide.")
+                            st.warning("⛔ Libellé non recalculé : aucune source exploitable (extrait, dictée, commentaire, extrait commentaire).")
 
                         # --- Commentaire ---
                         if (not local_request_blocked) and extrait_com:
@@ -2841,8 +2942,6 @@ def show_annotation_interface():
 
                                         appcfg = _load_app_config(infos)
                                         local_cfg = appcfg.get("local_llm", {}) or {}
-                                        local_asr_model_key = _resolve_local_asr_model_key(appcfg)
-
                                         client = LocalLLMClient(
                                             base_url=(local_cfg.get("base_url") or "http://127.0.0.1:5050"),
                                             api_key=(local_cfg.get("api_key") or ""),
@@ -2857,10 +2956,10 @@ def show_annotation_interface():
                                         if asr_backend == "local":
                                             project_id, pcfixe = _require_server_project_context(infos)
                                             dictation_duration_s = float(audio_diag.get("duration_s") or 0.0)
-                                            dictation_is_long = dictation_duration_s >= (45 * 60)
-                                            asr_chunk = 120 if dictation_is_long else 30
-                                            asr_stride = 5 if dictation_is_long else 10
-                                            asr_auto_chunk = bool(dictation_is_long)
+                                            dictation_asr_options = _build_dictation_local_asr_options(
+                                                appcfg,
+                                                dictation_duration_s,
+                                            )
 
                                             # (A) sous-répertoire relatif sous la racine canonique Affaires pour /files
                                             #     area="asr_in" pointe déjà vers le dossier asr_in ;
@@ -2894,12 +2993,14 @@ def show_annotation_interface():
                                             # 2) ASR -> /asr_voxtral en mode non bloquant + export CSV dans asr_out
                                             client.asr_voxtral(
                                                 audio_path_server,
-                                                model_key=local_asr_model_key,
+                                                model_key=dictation_asr_options["model_key"],
                                                 lang="fr",
                                                 timestamps=True,
-                                                auto_chunk=asr_auto_chunk,
-                                                chunk=asr_chunk,
-                                                stride=asr_stride,
+                                                auto_chunk=dictation_asr_options["auto_chunk"],
+                                                cpu=dictation_asr_options["cpu"],
+                                                no4bit=dictation_asr_options["no4bit"],
+                                                chunk=dictation_asr_options["chunk"],
+                                                stride=dictation_asr_options["stride"],
                                                 diarize=False,
                                                 output_csv_dir=out_dir_abs,     # ✅ ABSOLU PC fixe
                                                 export_raw_csv=True,
@@ -2909,8 +3010,8 @@ def show_annotation_interface():
                                                 temperature=0.0,
                                                 top_p=0.9,
                                                 max_new_tokens=768,
-                                                batch_size=1,
-                                                client_tag="annotationphotogpt_dictation_ui",
+                                                batch_size=dictation_asr_options["batch_size"],
+                                                client_tag=dictation_asr_options["client_tag"],
                                                 return_payload=False,
                                                 request_timeout=8,
                                                 allow_timeout_success=True,
