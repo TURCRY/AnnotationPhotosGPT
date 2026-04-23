@@ -2405,9 +2405,12 @@ def show_annotation_interface():
 
                     # Lecture unique via row_view (UI + batch)
                     desc_vlm = pick_desc_vlm(row_view)
+                    skip_auto_vlm_once = bool(st.session_state.pop(f"skip_auto_vlm_once_{i}", False))
 
                     if not desc_vlm:
-                        if not is_annotated:
+                        if skip_auto_vlm_once:
+                            pass
+                        elif not is_annotated:
                             guide_src = (texte_com or texte_lib or "").strip()
                             desc_vlm = ensure_desc_vlm(
                                 i, row_view, guide_src=guide_src,
@@ -3144,6 +3147,9 @@ def show_annotation_interface():
                         ):
                             if k in st.session_state:
                                 del st.session_state[k]
+
+                        # 3) empêcher tout fallback VLM automatique au rerun suivant
+                        st.session_state[f"skip_auto_vlm_once_{i}"] = True
 
 
                         photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
