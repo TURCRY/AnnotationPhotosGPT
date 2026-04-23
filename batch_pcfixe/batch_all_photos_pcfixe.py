@@ -26,7 +26,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import sys
 import uuid, threading
 import requests
-from openai import OpenAI
 sys.path.insert(0, str(Path(__file__).parent))
 from local_llm_client import LocalLLMClient
 import logging
@@ -49,6 +48,8 @@ _handler = RotatingFileHandler(
 _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 log.addHandler(_handler)
 log.propagate = False
+
+BATCH_ENV_PATH = Path(__file__).with_name("batch.env")
 
 
 
@@ -97,6 +98,39 @@ HEADER_BATCH = [
   "sujets_justif",
 ]
 
+RESET_VLM_PLUS_FIELDS = [
+  "description_vlm_batch",
+  "vlm_status",
+  "vlm_err",
+  "vlm_batch_id",
+  "vlm_batch_ts",
+  "batch_status",
+  "batch_id",
+  "batch_ts",
+  "libelle_propose_batch",
+  "commentaire_propose_batch",
+  "llm_err_lib",
+  "llm_err_com",
+  "llm_http_status_lib",
+  "llm_http_status_com",
+  "llm_trace_lib",
+  "llm_trace_com",
+]
+
+RESET_LLM_FIELDS = [
+  "libelle_propose_batch",
+  "commentaire_propose_batch",
+  "llm_err_lib",
+  "llm_err_com",
+  "llm_http_status_lib",
+  "llm_http_status_com",
+  "llm_trace_lib",
+  "llm_trace_com",
+  "batch_status",
+  "batch_id",
+  "batch_ts",
+]
+
 _last_call_ts = 0.0
 
 def throttle(min_interval_s: float):
@@ -125,6 +159,83 @@ def vlm_limits(night: bool) -> tuple[int, int, int]:
 
 def now_ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def parse_ts_or_none(raw: Any) -> datetime | None:
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            pass
+    return None
+
+def is_weak_libelle(text: str) -> bool:
+    s = " ".join(str(text or "").strip().lower().split())
+    if len(s) < 8:
+        return True
+    weak_patterns = [
+        "vue generale",
+        "vue générale",
+        "element non precise",
+        "élément non précisé",
+        "ensemble non precise",
+        "ensemble non précisé",
+        "vue d'ensemble",
+        "vue d’ensemble",
+        "photo non exploitable",
+        "element non identifié",
+        "élément non identifié",
+    ]
+    return any(pattern in s for pattern in weak_patterns)
+
+def weak_libelle_reason(text: str) -> str | None:
+    s = " ".join(str(text or "").strip().lower().split())
+    if len(s) < 8:
+        return "too_short"
+    if is_weak_libelle(text):
+        return "boilerplate"
+    return None
+
+def weak_commentaire_reason(text: str, desc_vlm: str = "") -> str | None:
+    s = " ".join(str(text or "").strip().lower().split())
+    d = " ".join(str(desc_vlm or "").strip().lower().split())
+
+    if len(s) < 24:
+        return "too_short"
+
+    weak_patterns = [
+        "photo non exploitable",
+        "aucun element precis",
+        "aucun élément précis",
+        "pas d'information exploitable",
+        "commentaire non precise",
+        "commentaire non précisé",
+        "vue generale",
+        "vue générale",
+        "element non precise",
+        "élément non précisé",
+    ]
+    if any(pattern in s for pattern in weak_patterns):
+        return "boilerplate"
+
+    sentences = [re.sub(r"\s+", " ", part).strip() for part in re.split(r"[.!?]+", s) if part.strip()]
+    if len(sentences) >= 2 and len(set(sentences)) < len(sentences):
+        return "repetition"
+
+    if d and (s == d or (s in d or d in s) and abs(len(s) - len(d)) <= 20):
+        return "no_contextual_added_value"
+
+    return None
+
+def is_weak_commentaire(text: str, desc_vlm: str = "") -> bool:
+    return weak_commentaire_reason(text, desc_vlm) is not None
+
+def append_trace(prev: Any, msg: str, max_len: int = 1200) -> str:
+    base = str(prev or "").strip()
+    out = f"{base}\n{msg}" if base else msg
+    return out[-max_len:]
 
 def die(code: int, msg: str) -> int:
     print(msg, file=sys.stderr)
@@ -203,10 +314,98 @@ def load_or_init_batch(path: Path) -> list[dict]:
             r.setdefault(c, "")
     return br
 
+
+def reset_fields_in_row(row: Dict[str, Any], fields: List[str], *, presets: Optional[Dict[str, Any]] = None) -> None:
+    for field in fields:
+        row[field] = ""
+    if presets:
+        for key, value in presets.items():
+            row[key] = value
+
 def write_json(path: Path, data: Dict[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+def _read_env_value_from_file(path: Path, key: str) -> str:
+    if not path.exists():
+        return ""
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            if k.strip() != key:
+                continue
+            return v.strip().strip('"').strip("'")
+    except Exception:
+        return ""
+    return ""
+
+
+def resolve_openai_api_key() -> str:
+    existing = str(os.getenv("OPENAI_API_KEY", "") or "").strip()
+    if existing:
+        return existing
+
+    if not BATCH_ENV_PATH.exists():
+        return ""
+
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except Exception:
+        load_dotenv = None
+
+    if load_dotenv is not None:
+        try:
+            load_dotenv(BATCH_ENV_PATH, override=False)
+        except Exception:
+            pass
+        existing = str(os.getenv("OPENAI_API_KEY", "") or "").strip()
+        if existing:
+            return existing
+
+    return _read_env_value_from_file(BATCH_ENV_PATH, "OPENAI_API_KEY")
+
+
+def _is_placeholder_secret(value: str) -> bool:
+    s = str(value or "").strip()
+    if not s:
+        return True
+    return "PLACEHOLDER" in s.upper()
+
+
+def resolve_local_llm_api_key(config_value: str = "") -> str:
+    existing = str(os.getenv("LOCAL_LLM_API_KEY", "") or "").strip()
+    if existing:
+        return existing
+
+    if BATCH_ENV_PATH.exists():
+        try:
+            from dotenv import load_dotenv  # type: ignore
+        except Exception:
+            load_dotenv = None
+
+        if load_dotenv is not None:
+            try:
+                load_dotenv(BATCH_ENV_PATH, override=False)
+            except Exception:
+                pass
+            existing = str(os.getenv("LOCAL_LLM_API_KEY", "") or "").strip()
+            if existing:
+                return existing
+
+        existing = _read_env_value_from_file(BATCH_ENV_PATH, "LOCAL_LLM_API_KEY")
+        if existing:
+            return existing
+
+    config_value = str(config_value or "").strip()
+    if not _is_placeholder_secret(config_value):
+        return config_value
+
+    return ""
 
 def _set_llm_err(b: dict, which: str, e: Exception, resp_text: str | None = None, http_status: int | None = None):
     key = (which or "").strip().lower()
@@ -320,8 +519,10 @@ def generate_with_retry(
                 if llm_backend == "openai":
                     if not openai_api_key:
                         raise RuntimeError("OPENAI_API_KEY_MISSING")
-                    oa_client = OpenAI(api_key=openai_api_key)
-                    response = oa_client.chat.completions.create(
+                    if client is None:
+                        from openai import OpenAI
+                        client = OpenAI(api_key=openai_api_key)
+                    response = client.chat.completions.create(
                         model=model or "gpt-4o-mini",
                         temperature=float(temperature),
                         max_tokens=int(max_tokens),
@@ -403,6 +604,14 @@ def generate_with_retry(
                 sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0.0, 0.25)
                 time.sleep(sleep_s)
                 continue
+            except Exception as e:
+                last_exc = e
+                _set_llm_err(b, which, e)
+                if attempt == max_attempts:
+                    raise
+                sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0.0, 0.25)
+                time.sleep(sleep_s)
+                continue
 
     raise last_exc or RuntimeError("generate_with_retry: failed without exception")
 
@@ -445,70 +654,25 @@ def ensure_columns(rows: List[Dict[str, Any]], required: Dict[str, Any]) -> List
     return base
 
 
+def reset_vlm_plus_rows(rows: List[Dict[str, Any]]) -> int:
+    touched = 0
+    for row in rows:
+        changed = False
+        for field in RESET_VLM_PLUS_FIELDS:
+            if row.get(field, "") != "":
+                changed = True
+            row[field] = ""
+        if changed:
+            touched += 1
+    return touched
+
+
 
 def apply_template(s: str, mapping: Dict[str, str]) -> str:
     out = s or ""
     for k, v in mapping.items():
         out = out.replace("{{" + k + "}}", v or "")
     return out
-
-
-GENERIC_LABEL_PATTERNS = (
-    r"^vue générale\b",
-    r"^vue d[' ]ensemble\b",
-    r"^vue globale\b",
-)
-
-BOILERPLATE_LABEL_PATTERNS = (
-    r"^(vérifie|verifie|répare|repare|réparation terminée|reparation terminee|contrôle|controle|observe|remplace|redémarre|redemarre)\b",
-    r"\b(connexion internet|redémarre appareil|redemarre appareil|s'il te plaît|svp|veuillez|merci)\b",
-    r"\bassistant\b",
-)
-
-
-def is_label_generic_or_invalid(label: str) -> bool:
-    txt = (label or "").strip()
-    if not txt:
-        return True
-    low = txt.lower()
-    if any(re.search(p, low) for p in GENERIC_LABEL_PATTERNS):
-        return True
-    if any(re.search(p, low) for p in BOILERPLATE_LABEL_PATTERNS):
-        return True
-    return False
-
-
-def build_libelle_retry_prompt(commentaire: str, description_vlm: str) -> str:
-    commentaire = (commentaire or "").strip()
-    description_vlm = (description_vlm or "").strip()
-    return (
-        "Tu dois produire uniquement un libelle photo.\n"
-        "Contraintes obligatoires :\n"
-        "- une seule ligne ;\n"
-        "- formulation courte, descriptive et nominale ;\n"
-        "- pas d'impératif, pas de consigne, pas de formulation assistant ;\n"
-        "- pas de 'vue générale', pas d'élément non précisé, pas de commentaire complet ;\n"
-        "- s'ancrer d'abord sur le commentaire ci-dessous, puis sur la description visuelle si utile.\n\n"
-        "Commentaire :\n"
-        f"{commentaire}\n\n"
-        "Description visuelle :\n"
-        f"{description_vlm}\n\n"
-        "Réponds uniquement par le libelle."
-    )
-
-
-def extract_vlm_prompt_fields(ctx_general: Dict[str, Any]) -> tuple[str, str]:
-    """
-    PASS 1 VLM:
-    - utilise les champs dédiés `vlm_system` / `vlm_user` si présents ;
-    - reste rétrocompatible avec les anciens JSON en renvoyant des chaînes vides.
-    PASS 2 LLM continue d'utiliser `system` / `user` via les prompts batch/UI.
-    """
-    if not isinstance(ctx_general, dict):
-        return "", ""
-    vlm_system = str(ctx_general.get("vlm_system") or "").strip()
-    vlm_user = str(ctx_general.get("vlm_user") or "").strip()
-    return vlm_system, vlm_user
 
 
 def compute_pcfixe_dirs_from_photo_rel(photo_rel_native: str, pc_root_affaires: str, id_affaire: str) -> tuple[str, str]:
@@ -559,6 +723,148 @@ def extract_transcript_window(trs, center, before, after, max_chars=2000) -> str
 # -------------------------
 # VLM batch
 # -------------------------
+
+_VLM_CHECK_TERMS = [
+    "fissure", "fissures", "microfissure", "micro-fissure",
+    "cloque", "cloques", "boursouflure", "boursouflures",
+    "déformation", "déformations", "voilement", "affaissement",
+    "décollement", "gondolement", "gonflement",
+    "humidité", "moisi", "mousse", "infiltration", "fuite", "gouttes",
+]
+
+VLM_BATCH_PROMPT = (
+    "Décris l’image de façon factuelle, en français.\n"
+    "Contraintes générales :\n"
+    "- Décrire uniquement ce qui est visible. Ne rien inventer.\n"
+    "- Si une information est incertaine, l’indiquer explicitement : (certain / probable / incertain).\n"
+    "- Ne pas conclure sur un matériau si l’indice visuel n’est pas clair.\n"
+    "- Attention particulière aux éléments pertinents pour des constats d’ouvrage : ouvrages, matériaux, assemblages, finitions, désordres apparents, inachèvements.\n"
+    "- Ne pas faire d’un objet parasite visible mais hors sujet l’élément central de la description.\n"
+    "- Ignorer les personnes, vêtements, meubles, décoration, électroménager, objets personnels, jouets, sauf si leur présence est indispensable pour qualifier l’échelle.\n"
+    "- Attention particulière aux conduites/tuyaux/gouttières : segments, coudes, raccords, colliers, changements d’aspect.\n"
+    "\n"
+    "RÈGLE D’ÉCHELLE (OBLIGATOIRE) :\n"
+    "- Pour tout objet pouvant être confondu avec un objet réel (ex : véhicule, engin, outil, figurine, jouet, maquette),\n"
+    "  tu DOIS qualifier l’échelle avec l’un des mots exacts suivants :\n"
+    "  « jouet », « miniature », « maquette », « figurine », « réel », « échelle incertaine ».\n"
+    "- Interdiction d’utiliser un mot ambigu sans qualificatif lorsque l’échelle n’est pas certaine.\n"
+    "\n"
+    "Sortie attendue :\n"
+    "A) Description factuelle (6 à 10 phrases courtes)\n"
+    "B) Vérifications guidées (si un contexte est fourni) :\n"
+    "   - Lister les éléments mentionnés et donner un statut : [VISIBLE]/[PROBABLE]/[NON VISIBLE]/[INCERTAIN]\n"
+    "   - Si [VISIBLE] ou [PROBABLE] : donner 1–2 indices visuels.\n"
+)
+
+RERUN_WEAK_LIB = """CORRECTION CIBLEE - LIBELLE
+
+Le precedent libelle etait juge trop faible ou trop generique.
+
+Consignes renforcees :
+- Produire un libelle de photo factuel, concret, precis.
+- Une seule ligne.
+- Viser 5 a 12 mots.
+- Decrire l'element principal reellement visible sur la photo.
+- Privilegier un nom d'ouvrage, de materiau, de desordre apparent ou d'assemblage visible.
+- Eviter absolument les formulations vagues ou passe-partout :
+  « vue generale », « element non precise », « photo non exploitable », « ensemble », « detail », ou toute formule equivalente.
+- Ne pas faire de commentaire general.
+- Ne pas expliquer.
+- Ne pas conclure.
+- Ne pas employer de formulation de support, de procedure ou de meta-discours.
+- Si une dictee ou transcription existe, l'utiliser seulement pour mieux cibler l'objet visible, sans inventer ce qui n'apparait pas sur l'image.
+
+Attendu :
+- un libelle court, specifique, exploitable tel quel dans un tableau d'expertise photo.
+"""
+
+RERUN_WEAK_COM = """CORRECTION CIBLEE - COMMENTAIRE
+
+Le precedent commentaire etait juge trop faible, trop generique, ou trop proche de la simple description visuelle.
+
+Consignes renforcees :
+- Produire un commentaire utile, factuel et exploitable.
+- Rester concis.
+- Eviter toute redite quasi brute de la description visuelle.
+- Apporter une vraie valeur contextuelle a partir de la transcription ou de la dictee si elle existe.
+- Ne pas inventer.
+- Ne pas conclure.
+- Ne pas employer de langage normatif, juridique, causal ou speculatif.
+- Eviter absolument les formulations vagues ou passe-partout :
+  « photo non exploitable », « aucun element precis », « vue generale », « commentaire non precise », ou toute formule equivalente.
+- Faire apparaitre clairement :
+  1. ce qui est visible sur la photo ;
+  2. ce qui est indique par la transcription ou la dictee ;
+  3. sans confondre les deux sources.
+
+Attendu :
+- un commentaire plus precis, mieux ancre, et distinct de la seule description VLM.
+"""
+
+
+def build_vlm_context(ctx_general: dict) -> str:
+    mission = (ctx_general.get("mission") or "").strip()
+    vlm_system = (ctx_general.get("vlm_system") or "").strip()
+    vlm_user = (ctx_general.get("vlm_user") or "").strip()
+    if vlm_system or vlm_user:
+        parts = [
+            "CADRE VISUEL (VLM dédié) :",
+            "- Le contexte texte ne décrit pas l'image : il sert uniquement à guider l'attention.",
+            "- Ne jamais reprendre une donnée textuelle comme élément visible.",
+        ]
+        if vlm_system:
+            parts.append("")
+            parts.append("INSTRUCTIONS SYSTÈME VLM :")
+            parts.append(vlm_system)
+        if vlm_user:
+            parts.append("")
+            parts.append("CONSIGNE UTILISATEUR VLM :")
+            parts.append(vlm_user)
+        return "\n".join(parts).strip()
+
+    mission_label = "expertise bâtiment"
+    if mission:
+        mission_norm = mission.lower()
+        if "expert" in mission_norm or "bât" in mission_norm or "ouvrage" in mission_norm:
+            mission_label = "expertise bâtiment"
+    return (
+        "CADRE VISUEL (filtré pour VLM) :\n"
+        f"- Type de dossier : {mission_label}\n"
+        "- Photo d'expertise bâtiment.\n"
+        "- Le contexte texte ne décrit pas l'image : il sert uniquement à guider l'attention.\n"
+        "- Ne jamais reprendre une donnée textuelle comme élément visible.\n\n"
+        "INSTRUCTIONS VISION (obligatoires) :\n"
+        "1) Décrire UNIQUEMENT ce qui est visible et pertinent pour des constats d'ouvrage.\n"
+        "2) Priorité : ouvrages, matériaux, assemblages, finitions, désordres apparents, inachèvements.\n"
+        "3) Ignorer : personnes, vêtements, meubles, décoration, électroménager, objets personnels, jouets.\n"
+        "4) Ne pas inférer (pas de cause, pas de conformité, pas d'explication).\n"
+        "5) Si un élément hors sujet apparaît : ne pas en faire l'élément central de la description.\n"
+        "6) Exclure toute adresse, état d'avancement, historique procédural ou documentaire du visible décrit.\n"
+    )
+
+
+def extract_vlm_checklist(transcription: str) -> list[str]:
+    t = (transcription or "").lower()
+    hits = []
+    for w in _VLM_CHECK_TERMS:
+        if re.search(rf"\b{w}\b", t):
+            hits.append(w)
+    return sorted(set(hits))[:12]
+
+
+def build_vlm_specific_context(transcription_extrait: str) -> str:
+    transcription_extrait = (transcription_extrait or "").strip()
+    parts = []
+    if transcription_extrait:
+        parts.append("TRANSCRIPTION (extrait) :\n" + transcription_extrait)
+    items = extract_vlm_checklist(transcription_extrait)
+    if items:
+        parts.append(
+            "VÉRIFICATIONS GUIDÉES (à contrôler sur l’image — ne pas en déduire que c’est présent) :\n"
+            + "\n".join([f"- {it}" for it in items])
+        )
+    return "\n\n".join(parts).strip()
+
 
 def post_vision_describe_batch(base_url, api_key, images, *, mode="quality", timeout, context_global="", prompt=""):
     url = base_url.rstrip("/") + "/vision/describe_batch"
@@ -682,9 +988,9 @@ def flush_vlm_batch(batch, *, batch_index, base_url, api_key, mode, current_batc
             base_url, api_key,
             [(p, c) for (_, p, c) in batch],
             mode=mode,
-            timeout=timeout,
             context_global=context_global,
             prompt=prompt,
+            timeout=timeout,
         )
         if not isinstance(results, list) or len(results) != len(batch):
             for (photo_key, _, _) in batch:
@@ -693,6 +999,21 @@ def flush_vlm_batch(batch, *, batch_index, base_url, api_key, mode, current_batc
             return 0, len(batch)
 
     except Exception as e:
+        resp = getattr(e, "response", None)
+        status = getattr(resp, "status_code", None)
+        body_prefix = ""
+        try:
+            if resp is not None and getattr(resp, "text", None):
+                body_prefix = str(resp.text)[:500]
+        except Exception:
+            body_prefix = ""
+        log.error(
+            "flush_vlm_batch exception class=%s message=%s status_http=%s body_prefix=%r",
+            type(e).__name__,
+            str(e),
+            status,
+            body_prefix,
+        )
         for (photo_key, _, _) in batch:
             b = get_batch_row(batch_index, photo_key)
             mark_vlm_err_batch(b, "ERR_VLM_BATCH", batch_id=current_batch_id)
@@ -1038,12 +1359,28 @@ def main() -> int:
     ap.add_argument("--night", type=int, default=0)
     ap.add_argument("--vlm-strict", type=int, default=0)  # 1 => 1 image par flush
     ap.add_argument("--reset-vlm", type=int, default=0)  # 1 => relance VLM même si ERR/SKIP
+    ap.add_argument("--reset-llm", type=int, default=0)  # 1 => relance PASS 2 sans effacer le VLM
+    ap.add_argument("--reset-vlm-plus", type=int, default=0)  # 1 => remise à blanc ciblée des sorties VLM/LLM
+    ap.add_argument("--only-new-dictee", type=int, default=0)
+    ap.add_argument("--rerun-weak", type=int, default=0)
+    ap.add_argument("--rerun-weak-backend", default="same")
 
 
     args = ap.parse_args()
     reset_vlm = bool(args.reset_vlm)
+    reset_llm = bool(args.reset_llm)
+    reset_vlm_plus = bool(args.reset_vlm_plus)
     print(f"[DEBUG] reset_vlm={bool(args.reset_vlm)}")
+    print(f"[DEBUG] reset_llm={bool(args.reset_llm)}")
+    print(f"[DEBUG] reset_vlm_plus={bool(args.reset_vlm_plus)}")
+    if sum(1 for x in (reset_vlm, reset_llm, reset_vlm_plus) if x) > 1:
+        return die(2, "Options incompatibles : utiliser un seul reset parmi --reset-vlm / --reset-llm / --reset-vlm-plus")
     is_dry = bool(args.dry_run)
+    only_new_dictee = bool(args.only_new_dictee)
+    rerun_weak = bool(args.rerun_weak)
+    rerun_weak_backend = str(args.rerun_weak_backend or "same").strip().lower()
+    if rerun_weak_backend not in ("same", "local", "remote", "openai"):
+        return die(2, "Option invalide pour --rerun-weak-backend : same / local / remote")
     print(f"[DEBUG] is_dry={is_dry} args.dry_run={args.dry_run} args.limit={args.limit}")
     vlm_strict = bool(args.vlm_strict)
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1122,6 +1459,11 @@ def main() -> int:
     photos_csv = Path(pc["fichier_photos"])
     batch_path_str = str(pc.get("fichier_photos_batch") or "").strip()
     photos_batch_csv = Path(batch_path_str) if batch_path_str else photos_csv.with_name(photos_csv.stem + "_batch.csv")
+    log.info("Preflight paths photos_csv=%s photos_batch_csv=%s", str(photos_csv), str(photos_batch_csv))
+    print(f"[PREFLIGHT] photos_csv={photos_csv}")
+    print(f"[PREFLIGHT] photos_batch_csv={photos_batch_csv}")
+    if not photos_csv.exists():
+        raise FileNotFoundError(f"photos.csv PC fixe introuvable: {photos_csv}")
     batch_rows = load_or_init_batch(photos_batch_csv)
     batch_index = {r["photo_rel_native"]: r for r in batch_rows if r.get("photo_rel_native")}
 
@@ -1129,8 +1471,24 @@ def main() -> int:
     trans_csv  = Path(pc["fichier_transcription"])
     ctx_path   = Path(pc["fichier_contexte_general"])
     cfg_llm    = read_json(Path(pc["config_llm"]))
-    ctx_general = read_json(ctx_path)
-    vlm_context_global, vlm_prompt = extract_vlm_prompt_fields(ctx_general)
+    ctx_general_vlm = {
+        "mission": str(infos.get("mission") or "").strip(),
+        "system": str(infos.get("system") or "").strip(),
+        "user": str(infos.get("user") or "").strip(),
+        "vlm_system": str(infos.get("vlm_system") or "").strip(),
+        "vlm_user": str(infos.get("vlm_user") or "").strip(),
+    }
+    if ctx_path.exists():
+        try:
+            ctx_data_vlm = read_json(ctx_path)
+            ctx_general_vlm["mission"] = str(ctx_data_vlm.get("mission") or ctx_general_vlm["mission"]).strip()
+            ctx_general_vlm["system"] = str(ctx_data_vlm.get("system") or ctx_general_vlm["system"]).strip()
+            ctx_general_vlm["user"] = str(ctx_data_vlm.get("user") or ctx_general_vlm["user"]).strip()
+            ctx_general_vlm["vlm_system"] = str(ctx_data_vlm.get("vlm_system") or ctx_general_vlm["vlm_system"]).strip()
+            ctx_general_vlm["vlm_user"] = str(ctx_data_vlm.get("vlm_user") or ctx_general_vlm["vlm_user"]).strip()
+        except Exception:
+            pass
+    vlm_context_global = build_vlm_context(ctx_general_vlm)
 
     vlm_log_path = photos_csv.with_suffix(f".vlm_{run_id}.jsonl")
     def log_vlm_event(event: dict):
@@ -1143,6 +1501,10 @@ def main() -> int:
 
     with photos_csv.open("r", encoding="utf-8-sig", newline="") as f:
         rows_ui = list(csv.DictReader(f, delimiter=";"))
+    log.info("CSV runtime photos_csv=%s rows_ui=%d", str(photos_csv), len(rows_ui))
+    print(f"[CSV] photos_csv={photos_csv} rows={len(rows_ui)}")
+    if not rows_ui:
+        raise RuntimeError(f"photos.csv PC fixe vide ou sans lignes exploitables: {photos_csv}")
     for i, row in enumerate(rows_ui):
         row["idx"] = i
 
@@ -1157,10 +1519,42 @@ def main() -> int:
     if photos_batch_csv.exists():
         with photos_batch_csv.open("r", encoding="utf-8-sig", newline="") as f:
             batch_rows = list(csv.DictReader(f, delimiter=";"))
+    log.info("CSV runtime photos_batch_csv=%s exists=%s batch_rows=%d", str(photos_batch_csv), photos_batch_csv.exists(), len(batch_rows))
+    print(f"[CSV] photos_batch_csv={photos_batch_csv} exists={photos_batch_csv.exists()} rows={len(batch_rows)}")
+    ui_keys = {
+        (r.get("photo_rel_native") or "").strip()
+        for r in rows_ui
+        if (r.get("photo_rel_native") or "").strip()
+    }
+    batch_keys = {
+        (r.get("photo_rel_native") or "").strip()
+        for r in batch_rows
+        if (r.get("photo_rel_native") or "").strip()
+    }
+    common_keys = ui_keys & batch_keys
+    batch_keys_missing_in_ui = batch_keys - ui_keys
+    log.info(
+        "Preflight coherence nb_rows_ui=%d nb_rows_batch=%d common_photo_rel_native=%d batch_keys_missing_in_ui=%d",
+        len(rows_ui),
+        len(batch_rows),
+        len(common_keys),
+        len(batch_keys_missing_in_ui),
+    )
+    print(
+        f"[PREFLIGHT] nb_rows_ui={len(rows_ui)} nb_rows_batch={len(batch_rows)} "
+        f"common_photo_rel_native={len(common_keys)} batch_keys_missing_in_ui={len(batch_keys_missing_in_ui)}"
+    )
 
     # Garantir le schéma batch (HEADER_BATCH)
     BATCH_DEFAULTS = {c: "" for c in HEADER_BATCH}
     batch_fieldnames = ensure_columns(batch_rows, BATCH_DEFAULTS)
+
+    if reset_vlm_plus:
+        touched = reset_vlm_plus_rows(batch_rows)
+        atomic_write_csv(photos_batch_csv, batch_rows, HEADER_BATCH)
+        log.info("Reset VLM+ applied path=%s rows=%d touched=%d", str(photos_batch_csv), len(batch_rows), touched)
+        print(f"[RESET_VLM_PLUS] path={photos_batch_csv} rows={len(batch_rows)} touched={touched}")
+        return 0
 
     # Index par clé
     batch_index = {}
@@ -1173,17 +1567,32 @@ def main() -> int:
 
 
     n_ok = 0
+    n_weak = 0
+    n_weak_com = 0
     n_err = 0
     n_skip = 0
     n_done = 0  # nombre de lignes effectivement traitées (OK/ERR/SKIP)
+    n_rerun_weak = 0
+    n_rerun_weak_ok = 0
+    n_rerun_weak_still = 0
 
 
     llm_backend = str(cfg_llm.get("llm_backend", "local") or "local").strip().lower()
     local_cfg = cfg_llm.get("local_llm", {}) or {}
-    base_url = local_cfg.get("base_url", "")
-    api_key  = local_cfg.get("api_key", "")
-    local_model = local_cfg.get("model", "")
-    openai_api_key = os.getenv("OPENAI_API_KEY", "") or str(cfg_llm.get("openai_api_key", "") or "").strip()
+    base_url = str(local_cfg.get("base_url", "") or "").strip()
+    api_key  = str(local_cfg.get("api_key", "") or "").strip()
+    local_model = str(local_cfg.get("model", "") or "").strip()
+    openai_api_key = resolve_openai_api_key()
+    local_llm_api_key = resolve_local_llm_api_key(api_key)
+    if rerun_weak:
+        if rerun_weak_backend in ("remote", "openai"):
+            llm_backend = "openai"
+        elif rerun_weak_backend == "local":
+            llm_backend = "local"
+    if llm_backend not in ("local", "openai"):
+        raise RuntimeError(f"llm_backend non supporté: {llm_backend}")
+    if llm_backend == "openai" and not openai_api_key:
+        raise RuntimeError(f"OPENAI_API_KEY introuvable (env ou {BATCH_ENV_PATH})")
 
     batch_cfg = cfg_llm.get("batch", {})
     mt = (batch_cfg.get("max_tokens") or {})
@@ -1247,6 +1656,10 @@ def main() -> int:
 
 
     selected_idx: list[int] = []
+    reject_counts: dict[str, int] = {}
+
+    def reject(reason: str):
+        reject_counts[reason] = reject_counts.get(reason, 0) + 1
 
     def ui_row(i: int) -> dict:
         return rows_ui[i]
@@ -1261,20 +1674,49 @@ def main() -> int:
         if args.limit and len(selected_idx) >= args.limit:
             break
         if norm_bool(row.get("annotation_validee")):
+            reject("annotation_validee")
             continue
         if safe_float(row.get("t_audio")) is None:
+            reject("t_audio_absent")
             continue
 
         photo_key = (row.get("photo_rel_native") or "").strip()
+        if not photo_key:
+            reject("photo_rel_native_absent")
+            continue
         b = get_batch_row(batch_index, photo_key)
+
+        if only_new_dictee:
+            dictee_status = (row.get("dictee_asr_status") or "").strip().upper()
+            dictee_text = (row.get("dictee_asr_text") or "").strip()
+            dictee_ts = parse_ts_or_none(row.get("dictee_asr_ts"))
+            last_batch_ts = parse_ts_or_none(b.get("batch_ts"))
+
+            if dictee_status != "OK":
+                reject("dictee_status_not_ok")
+                continue
+            if not dictee_text:
+                reject("dictee_text_empty")
+                continue
+            if dictee_ts is None:
+                reject("dictee_ts_absent_or_invalid")
+                continue
+            if last_batch_ts is not None and not (dictee_ts > last_batch_ts):
+                reject("dictee_not_newer_than_batch")
+                continue
 
         # disponibilité PC fixe : champ batch
         if not norm_bool(b.get("photo_disponible_pcfixe")):
+            reject("photo_disponible_pcfixe_false")
             continue
 
         # statut VLM/batch : champs batch
         bs_u = (b.get("batch_status") or "").strip().upper()
         vs   = (b.get("vlm_status") or "").strip().upper()
+        if rerun_weak:
+            if bs_u not in ("WEAK_LIB", "OK_LIB_COM_WEAK"):
+                reject("rerun_weak_not_target")
+                continue
 
         if bs_u.startswith("ERR_VLM") or bs_u == "SKIP_VLM_EN_ERREUR":
             b["batch_status"] = ""
@@ -1291,12 +1733,17 @@ def main() -> int:
         }
         img = resolve_img_path(resolver_row)
         if img is None:
+            reject("image_introuvable_apres_resolution")
             continue
 
         selected_idx.append(i)
         print(f"[DBG] idx={i} img=OK vlm_status=[{b.get('vlm_status')}] batch_status=[{b.get('batch_status')}]")
 
 
+    log.info("Selection diagnostics total_ui=%d selected=%d reject_counts=%s", len(rows_ui), len(selected_idx), reject_counts)
+    print(f"[SELECT] total_ui={len(rows_ui)} selected={len(selected_idx)} reject_counts={reject_counts}")
+    if rerun_weak and not selected_idx:
+        print("[SELECT] rerun_weak: aucune ligne WEAK a retraiter")
     print(f"[LIMIT] sélection={len(selected_idx)} / limit={args.limit or 0} indices={selected_idx}")
 
     if reset_vlm:
@@ -1312,6 +1759,13 @@ def main() -> int:
             b["vlm_batch_id"] = ""
             b["vlm_err"] = ""
             b["description_vlm_batch"] = ""
+    elif reset_llm:
+        for i in selected_idx:
+            row_ui = rows_ui[i]
+            photo_key = (row_ui.get("photo_rel_native") or "").strip()
+            b = get_batch_row(batch_index, photo_key)
+
+            reset_fields_in_row(b, RESET_LLM_FIELDS)
 
 
 
@@ -1320,6 +1774,8 @@ def main() -> int:
     # -------------------------
 
     max_total, max_file, max_files = vlm_limits(bool(args.night))
+    # RTX 3060 12 Go: stabilité prioritaire, 1 photo par appel VLM.
+    max_files = 1
     vlm_mode = "quality"
     vlm_fail_streak = 0
 
@@ -1420,7 +1876,8 @@ def main() -> int:
                 b["batch_ts"] = now_ts()
                 continue
 
-            ctx = "TRANSCRIPTION (extrait) :\n" + extract_transcript_window(trs, t, com_before, com_after, max_chars=1200)
+            transcript_excerpt = extract_transcript_window(trs, t, com_before, com_after, max_chars=1200)
+            ctx = build_vlm_specific_context(transcript_excerpt)
 
             should_flush = (size_sum + s > max_total) or (len(batch) >= max_files) or vlm_strict
             if should_flush and batch:
@@ -1431,11 +1888,11 @@ def main() -> int:
                     batch,                       # <-- plus de "rows"
                     batch_index=batch_index,
                     base_url=base_url,
-                    api_key=api_key,
+                    api_key=local_llm_api_key,
                     mode=vlm_mode,
                     current_batch_id=current_batch_id,
                     context_global=vlm_context_global,
-                    prompt=vlm_prompt,
+                    prompt=VLM_BATCH_PROMPT,
                 )
 
                 vlm_fail_streak = 0 if ok > 0 else (vlm_fail_streak + 1)
@@ -1454,11 +1911,11 @@ def main() -> int:
                 batch,
                 batch_index=batch_index,
                 base_url=base_url,
-                api_key=api_key,
+                api_key=local_llm_api_key,
                 mode=vlm_mode,
                 current_batch_id=current_batch_id,
                 context_global=vlm_context_global,
-                prompt=vlm_prompt,
+                prompt=VLM_BATCH_PROMPT,
             )
             vlm_fail_streak = 0 if ok > 0 else (vlm_fail_streak + 1)
             vlm_backoff_sleep(vlm_fail_streak)
@@ -1489,7 +1946,7 @@ def main() -> int:
 
     # Passe 1 terminée -> purge VLM avant passe 2 (LLM texte /annoter)
 
-    ok_purge = purge_vlm(base_url, api_key, timeout=30, wait_step=1.0)
+    ok_purge = purge_vlm(base_url, local_llm_api_key, timeout=30, wait_step=1.0)
     if not ok_purge:
         raise RuntimeError("Purge VLM impossible (VLM busy trop longtemps ou erreur serveur).")
 
@@ -1501,6 +1958,7 @@ def main() -> int:
 
 
     # 0) contexte/mission (inchangé)
+    ctx_general = read_json(ctx_path)
     contexte_general_str = json.dumps(ctx_general, ensure_ascii=False, indent=2)
     mission = str(infos.get("mission") or ctx_general.get("mission") or "")
 
@@ -1524,13 +1982,17 @@ def main() -> int:
     timeout_s = max(timeout_s, 600.0)  # test “sécurisé”
 
     client = None
-    model = str(cfg_llm.get("model", "gpt-4o-mini") or "gpt-4o-mini") if llm_backend == "openai" else local_model
+    model = str(cfg_llm.get("model", "gpt-4o-mini") or "gpt-4o-mini").strip() if llm_backend == "openai" else local_model
     if llm_backend == "local":
-        client = LocalLLMClient(base_url=base_url, api_key=api_key, timeout=timeout_s)
+        client = LocalLLMClient(base_url=base_url, api_key=local_llm_api_key, timeout=timeout_s)
         print(f"[BATCH] client.timeout={timeout_s}s")
-        log.info("LLM backend=local model=%s base_url=%s", model, base_url)
+        log.info("LLM runtime backend=local model=%s base_url=%s", model, base_url)
     else:
-        log.info("LLM backend=openai model=%s", model)
+        log.info("LLM runtime backend=openai model=%s", model)
+    print(f"[BATCH] LLM runtime backend={llm_backend} model={model}" + (f" base_url={base_url}" if llm_backend == "local" else ""))
+    if rerun_weak:
+        print(f"[BATCH] rerun_weak=1 backend={llm_backend}")
+        log.info("WEAK rerun mode enabled backend=%s requested=%s", llm_backend, rerun_weak_backend)
 
     
     def build_prompt_with_desc_compat(user_template: str, final_prompt: str, desc_vlm: str) -> str:
@@ -1576,12 +2038,22 @@ def main() -> int:
 
         # MODE RÉEL
         bs = (b.get("batch_status") or "").upper().strip()
-        if bs.startswith("OK") and (b.get("libelle_propose_batch") or "").strip():
+        lib_existing = (b.get("libelle_propose_batch") or "").strip()
+        libelle_weak_existing = bool(lib_existing) and is_weak_libelle(lib_existing)
+        commentaire_weak = (bs == "OK_LIB_COM_WEAK")
+        weak_target = (bs == "WEAK_LIB") or commentaire_weak
+        if rerun_weak and not weak_target:
+            continue
+        rerun_lib = bool(rerun_weak and bs == "WEAK_LIB")
+        rerun_com = bool(rerun_weak and commentaire_weak)
+        if bs.startswith("OK") and lib_existing:
+            if not commentaire_weak and not libelle_weak_existing:
+                # si vous voulez aussi exiger commentaire :
+                # if (b.get("commentaire_propose_batch") or "").strip():
+                continue
             # si vous voulez aussi exiger commentaire :
             # if (b.get("commentaire_propose_batch") or "").strip():
-            continue
-
-
+            pass
 
         if args.limit and done_llm >= args.limit:
             break
@@ -1637,6 +2109,53 @@ def main() -> int:
 
         dictee_ok = (dictee_status == "OK" and bool(dictee_text))
 
+        photo_ref = (
+            (row_ui.get("photo_rel_native") or "").strip()
+            or (row_ui.get("nom_fichier_image") or "").strip()
+            or (b.get("photo_rel_native") or "").strip()
+            or "UNKNOWN"
+        )
+        if rerun_weak and weak_target:
+            rerun_target = []
+            if rerun_lib:
+                rerun_target.append("lib")
+            if rerun_com:
+                rerun_target.append("com")
+            n_rerun_weak += 1
+            log.info(
+                "[WEAK][RERUN][START] photo=%s target=%s prev_status=%s backend=%s model=%s",
+                photo_ref,
+                "+".join(rerun_target) or "unknown",
+                bs or "EMPTY",
+                llm_backend,
+                model,
+            )
+            if rerun_lib:
+                b["llm_trace_lib"] = append_trace(
+                    b.get("llm_trace_lib"),
+                    f"[rerun_weak start photo={photo_ref} prev_status={bs or 'EMPTY'} backend={llm_backend} model={model}]",
+                )
+            if rerun_com:
+                b["llm_trace_com"] = append_trace(
+                    b.get("llm_trace_com"),
+                    f"[rerun_weak start photo={photo_ref} prev_status={bs or 'EMPTY'} backend={llm_backend} model={model}]",
+                )
+
+        libelle_seed = ""
+        libelle_seed_source = "EMPTY"
+
+        if (trans_lib or "").strip():
+            libelle_seed = trans_lib.strip()
+            libelle_seed_source = "trans_lib"
+        elif dictee_ok and (dictee_text or "").strip():
+            libelle_seed = dictee_text.strip()
+            libelle_seed_source = "dictee_asr"
+        elif (trans_com or "").strip():
+            libelle_seed = trans_com.strip()
+            libelle_seed_source = "trans_com"
+
+        log.info("[LIB][SRC] photo=%s source=%s", photo_ref, libelle_seed_source)
+
 
         # 2) salient_families + points_saillants texte (pour le prompt)
 
@@ -1663,14 +2182,16 @@ def main() -> int:
         else:
             dictee_block = ""   # IMPORTANT : pas de mot "dictée" dans le prompt
 
+        lib_dictee_block = "" if libelle_seed_source == "dictee_asr" else dictee_block
+
         # 3) Prompts
         mapping_lib = {
             "contexte_general": contexte_general_str,
             "mission": mission,
             "description_vlm": description_vlm_batch,      # attention au nom (voir §2)
             "points_saillants": points_saillants_lib,
-            "transcription": trans_lib,
-            "dictee_block": dictee_block,
+            "transcription": libelle_seed,
+            "dictee_block": lib_dictee_block,
         }
 
         mapping_com = {
@@ -1685,6 +2206,8 @@ def main() -> int:
 
         final_lib = apply_template(usr_lib, mapping_lib)
         final_lib = build_prompt_with_desc_compat(usr_lib, final_lib, description_vlm_batch)
+        if rerun_weak and libelle_weak_existing:
+            final_lib += "\n\n" + RERUN_WEAK_LIB
 
         final_com = apply_template(usr_com, mapping_com)
 
@@ -1706,6 +2229,8 @@ def main() -> int:
         # appeler uniquement si le template n'a PAS déjà {{description_vlm_batch}}
         if "{{description_vlm_batch}}" not in (usr_com or ""):
             final_com = build_prompt_with_desc_compat(usr_com, final_com, description_vlm_batch)
+        if rerun_weak and commentaire_weak:
+            final_com += "\n\n" + RERUN_WEAK_COM
 
         # --- LIBELLÉ (obligatoire) ---
         SLEEP_OK  = 0.25   # après succès
@@ -1713,7 +2238,8 @@ def main() -> int:
 
         # --- LIBELLÉ (obligatoire) ---
         lib_ok = False
-        lib_needs_retry = False
+        lib_weak = False
+        lib_weak_reason = None
         try:
             actual_llm_calls += 1
             actual_llm_lib += 1
@@ -1739,14 +2265,30 @@ def main() -> int:
 
             if not lib:
                 raise ValueError("LIB_EMPTY")
+            lib_weak_reason = weak_libelle_reason(lib)
+            if lib_weak_reason:
+                lib_weak = True
+                log.warning("[LIB][WEAK] idx=%s reason=%s photo=%s lib=%r", i, lib_weak_reason, photo_ref, lib)
 
             b["libelle_propose_batch"] = lib
             b["llm_err_lib"] = ""
             b["llm_http_status_lib"] = ""
-            b["llm_trace_lib"] = ""
-            b["batch_status"] = "OK_LIB"
-            lib_ok = True
-            lib_needs_retry = is_label_generic_or_invalid(lib)
+            if rerun_lib:
+                lib_rerun_result = "still_weak" if lib_weak else "recovered"
+                b["llm_trace_lib"] = append_trace(
+                    "",
+                    f"[rerun_weak end photo={photo_ref} result={lib_rerun_result} batch_status={'WEAK_LIB' if lib_weak else 'OK_LIB'}]",
+                )
+                log.info(
+                    "[WEAK][RERUN][LIB][END] photo=%s result=%s batch_status=%s",
+                    photo_ref,
+                    lib_rerun_result,
+                    "WEAK_LIB" if lib_weak else "OK_LIB",
+                )
+            else:
+                b["llm_trace_lib"] = ""
+            b["batch_status"] = "WEAK_LIB" if lib_weak else "OK_LIB"
+            lib_ok = not lib_weak
 
         except Exception as e:
             # generate_with_retry a déjà appelé _set_llm_err dans la plupart des cas
@@ -1759,6 +2301,7 @@ def main() -> int:
 
         # --- COMMENTAIRE (optionnel, non bloquant) ---
         com_ok = False
+        com_weak = False
         if lib_ok:
             try:
                 actual_llm_calls += 1
@@ -1785,65 +2328,30 @@ def main() -> int:
 
                 if not com:
                     raise ValueError("COM_EMPTY")
+                com_weak_reason = weak_commentaire_reason(com, description_vlm_batch)
+                if com_weak_reason:
+                    com_weak = True
+                    log.warning("[COM][WEAK] photo=%s reason=%s com=%r", photo_ref, com_weak_reason, com)
 
                 b["commentaire_propose_batch"] = com
                 b["llm_err_com"] = ""
                 b["llm_http_status_com"] = ""
-                b["llm_trace_com"] = ""
-                b["batch_status"] = "OK_LIB_COM"
+                if rerun_com:
+                    com_rerun_result = "still_weak" if com_weak else "recovered"
+                    b["llm_trace_com"] = append_trace(
+                        "",
+                        f"[rerun_weak end photo={photo_ref} result={com_rerun_result} batch_status={'OK_LIB_COM_WEAK' if com_weak else 'OK_LIB_COM'}]",
+                    )
+                    log.info(
+                        "[WEAK][RERUN][COM][END] photo=%s result=%s batch_status=%s",
+                        photo_ref,
+                        com_rerun_result,
+                        "OK_LIB_COM_WEAK" if com_weak else "OK_LIB_COM",
+                    )
+                else:
+                    b["llm_trace_com"] = ""
+                b["batch_status"] = "OK_LIB_COM_WEAK" if com_weak else "OK_LIB_COM"
                 com_ok = True
-
-                if lib_needs_retry and (b.get("commentaire_propose_batch") or "").strip():
-                    prev_err_lib = b.get("llm_err_lib", "")
-                    prev_http_lib = b.get("llm_http_status_lib", "")
-                    prev_trace_lib = b.get("llm_trace_lib", "")
-                    try:
-                        retry_prompt = build_libelle_retry_prompt(
-                            commentaire=b.get("commentaire_propose_batch", ""),
-                            description_vlm=description_vlm_batch,
-                        )
-                        actual_llm_calls += 1
-                        actual_llm_lib += 1
-                        lib_retry = generate_with_retry(
-                            client,
-                            llm_backend=llm_backend,
-                            prompt=retry_prompt,
-                            system=sys_lib,
-                            model=model,
-                            openai_api_key=openai_api_key,
-                            temperature=temp_lib,
-                            max_tokens=max_tokens_lib,
-                            task="libelle",
-                            expect_json=True,
-                            salient_families=[],
-                            prefer_dictee=False,
-                            b=b,
-                            which="LIB",
-                            max_attempts=1,
-                            base_sleep=0.6,
-                        )
-                        if lib_retry and not is_label_generic_or_invalid(lib_retry):
-                            b["libelle_propose_batch"] = lib_retry
-                            b["llm_err_lib"] = ""
-                            b["llm_http_status_lib"] = ""
-                            b["llm_trace_lib"] = (
-                                (prev_trace_lib + "\n[lib_retry_from_comment=ok]").strip()
-                                if prev_trace_lib else "[lib_retry_from_comment=ok]"
-                            )
-                        else:
-                            b["llm_err_lib"] = prev_err_lib
-                            b["llm_http_status_lib"] = prev_http_lib
-                            b["llm_trace_lib"] = (
-                                (prev_trace_lib + "\n[lib_retry_from_comment=ignored]").strip()
-                                if prev_trace_lib else "[lib_retry_from_comment=ignored]"
-                            )
-                    except Exception:
-                        b["llm_err_lib"] = prev_err_lib
-                        b["llm_http_status_lib"] = prev_http_lib
-                        b["llm_trace_lib"] = (
-                            (prev_trace_lib + "\n[lib_retry_from_comment=failed]").strip()
-                            if prev_trace_lib else "[lib_retry_from_comment=failed]"
-                        )
 
             except Exception as e:
                 # on garde OK_LIB et on marque l’échec commentaire
@@ -1856,15 +2364,32 @@ def main() -> int:
 
         # comptage (une seule fois par ligne)
         b["batch_ts"] = now_ts()
-        if lib_ok:
-            n_ok += 1
+        final_status = (b.get("batch_status") or "").strip().upper()
+        if final_status == "WEAK_LIB":
+            n_weak += 1
+        elif lib_ok:
+            if final_status == "OK_LIB_COM_WEAK":
+                n_weak_com += 1
+            elif final_status.startswith("OK"):
+                n_ok += 1
+            else:
+                n_err += 1
         else:
             n_err += 1
+        if rerun_weak and weak_target:
+            if final_status in ("WEAK_LIB", "OK_LIB_COM_WEAK"):
+                n_rerun_weak_still += 1
+                log.warning("[WEAK][RERUN][FINAL] photo=%s result=still_weak batch_status=%s", photo_ref, final_status)
+            elif final_status.startswith("OK"):
+                n_rerun_weak_ok += 1
+                log.info("[WEAK][RERUN][FINAL] photo=%s result=recovered batch_status=%s", photo_ref, final_status)
         n_done += 1
 
 
     print(f"[RUN] VLM calls={actual_vlm_calls} images={actual_vlm_images} | LLM calls={actual_llm_calls} (lib={actual_llm_lib}, com={actual_llm_com})")
-    print(f"[INFO] total_ui={len(rows_ui)} OK={n_ok} SKIP={n_skip} ERR={n_err} dry_run={is_dry}")
+    print(f"[INFO] total_ui={len(rows_ui)} OK={n_ok} WEAK={n_weak} WEAK_COM={n_weak_com} SKIP={n_skip} ERR={n_err} dry_run={is_dry}")
+    if rerun_weak:
+        print(f"[INFO] rerun_weak={n_rerun_weak} rerun_weak_ok={n_rerun_weak_ok} rerun_weak_still={n_rerun_weak_still}")
 
     # --- DRY-RUN / PREFLIGHT : on affiche et on sort SANS ECRITURE ---
     if is_dry:
@@ -1884,11 +2409,13 @@ def main() -> int:
 
 
     # --- MODE REEL : écriture CSV (batch uniquement) ---
+    batch_write_ok = False
     try:
         if isinstance(batch_index, dict) and batch_index:
             batch_rows = list(batch_index.values())
             atomic_write_csv(photos_batch_csv, batch_rows, HEADER_BATCH)
             log.info("photos_batch.csv écrit: %s (%d lignes)", str(photos_batch_csv), len(batch_rows))
+            batch_write_ok = True
         else:
             log.info("batch_index vide: aucune écriture photos_batch.csv")
     except Exception as e:

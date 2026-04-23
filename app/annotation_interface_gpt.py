@@ -1221,6 +1221,19 @@ def pick_commentaire(row):
     return str(row.get("commentaire_propose", "") or row.get("commentaire_propose_batch", "") or "").strip()
 
 
+def _batch_status_badge(status: str) -> str:
+    status = str(status or "").strip().upper()
+    if not status:
+        return "—"
+    if status.startswith("ERR"):
+        return f"🔴 {status}"
+    if "WEAK" in status:
+        return f"🟠 {status}"
+    if status.startswith("OK"):
+        return f"🟢 {status}"
+    return status
+
+
 def asr_dictee(audio_bytes: bytes, audio_path_server: str | None, lang: str = "fr") -> str:
     r"""
     Transcrit la dictée selon config:
@@ -1966,6 +1979,33 @@ def show_annotation_interface():
             st.info("ℹ️ photos_batch.csv non présent ou vide : affichage UI seul.")
 
 
+    batch_filter_labels = []
+    if edit_mode == "Réédition libre (expert)" and batch_df is not None and not batch_df.empty:
+        with st.expander("🎯 Filtre batch", expanded=False):
+            show_weak = st.checkbox("Afficher WEAK_LIB / OK_LIB_COM_WEAK", value=False, key="batch_filter_weak")
+            show_err = st.checkbox("Afficher ERR_LIB / OK_LIB_ERR_COM", value=False, key="batch_filter_err")
+
+        if show_weak or show_err:
+            batch_status_series = photos_view_df.get("batch_status", pd.Series("", index=photos_view_df.index)).astype(str)
+            selected_mask = pd.Series(False, index=photos_view_df.index)
+            if show_weak:
+                selected_mask |= batch_status_series.str.contains("WEAK", case=False, na=False)
+                batch_filter_labels.append("WEAK")
+            if show_err:
+                selected_mask |= batch_status_series.str.startswith("ERR", na=False) | batch_status_series.str.contains(
+                    "ERR_COM",
+                    case=False,
+                    na=False,
+                )
+                batch_filter_labels.append("ERR")
+            target_indices = [idx for idx in target_indices if bool(selected_mask.iloc[idx])]
+
+            if batch_filter_labels:
+                st.caption(f"Filtre batch actif : {', '.join(batch_filter_labels)}")
+            if not target_indices:
+                st.info(f"Aucune photo ne correspond au filtre batch sélectionné : {', '.join(batch_filter_labels)}.")
+                return
+
     # --- BOUCLE PRINCIPALE SUR LES PHOTOS ---
 
     photos_df = photos_df.reset_index(drop=True)
@@ -2164,8 +2204,11 @@ def show_annotation_interface():
             desc_vlm = pick_desc_vlm(row_view)  # ✅ UI > legacy > batch
             vlm_status = str(row.get("vlm_ui_status", "") or "").strip()  # ✅ UI
             vlm_ts     = str(row.get("vlm_ui_ts", "") or "").strip()
+            batch_status = str(row_view.get("batch_status", "") or "").strip()
 
-            st.caption(f"Statut: {vlm_status or '—'} • Date: {vlm_ts or '—'}")
+            st.caption(
+                f"Statut VLM: {vlm_status or '—'} • Batch: {_batch_status_badge(batch_status)} • Date: {vlm_ts or '—'}"
+            )
 
             with st.expander("🧠 Description VLM (photo)", expanded=True):
                 
