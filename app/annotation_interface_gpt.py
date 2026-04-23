@@ -1209,16 +1209,22 @@ def _persist_llm_backend(infos: dict, backend: str) -> tuple[bool, str]:
     return True, str(config_path)
 
 def pick_libelle(row):
-    v = str(row.get("libelle_propose_ui", "") or "").strip()
+    v = _ui_text(row.get("libelle_propose_ui"))
     if v:
         return v
-    return str(row.get("libelle_propose", "") or row.get("libelle_propose_batch", "") or "").strip()
+    v = _ui_text(row.get("libelle_propose"))
+    if v:
+        return v
+    return _ui_text(row.get("libelle_propose_batch"))
 
 def pick_commentaire(row):
-    v = str(row.get("commentaire_propose_ui", "") or "").strip()
+    v = _ui_text(row.get("commentaire_propose_ui"))
     if v:
         return v
-    return str(row.get("commentaire_propose", "") or row.get("commentaire_propose_batch", "") or "").strip()
+    v = _ui_text(row.get("commentaire_propose"))
+    if v:
+        return v
+    return _ui_text(row.get("commentaire_propose_batch"))
 
 
 def _batch_status_badge(status: str) -> str:
@@ -1410,18 +1416,18 @@ def build_vlm_context_guided(ctx_general: dict, transcription_extrait: str) -> s
 def ensure_desc_vlm(i, row_view, guide_src: str, *, photos_df, photos_csv, mission, context_system, context_user="", vlm_system="", vlm_user="", force: bool = False) -> str:
     if not force:
         # 1) priorité absolue : UI explicite
-        desc = str(row_view.get("description_vlm_ui", "") or "").strip()
+        desc = _ui_text(row_view.get("description_vlm_ui"))
         if desc:
             return desc
 
         # 2) fallback : colonne UI historique (si encore utilisée)
-        desc = str(row_view.get("description_vlm", "") or "").strip()
+        desc = _ui_text(row_view.get("description_vlm"))
         if desc:
             return desc
 
         # 3) fallback batch (merge suffix _batch ou colonne native si déjà présente)
         #    (selon votre merge, c’est souvent "description_vlm_batch")
-        desc = str(row_view.get("description_vlm_batch", "") or "").strip()
+        desc = _ui_text(row_view.get("description_vlm_batch"))
         if desc:
             return desc
 
@@ -2193,18 +2199,18 @@ def show_annotation_interface():
             # ─────────────────────────────────────────────
 
             def pick_desc_vlm(r):
-                v = str(r.get("description_vlm_ui", "") or "").strip()
+                v = _ui_text(r.get("description_vlm_ui"))
                 if v:
                     return v
-                v = str(r.get("description_vlm", "") or "").strip()
+                v = _ui_text(r.get("description_vlm"))
                 if v:
                     return v
-                return str(r.get("description_vlm_batch", "") or "").strip()
+                return _ui_text(r.get("description_vlm_batch"))
 
             desc_vlm = pick_desc_vlm(row_view)  # ✅ UI > legacy > batch
-            vlm_status = str(row.get("vlm_ui_status", "") or "").strip()  # ✅ UI
-            vlm_ts     = str(row.get("vlm_ui_ts", "") or "").strip()
-            batch_status = str(row_view.get("batch_status", "") or "").strip()
+            vlm_status = _ui_text(row.get("vlm_ui_status"))  # ✅ UI
+            vlm_ts     = _ui_text(row.get("vlm_ui_ts"))
+            batch_status = _ui_text(row_view.get("batch_status"))
 
             st.caption(
                 f"Statut VLM: {vlm_status or '—'} • Batch: {_batch_status_badge(batch_status)} • Date: {vlm_ts or '—'}"
@@ -3120,7 +3126,13 @@ def show_annotation_interface():
 
                     if st.button("↩️ Revenir au batch", key=f"back_batch_{i}"):
                         # 1) vider les colonnes UI persistées
-                        for c in ("description_vlm_ui", "libelle_propose_ui", "commentaire_propose_ui"):
+                        for c in (
+                            "description_vlm_ui",
+                            "libelle_propose_ui",
+                            "commentaire_propose_ui",
+                            "vlm_ui_status",
+                            "vlm_ui_ts",
+                        ):
                             if c in photos_df.columns:
                                 photos_df.at[i, c] = ""
 
