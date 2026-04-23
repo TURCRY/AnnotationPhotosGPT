@@ -1240,6 +1240,14 @@ def _batch_status_badge(status: str) -> str:
     return status
 
 
+def _show_vlm_error(exc: Exception) -> None:
+    detail = str(exc or "").strip()
+    log.exception("VLM UI error: %s", detail)
+    st.error("Erreur lors du calcul de la description VLM.")
+    if detail:
+        st.caption(f"Détail technique : {detail}")
+
+
 def asr_dictee(audio_bytes: bytes, audio_path_server: str | None, lang: str = "fr") -> str:
     r"""
     Transcrit la dictée selon config:
@@ -2251,7 +2259,7 @@ def show_annotation_interface():
                                     else:
                                         st.warning("VLM a répondu vide.")
                         except Exception as e:
-                            st.error(f"Erreur VLM : {e}")
+                            _show_vlm_error(e)
 
                 # 2) régénération forcée (NOUVEAU)
                 with colv2:
@@ -2271,7 +2279,7 @@ def show_annotation_interface():
                             else:
                                 st.warning("VLM a répondu vide.")
                         except Exception as e:
-                            st.error(f"Erreur VLM : {e}")
+                            _show_vlm_error(e)
 
 
 
@@ -2398,41 +2406,11 @@ def show_annotation_interface():
                 st.markdown("**Extrait commentaire:**"); st.write(texte_com or "_(vide)_")
 
                 # =========================================================
-                # VLM : description photo (fallback UI si batch non lancé)
+                # VLM : lecture seule au chargement/rerun.
+                # Aucun appel VLM automatique ici : seuls les boutons dédiés
+                # peuvent déclencher ensure_desc_vlm / call_vlm_single.
                 # =========================================================
-                try:
-                    photo_dirty = False
-
-                    # Lecture unique via row_view (UI + batch)
-                    desc_vlm = pick_desc_vlm(row_view)
-                    skip_auto_vlm_once = bool(st.session_state.pop(f"skip_auto_vlm_once_{i}", False))
-
-                    if not desc_vlm:
-                        if skip_auto_vlm_once:
-                            pass
-                        elif not is_annotated:
-                            guide_src = (texte_com or texte_lib or "").strip()
-                            desc_vlm = ensure_desc_vlm(
-                                i, row_view, guide_src=guide_src,
-                                photos_df=photos_df, photos_csv=photos_csv,
-                                mission=mission, context_system=context_system,
-                                context_user=context_user, vlm_system=vlm_system, vlm_user=vlm_user
-                            )
-                            photo_dirty = True
-                            if not desc_vlm:
-                                photos_df.at[i, "vlm_ui_status"] = "EMPTY"
-                                photo_dirty = True
-                        else:
-                            photos_df.at[i, "vlm_ui_status"] = "SKIP"
-                            photo_dirty = True
-
-                except Exception as e:
-                    photos_df.at[i, "vlm_ui_status"] = "ERR"
-                    photo_dirty = True
-                    st.error(f"Erreur VLM : {e}")
-
-                if photo_dirty:
-                    photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+                desc_vlm = pick_desc_vlm(row_view)
 
 
                 #************************************************************************
@@ -3147,10 +3125,6 @@ def show_annotation_interface():
                         ):
                             if k in st.session_state:
                                 del st.session_state[k]
-
-                        # 3) empêcher tout fallback VLM automatique au rerun suivant
-                        st.session_state[f"skip_auto_vlm_once_{i}"] = True
-
 
                         photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
                         st.rerun()
