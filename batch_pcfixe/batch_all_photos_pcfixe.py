@@ -791,6 +791,39 @@ def _post_asr_voxtral_deferred(
         return {}
 
 
+def _mark_deferred_asr_ok(row: Dict[str, Any], text: str, csv_path: str) -> None:
+    row["dictee_asr_status"] = "OK"
+    row["dictee_asr_text"] = text
+    row["dictee_asr_error"] = ""
+    row["dictee_asr_ts"] = _clean_cell(row.get("dictee_asr_ts")) or now_ts()
+    row["dictee_llm_status"] = "TODO"
+    row["dictee_llm_error"] = ""
+    if csv_path and not _clean_cell(row.get("dictee_asr_csv_path_pcfixe")):
+        row["dictee_asr_csv_path_pcfixe"] = csv_path
+
+
+def _run_deferred_asr_then_read(
+    *,
+    row: Dict[str, Any],
+    base_url: str,
+    api_key: str,
+    audio_path: str,
+    timeout: float,
+) -> tuple[str, str]:
+    payload = _post_asr_voxtral_deferred(
+        base_url=base_url,
+        api_key=api_key,
+        audio_path=audio_path,
+        output_csv_dir=_asr_output_dir_from_row(row),
+        timeout=timeout,
+    )
+    text = _clean_cell(payload.get("text"))
+    csv_path = ""
+    if not text:
+        text, csv_path = _read_deferred_asr_text(row)
+    return text, csv_path
+
+
 def needs_dictee_llm_retry(row_ui: Dict[str, Any]) -> bool:
     if norm_bool(row_ui.get("annotation_validee")):
         return False
@@ -838,13 +871,42 @@ def process_deferred_dictees(
         if status == "PENDING" and not asr_text:
             reloaded_text, csv_path = _read_deferred_asr_text(row)
             if reloaded_text:
-                row["dictee_asr_status"] = "OK"
-                row["dictee_asr_text"] = reloaded_text
-                row["dictee_asr_error"] = ""
-                row["dictee_llm_status"] = "TODO"
-                row["dictee_llm_error"] = ""
-                if csv_path and not _clean_cell(row.get("dictee_asr_csv_path_pcfixe")):
-                    row["dictee_asr_csv_path_pcfixe"] = csv_path
+                log.info("Dictee ASR PENDING resolue par CSV existant: csv=%s", csv_path)
+                _mark_deferred_asr_ok(row, reloaded_text, csv_path)
+                changed += 1
+                continue
+            if not audio_path or not Path(audio_path).exists():
+                row["dictee_asr_status"] = "ERR"
+                row["dictee_asr_error"] = "WAV absent pour reprise ASR PENDING"
+                row["dictee_asr_ts"] = _clean_cell(row.get("dictee_asr_ts")) or now_ts()
+                log.warning("Dictee ASR PENDING impossible: WAV absent audio_path=%s", audio_path or "<vide>")
+                changed += 1
+                continue
+            log.info("Dictee ASR PENDING sans CSV: relance /asr_voxtral audio_path=%s", audio_path)
+            try:
+                text, csv_path = _run_deferred_asr_then_read(
+                    row=row,
+                    base_url=base_url,
+                    api_key=api_key,
+                    audio_path=audio_path,
+                    timeout=timeout,
+                )
+                if not text:
+                    raise RuntimeError("ASR OK mais texte vide")
+                _mark_deferred_asr_ok(row, text, csv_path)
+                log.info("Dictee ASR PENDING relancee puis resolue: csv=%s", csv_path or "<payload>")
+                changed += 1
+            except Exception as e:
+                err = str(e)
+                if "HTTP 409" in err and "ASR Voxtral" in err:
+                    row["dictee_asr_status"] = "BUSY"
+                    row["dictee_asr_error"] = "HTTP 409: ASR Voxtral deja en cours"
+                    log.info("Dictee ASR PENDING conservee en attente: /asr_voxtral BUSY audio_path=%s", audio_path)
+                else:
+                    row["dictee_asr_status"] = "ERR"
+                    row["dictee_asr_error"] = err[:600]
+                    log.warning("Dictee ASR PENDING en erreur apres relance: %s", err[:600])
+                row["dictee_asr_ts"] = _clean_cell(row.get("dictee_asr_ts")) or now_ts()
                 changed += 1
             continue
 
@@ -859,26 +921,16 @@ def process_deferred_dictees(
             continue
 
         try:
-            payload = _post_asr_voxtral_deferred(
+            text, csv_path = _run_deferred_asr_then_read(
+                row=row,
                 base_url=base_url,
                 api_key=api_key,
                 audio_path=audio_path,
-                output_csv_dir=_asr_output_dir_from_row(row),
                 timeout=timeout,
             )
-            text = _clean_cell(payload.get("text"))
-            if not text:
-                text, csv_path = _read_deferred_asr_text(row)
-                if csv_path and not _clean_cell(row.get("dictee_asr_csv_path_pcfixe")):
-                    row["dictee_asr_csv_path_pcfixe"] = csv_path
             if not text:
                 raise RuntimeError("ASR OK mais texte vide")
-            row["dictee_asr_status"] = "OK"
-            row["dictee_asr_text"] = text
-            row["dictee_asr_error"] = ""
-            row["dictee_asr_ts"] = _clean_cell(row.get("dictee_asr_ts")) or now_ts()
-            row["dictee_llm_status"] = "TODO"
-            row["dictee_llm_error"] = ""
+            _mark_deferred_asr_ok(row, text, csv_path)
             changed += 1
         except Exception as e:
             err = str(e)
