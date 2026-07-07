@@ -490,6 +490,11 @@ def _read_dictee_text_from_csv(csv_path: str) -> str:
     return "\n".join(parts).strip()
 
 
+def _is_asr_busy_error(exc: Exception) -> bool:
+    msg = str(exc or "")
+    return "HTTP 409" in msg and "ASR Voxtral" in msg
+
+
 def _refresh_pending_dictee(
     i: int,
     row,
@@ -504,7 +509,7 @@ def _refresh_pending_dictee(
     csv_path = _ui_text(row.get("dictee_asr_csv_path_pcfixe"))
     photo_csv_path = _ui_text(row.get("dictee_asr_photo_csv_path_pcfixe"))
 
-    if status != "PENDING" or not audio_path:
+    if not _is_dictee_pending(status) or not audio_path:
         return status, text, csv_path, photo_csv_path
 
     try:
@@ -548,7 +553,7 @@ def _refresh_pending_dictee(
 
 
 def _is_dictee_pending(value) -> bool:
-    return _ui_text(value).upper() == "PENDING"
+    return _ui_text(value).upper() in {"PENDING", "TODO", "BUSY"}
 
 
 def _refresh_all_pending_dictees(
@@ -1756,6 +1761,7 @@ def show_annotation_interface():
             "dictee_asr_status",
             "dictee_asr_ts",
             "dictee_asr_text",
+            "dictee_asr_error",
             "dictee_audio_path_pcfixe",
             "dictee_asr_csv_path_pcfixe",
             "dictee_asr_photo_csv_path_pcfixe",
@@ -2853,6 +2859,8 @@ def show_annotation_interface():
                             st.success("Dictée transcrite.")
                         elif dictee_feedback == "pending":
                             st.info("⏳ Dictée envoyée au serveur. La transcription sera rechargée automatiquement dès qu'elle sera disponible.")
+                        elif dictee_feedback == "busy":
+                            st.warning("ASR occupé : la dictée est conservée et sera reprise par le batch.")
                         elif dictee_feedback == "empty":
                             st.warning("Dictee traitee, mais aucun texte ASR n'a ete renvoye.")
 
@@ -2871,6 +2879,8 @@ def show_annotation_interface():
                         st.text_area("Texte dicté (ASR)", value=current_dictee_text, height=120, disabled=True)
                         if persisted_dictee_status == "PENDING":
                             st.info("⏳ Transcription en cours (serveur). Vous pouvez passer à une autre photo et revenir plus tard.")
+                        elif persisted_dictee_status == "BUSY":
+                            st.warning("ASR occupé : la dictée est conservée et sera reprise par le batch.")
                         elif persisted_dictee_status == "OK" and has_current_dictee_text:
                             st.success("✅ Transcription disponible")
                             st.info("Le texte dicté affiché ci-dessus est la source actuellement réutilisée dans les prompts GPT pour proposer le libellé et le commentaire.")
@@ -3025,33 +3035,69 @@ def show_annotation_interface():
                                             )
 
                                             raw_csv_candidate, photo_csv_candidate = _dictation_csv_candidates(audio_path_server, out_dir_abs)
+                                            dictee_csv_path = str(raw_csv_candidate) if raw_csv_candidate else ""
+                                            dictee_photo_csv_path = str(photo_csv_candidate) if photo_csv_candidate else ""
+                                            now_dictee = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                            photos_df.at[i, "dictee_audio_path_pcfixe"] = audio_path_server
+                                            photos_df.at[i, "dictee_asr_text"] = ""
+                                            photos_df.at[i, "dictee_asr_status"] = "PENDING"
+                                            photos_df.at[i, "dictee_asr_error"] = ""
+                                            photos_df.at[i, "dictee_asr_ts"] = now_dictee
+                                            if dictee_csv_path:
+                                                photos_df.at[i, "dictee_asr_csv_path_pcfixe"] = dictee_csv_path
+                                            if dictee_photo_csv_path:
+                                                photos_df.at[i, "dictee_asr_photo_csv_path_pcfixe"] = dictee_photo_csv_path
+                                            photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+                                            root_in_abs = compute_dictee_target_dir(pcfixe)
+
+                                            _check_under(audio_path_server, root_in_abs, "WAV dictÃ©e (asr_in)")
 
                                             # 2) ASR -> /asr_voxtral en mode non bloquant + export CSV dans asr_out
-                                            client.asr_voxtral(
-                                                audio_path_server,
-                                                model_key=dictation_asr_options["model_key"],
-                                                lang="fr",
-                                                timestamps=True,
-                                                auto_chunk=dictation_asr_options["auto_chunk"],
-                                                cpu=dictation_asr_options["cpu"],
-                                                no4bit=dictation_asr_options["no4bit"],
-                                                chunk=dictation_asr_options["chunk"],
-                                                stride=dictation_asr_options["stride"],
-                                                diarize=False,
-                                                output_csv_dir=out_dir_abs,     # ✅ ABSOLU PC fixe
-                                                export_raw_csv=True,
-                                                export_photo_csv=True,
-                                                export_chat_csv=False,
-                                                export_chat_docx=False,
-                                                temperature=0.0,
-                                                top_p=0.9,
-                                                max_new_tokens=768,
-                                                batch_size=dictation_asr_options["batch_size"],
-                                                client_tag=dictation_asr_options["client_tag"],
-                                                return_payload=False,
-                                                request_timeout=8,
-                                                allow_timeout_success=True,
-                                            )
+                                            try:
+                                                client.asr_voxtral(
+                                                    audio_path_server,
+                                                    model_key=dictation_asr_options["model_key"],
+                                                    lang="fr",
+                                                    timestamps=True,
+                                                    auto_chunk=dictation_asr_options["auto_chunk"],
+                                                    cpu=dictation_asr_options["cpu"],
+                                                    no4bit=dictation_asr_options["no4bit"],
+                                                    chunk=dictation_asr_options["chunk"],
+                                                    stride=dictation_asr_options["stride"],
+                                                    diarize=False,
+                                                    output_csv_dir=out_dir_abs,     # ASR CSV output on PC fixe
+                                                    export_raw_csv=True,
+                                                    export_photo_csv=True,
+                                                    export_chat_csv=False,
+                                                    export_chat_docx=False,
+                                                    temperature=0.0,
+                                                    top_p=0.9,
+                                                    max_new_tokens=768,
+                                                    batch_size=dictation_asr_options["batch_size"],
+                                                    client_tag=dictation_asr_options["client_tag"],
+                                                    return_payload=False,
+                                                    request_timeout=8,
+                                                    allow_timeout_success=True,
+                                                )
+                                            except Exception as asr_exc:
+                                                err_text = str(asr_exc)
+                                                now_dictee = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                                photos_df.at[i, "dictee_audio_path_pcfixe"] = audio_path_server
+                                                photos_df.at[i, "dictee_asr_ts"] = now_dictee
+                                                if _is_asr_busy_error(asr_exc):
+                                                    photos_df.at[i, "dictee_asr_status"] = "BUSY"
+                                                    photos_df.at[i, "dictee_asr_error"] = "HTTP 409: ASR Voxtral deja en cours"
+                                                    photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+                                                    st.session_state[f"dictee_{i}"] = ""
+                                                    st.session_state[f"dictee_feedback_{i}"] = "busy"
+                                                    st.session_state["seq_override_index"] = int(i)
+                                                    st.warning("ASR occupé : la dictée est conservée et sera reprise par le batch.")
+                                                    st.rerun()
+                                                photos_df.at[i, "dictee_asr_status"] = "ERR"
+                                                photos_df.at[i, "dictee_asr_error"] = err_text
+                                                photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+                                                st.error(f"Erreur dictÃ©e/ASR : {asr_exc}")
+                                                st.stop()
 
                                             texte_dictee = ""
                                             dictee_csv_path = str(raw_csv_candidate) if raw_csv_candidate else ""
@@ -3070,6 +3116,7 @@ def show_annotation_interface():
                                             photos_df.at[i, "dictee_audio_path_pcfixe"] = audio_path_server
                                             photos_df.at[i, "dictee_asr_text"] = texte_dictee
                                             photos_df.at[i, "dictee_asr_status"] = "PENDING"
+                                            photos_df.at[i, "dictee_asr_error"] = ""
                                             photos_df.at[i, "dictee_asr_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                                             if dictee_csv_path:
@@ -3105,6 +3152,7 @@ def show_annotation_interface():
                                 except Exception as e:
                                     err_text = str(e)
                                     photos_df.at[i, "dictee_asr_status"] = "ERR_SILENT_AUDIO" if "silencieux ou inexploitable" in err_text else "ERR"
+                                    photos_df.at[i, "dictee_asr_error"] = err_text
                                     photos_df.at[i, "dictee_asr_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                     photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
                                     st.error(f"Erreur dictée/ASR : {e}")
