@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 import requests
 from dotenv import load_dotenv
+from app.server_locator import resolve_flask_base_url, request_with_endpoint_fallback
 
 
 def _load_app_config() -> dict[str, Any]:
@@ -40,18 +41,18 @@ def _is_placeholder_api_key(value: str) -> bool:
 def _resolve_server_base_url(appcfg: dict[str, Any]) -> str:
     server_url = (os.getenv("SERVER_URL") or "").strip()
     if server_url:
-        return server_url.rstrip("/")
+        return resolve_flask_base_url(extra_candidates=[server_url])
 
     local_env = (os.getenv("LOCAL_LLM_BASE_URL") or "").strip()
     if local_env:
-        return local_env.rstrip("/")
+        return resolve_flask_base_url(extra_candidates=[local_env])
 
     local_cfg = (appcfg.get("local_llm") or {}) if isinstance(appcfg, dict) else {}
     cfg_url = str(local_cfg.get("base_url") or "").strip()
     if cfg_url:
-        return cfg_url.rstrip("/")
+        return resolve_flask_base_url(extra_candidates=[cfg_url])
 
-    return "http://127.0.0.1:5050"
+    return resolve_flask_base_url()
 
 
 def _resolve_api_key(appcfg: dict[str, Any]) -> str:
@@ -103,8 +104,10 @@ def create_affaire_server_compatible(project_id: str, nom: str = "", affaires_ro
         headers["x-api-key"] = api_key
 
     try:
-        r = requests.post(
-            f"{base_url}/create_affaire",
+        r = request_with_endpoint_fallback(
+            "POST",
+            "/create_affaire",
+            extra_candidates=[base_url],
             json=payload,
             headers=headers,
             timeout=timeout,

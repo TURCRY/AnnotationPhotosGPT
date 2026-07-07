@@ -46,7 +46,7 @@
     },
     "llm_backend": "local",               
     "local_llm": {
-        "base_url": "http://192.168.0.155:5050",
+        "base_url": "",
         "api_key": "LOCAL_LLM_API_KEY_PLACEHOLDER",
         "model": "Qwen_2_5_14B",
         "timeout": 30

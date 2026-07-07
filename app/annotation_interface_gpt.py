@@ -23,6 +23,7 @@ from PIL import Image
 import math
 import re
 from app.local_llm_client import LocalLLMClient
+from app.server_locator import DEFAULT_FLASK_ENDPOINTS, resolve_flask_base_url
 from app.wol_util import wake_on_lan, wait_for_server, is_server_up
 from utils import charger_transcription_flexible
 import inspect
@@ -140,7 +141,12 @@ def _resolve_local_llm_settings(appcfg: dict) -> dict:
     server_url = (os.getenv("SERVER_URL") or "").strip()
     base_url_env = (os.getenv("LOCAL_LLM_BASE_URL") or "").strip()
     base_url_cfg = str(local_cfg.get("base_url") or "").strip()
-    local_cfg["base_url"] = (server_url or base_url_env or base_url_cfg or "http://127.0.0.1:5050").rstrip("/")
+    extra_candidates: list[str] = []
+    if server_url or base_url_env:
+        extra_candidates.append(server_url or base_url_env)
+    elif base_url_cfg and base_url_cfg.rstrip("/") not in DEFAULT_FLASK_ENDPOINTS:
+        extra_candidates.append(base_url_cfg)
+    local_cfg["base_url"] = resolve_flask_base_url(extra_candidates=extra_candidates)
 
     env_key = (os.getenv("LOCAL_LLM_API_KEY") or "").strip()
     cfg_key = str(local_cfg.get("api_key") or "").strip()
@@ -1009,7 +1015,7 @@ def generer_texte_gpt(role_systeme: str, prompt_user: str) -> str:
         wol_cfg   = appcfg.get("wol", {}) or {}
         busy_key  = "llm_local_request_inflight"
 
-        base_url  = local_cfg.get("base_url", "http://127.0.0.1:5050")
+        base_url  = local_cfg.get("base_url") or resolve_flask_base_url()
         api_key   = local_cfg.get("api_key", "")
         model     = local_cfg.get("model")
         timeout   = float(local_cfg.get("timeout", 30))
@@ -1288,7 +1294,7 @@ def call_vlm_single(image_path: str, context: str = "", prompt: str = "", model_
     appcfg = _load_app_config()
     local_cfg = appcfg.get("local_llm", {}) or {}
 
-    base_url = (local_cfg.get("base_url") or "http://127.0.0.1:5050").rstrip("/")
+    base_url = (local_cfg.get("base_url") or resolve_flask_base_url()).rstrip("/")
     api_key  = local_cfg.get("api_key", "")
     url = base_url + "/vision/describe"
 
@@ -2973,7 +2979,7 @@ def show_annotation_interface():
                                         appcfg = _load_app_config(infos)
                                         local_cfg = appcfg.get("local_llm", {}) or {}
                                         client = LocalLLMClient(
-                                            base_url=(local_cfg.get("base_url") or "http://127.0.0.1:5050"),
+                                            base_url=(local_cfg.get("base_url") or resolve_flask_base_url()),
                                             api_key=(local_cfg.get("api_key") or ""),
                                             timeout=float(local_cfg.get("timeout") or 30),
                                         )

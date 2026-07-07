@@ -6,6 +6,7 @@ import requests
 from typing import Optional, Dict, Any, List, Union
 
 from pathlib import Path
+from app.server_locator import resolve_flask_base_url, request_with_endpoint_fallback
 
 
 def _is_placeholder_api_key(value: str) -> bool:
@@ -33,8 +34,12 @@ class LocalLLMClient:
         api_key: Optional[str] = None,
         timeout: float = 30.0,
     ):
-        env_base = os.getenv("SERVER_URL") or os.getenv("LOCAL_LLM_BASE_URL") or "http://127.0.0.1:5050"
-        self.base_url = (base_url or env_base).rstrip("/")
+        env_base = os.getenv("SERVER_URL") or os.getenv("LOCAL_LLM_BASE_URL") or ""
+        self.base_url = (
+            base_url
+            or env_base
+            or resolve_flask_base_url()
+        ).rstrip("/")
 
         passed_key = (api_key or "").strip()
         env_key = (os.getenv("LOCAL_LLM_API_KEY") or "").strip()
@@ -103,8 +108,10 @@ class LocalLLMClient:
         if salient_families:
             payload["salient_families"] = salient_families
 
-        r = requests.post(
-            self._url("/annoter"),
+        r = request_with_endpoint_fallback(
+            "POST",
+            "/annoter",
+            extra_candidates=[self.base_url],
             json=payload,
             headers=self._h(),
             timeout=self.timeout,
@@ -168,7 +175,15 @@ class LocalLLMClient:
 
         files = {"file": (filename, file_bytes, "application/octet-stream")}
 
-        r = requests.post(self._url("/files"), data=data, files=files, headers=headers, timeout=self.timeout)
+        r = request_with_endpoint_fallback(
+            "POST",
+            "/files",
+            extra_candidates=[self.base_url],
+            data=data,
+            files=files,
+            headers=headers,
+            timeout=self.timeout,
+        )
         r.raise_for_status()
         j = r.json()
         if not j.get("ok") or not j.get("path"):
@@ -230,8 +245,10 @@ class LocalLLMClient:
         payload.update(kwargs)
 
         try:
-            r = requests.post(
-                self._url("/asr_voxtral"),
+            r = request_with_endpoint_fallback(
+                "POST",
+                "/asr_voxtral",
+                extra_candidates=[self.base_url],
                 json=payload,
                 headers=self._h(),
                 timeout=float(request_timeout) if request_timeout is not None else max(self.timeout, 600),
