@@ -5,6 +5,7 @@
 batch_all_photos_pcfixe.py
 
 PASS 1 : VLM (description_vlm_batch) en batch
+PASS 1bis : ASR dictées différées
 PASS 2 : LLM (libellé / commentaire) photo par photo
 
 Pré-requis:
@@ -652,6 +653,249 @@ def ensure_columns(rows: List[Dict[str, Any]], required: Dict[str, Any]) -> List
         if c not in base:
             base.append(c)
     return base
+
+
+def csv_fieldnames_without_internal(fieldnames: List[str]) -> List[str]:
+    return [f for f in fieldnames if f != "idx"]
+
+
+def _clean_cell(value: Any) -> str:
+    text = str(value or "").strip()
+    return "" if text.lower() == "nan" else text
+
+
+def _dictation_csv_candidates_from_row(row: Dict[str, Any]) -> list[Path]:
+    candidates: list[Path] = []
+    for key in ("dictee_asr_csv_path_pcfixe", "dictee_asr_photo_csv_path_pcfixe"):
+        value = _clean_cell(row.get(key))
+        if value:
+            candidates.append(Path(value))
+
+    audio_path = _clean_cell(row.get("dictee_audio_path_pcfixe"))
+    if audio_path:
+        p = Path(audio_path)
+        stem = p.stem
+        suffix = p.suffix.lstrip(".")
+        out_dirs: list[Path] = []
+        for existing in candidates:
+            if str(existing):
+                out_dirs.append(existing.parent)
+        out_dirs.append(p.parent)
+        if p.parent.name.lower() == "asr_in":
+            out_dirs.append(p.parent.parent / "asr_out")
+        seen_dirs = set()
+        for out_dir in out_dirs:
+            key = str(out_dir).lower()
+            if key in seen_dirs:
+                continue
+            seen_dirs.add(key)
+            if suffix:
+                candidates.append(out_dir / f"{stem}({suffix}).csv")
+                candidates.append(out_dir / f"{stem}({suffix})(photo).csv")
+            candidates.append(out_dir / f"{p.name}.csv")
+            candidates.append(out_dir / f"{p.name}(photo).csv")
+            candidates.append(out_dir / f"{stem}.csv")
+            candidates.append(out_dir / f"{stem}(photo).csv")
+
+    out: list[Path] = []
+    seen = set()
+    for p in candidates:
+        key = str(p).lower()
+        if key not in seen:
+            out.append(p)
+            seen.add(key)
+    return out
+
+
+def _read_asr_text_from_csv(path: Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f, delimiter=";")
+            if not reader.fieldnames or "text" not in reader.fieldnames:
+                return ""
+            parts = [_clean_cell(row.get("text")) for row in reader]
+    except Exception:
+        return ""
+    return "\n".join(p for p in parts if p).strip()
+
+
+def _read_deferred_asr_text(row: Dict[str, Any]) -> tuple[str, str]:
+    for csv_path in _dictation_csv_candidates_from_row(row):
+        text = _read_asr_text_from_csv(csv_path)
+        if text:
+            return text, str(csv_path)
+    return "", ""
+
+
+def _asr_output_dir_from_row(row: Dict[str, Any]) -> str:
+    for key in ("dictee_asr_csv_path_pcfixe", "dictee_asr_photo_csv_path_pcfixe"):
+        value = _clean_cell(row.get(key))
+        if value:
+            return str(Path(value).parent)
+    audio_path = _clean_cell(row.get("dictee_audio_path_pcfixe"))
+    if not audio_path:
+        return ""
+    parent = Path(audio_path).parent
+    if parent.name.lower() == "asr_in":
+        return str(parent.parent / "asr_out")
+    return str(parent)
+
+
+def _post_asr_voxtral_deferred(
+    *,
+    base_url: str,
+    api_key: str,
+    audio_path: str,
+    output_csv_dir: str,
+    timeout: float,
+) -> dict:
+    headers = {"x-api-key": api_key} if api_key else {}
+    payload: Dict[str, Any] = {
+        "audio_path": audio_path,
+        "lang": "fr",
+        "timestamps": True,
+        "auto_chunk": True,
+        "export_raw_csv": True,
+        "export_photo_csv": True,
+        "export_chat_csv": False,
+        "export_chat_docx": False,
+        "temperature": 0.0,
+        "top_p": 0.9,
+        "client_tag": "annotationphotogpt_batch_deferred_dictee",
+    }
+    if output_csv_dir:
+        payload["output_csv_dir"] = output_csv_dir
+    r = requests.post(
+        base_url.rstrip("/") + "/asr_voxtral",
+        json=payload,
+        headers=headers,
+        timeout=max(float(timeout or 0), 600.0),
+    )
+    if r.status_code == 409:
+        raise RuntimeError("HTTP 409: ASR Voxtral deja en cours")
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        detail = ""
+        try:
+            js = r.json() or {}
+            detail = js.get("error") or js.get("detail") or js.get("message") or ""
+        except Exception:
+            detail = (r.text or "").strip()
+        raise RuntimeError(f"HTTP {r.status_code}: {detail or str(e)}") from e
+    try:
+        return r.json() or {}
+    except Exception:
+        return {}
+
+
+def needs_dictee_llm_retry(row_ui: Dict[str, Any]) -> bool:
+    if norm_bool(row_ui.get("annotation_validee")):
+        return False
+    status = _clean_cell(row_ui.get("dictee_asr_status")).upper()
+    text = _clean_cell(row_ui.get("dictee_asr_text"))
+    if status != "OK" or not text:
+        return False
+    llm_status = _clean_cell(row_ui.get("dictee_llm_status")).upper()
+    asr_ts = _clean_cell(row_ui.get("dictee_asr_ts"))
+    llm_asr_ts = _clean_cell(row_ui.get("dictee_llm_asr_ts"))
+    if llm_status != "OK":
+        return True
+    return bool(asr_ts and llm_asr_ts != asr_ts)
+
+
+def process_deferred_dictees(
+    *,
+    rows_ui: List[Dict[str, Any]],
+    photos_csv: Path,
+    ui_fieldnames: List[str],
+    base_url: str,
+    api_key: str,
+    timeout: float,
+    selected_indices: set[int] | None = None,
+) -> int:
+    changed = 0
+    now = now_ts()
+    for row_pos, row in enumerate(rows_ui):
+        if selected_indices is not None and row_pos not in selected_indices:
+            continue
+        status = _clean_cell(row.get("dictee_asr_status")).upper()
+        audio_path = _clean_cell(row.get("dictee_audio_path_pcfixe"))
+        asr_text = _clean_cell(row.get("dictee_asr_text"))
+
+        if norm_bool(row.get("annotation_validee")):
+            llm_status = _clean_cell(row.get("dictee_llm_status")).upper()
+            asr_ts = _clean_cell(row.get("dictee_asr_ts"))
+            llm_asr_ts = _clean_cell(row.get("dictee_llm_asr_ts"))
+            if status == "OK" and asr_text and (llm_status == "TODO" or (asr_ts and llm_asr_ts != asr_ts)):
+                row["dictee_llm_status"] = "SKIP_VALIDATED"
+                row["dictee_llm_ts"] = now
+                changed += 1
+            continue
+
+        if status == "PENDING" and not asr_text:
+            reloaded_text, csv_path = _read_deferred_asr_text(row)
+            if reloaded_text:
+                row["dictee_asr_status"] = "OK"
+                row["dictee_asr_text"] = reloaded_text
+                row["dictee_asr_error"] = ""
+                row["dictee_llm_status"] = "TODO"
+                row["dictee_llm_error"] = ""
+                if csv_path and not _clean_cell(row.get("dictee_asr_csv_path_pcfixe")):
+                    row["dictee_asr_csv_path_pcfixe"] = csv_path
+                changed += 1
+            continue
+
+        if status not in {"BUSY", "TODO"} or not audio_path or asr_text:
+            continue
+
+        if not Path(audio_path).exists():
+            row["dictee_asr_status"] = "ERR"
+            row["dictee_asr_error"] = "WAV absent"
+            row["dictee_asr_ts"] = _clean_cell(row.get("dictee_asr_ts")) or now_ts()
+            changed += 1
+            continue
+
+        try:
+            payload = _post_asr_voxtral_deferred(
+                base_url=base_url,
+                api_key=api_key,
+                audio_path=audio_path,
+                output_csv_dir=_asr_output_dir_from_row(row),
+                timeout=timeout,
+            )
+            text = _clean_cell(payload.get("text"))
+            if not text:
+                text, csv_path = _read_deferred_asr_text(row)
+                if csv_path and not _clean_cell(row.get("dictee_asr_csv_path_pcfixe")):
+                    row["dictee_asr_csv_path_pcfixe"] = csv_path
+            if not text:
+                raise RuntimeError("ASR OK mais texte vide")
+            row["dictee_asr_status"] = "OK"
+            row["dictee_asr_text"] = text
+            row["dictee_asr_error"] = ""
+            row["dictee_asr_ts"] = _clean_cell(row.get("dictee_asr_ts")) or now_ts()
+            row["dictee_llm_status"] = "TODO"
+            row["dictee_llm_error"] = ""
+            changed += 1
+        except Exception as e:
+            err = str(e)
+            if "HTTP 409" in err and "ASR Voxtral" in err:
+                row["dictee_asr_status"] = "BUSY"
+                row["dictee_asr_error"] = "HTTP 409: ASR Voxtral deja en cours"
+            else:
+                row["dictee_asr_status"] = "ERR"
+                row["dictee_asr_error"] = err[:600]
+            row["dictee_asr_ts"] = _clean_cell(row.get("dictee_asr_ts")) or now_ts()
+            changed += 1
+
+    if changed:
+        atomic_write_csv(photos_csv, rows_ui, csv_fieldnames_without_internal(ui_fieldnames))
+        log.info("Dictées différées traitées: changed=%d photos_csv=%s", changed, str(photos_csv))
+        print(f"[DICTEE_ASR] changed={changed} photos_csv={photos_csv}")
+    return changed
 
 
 def reset_vlm_plus_rows(rows: List[Dict[str, Any]]) -> int:
@@ -1510,6 +1754,17 @@ def main() -> int:
 
     UI_DEFAULTS = {
         "annotation_validee": "0",
+        "dictee_audio_path_pcfixe": "",
+        "dictee_asr_status": "",
+        "dictee_asr_text": "",
+        "dictee_asr_error": "",
+        "dictee_asr_ts": "",
+        "dictee_asr_csv_path_pcfixe": "",
+        "dictee_asr_photo_csv_path_pcfixe": "",
+        "dictee_llm_status": "",
+        "dictee_llm_asr_ts": "",
+        "dictee_llm_error": "",
+        "dictee_llm_ts": "",
         # éventuellement d'autres champs UI si vous voulez les garantir
     }
 
@@ -1676,15 +1931,17 @@ def main() -> int:
         if norm_bool(row.get("annotation_validee")):
             reject("annotation_validee")
             continue
-        if safe_float(row.get("t_audio")) is None:
-            reject("t_audio_absent")
-            continue
 
         photo_key = (row.get("photo_rel_native") or "").strip()
         if not photo_key:
             reject("photo_rel_native_absent")
             continue
         b = get_batch_row(batch_index, photo_key)
+        dictee_retry_target = needs_dictee_llm_retry(row)
+
+        if safe_float(row.get("t_audio")) is None and not dictee_retry_target:
+            reject("t_audio_absent")
+            continue
 
         if only_new_dictee:
             dictee_status = (row.get("dictee_asr_status") or "").strip().upper()
@@ -1745,6 +2002,10 @@ def main() -> int:
     if rerun_weak and not selected_idx:
         print("[SELECT] rerun_weak: aucune ligne WEAK a retraiter")
     print(f"[LIMIT] sélection={len(selected_idx)} / limit={args.limit or 0} indices={selected_idx}")
+    if not selected_idx:
+        log.info("Selection vide: sortie immediate sans VLM, ASR ni LLM")
+        print("[SELECT] selected=0 -> sortie immediate sans VLM, ASR ni LLM")
+        return 0
 
     if reset_vlm:
         for i in selected_idx:
@@ -1950,6 +2211,17 @@ def main() -> int:
     if not ok_purge:
         raise RuntimeError("Purge VLM impossible (VLM busy trop longtemps ou erreur serveur).")
 
+    # PASS 1bis - ASR des dictees differees, apres purge VLM et avant les prompts LLM.
+    if not is_dry and base_url:
+        process_deferred_dictees(
+            rows_ui=rows_ui,
+            photos_csv=photos_csv,
+            ui_fieldnames=ui_fieldnames,
+            base_url=base_url,
+            api_key=local_llm_api_key,
+            timeout=float(local_cfg.get("timeout") or 600),
+            selected_indices=set(selected_idx),
+        )
 
 
     # -------------------------
@@ -2010,6 +2282,7 @@ def main() -> int:
         return prefix + final_prompt
 
     done_llm = 0
+    ui_dirty = False
 
     for i in selected_idx:
         row_ui = rows_ui[i]
@@ -2039,6 +2312,7 @@ def main() -> int:
         # MODE RÉEL
         bs = (b.get("batch_status") or "").upper().strip()
         lib_existing = (b.get("libelle_propose_batch") or "").strip()
+        dictee_retry_target = needs_dictee_llm_retry(row_ui)
         libelle_weak_existing = bool(lib_existing) and is_weak_libelle(lib_existing)
         commentaire_weak = (bs == "OK_LIB_COM_WEAK")
         weak_target = (bs == "WEAK_LIB") or commentaire_weak
@@ -2046,7 +2320,7 @@ def main() -> int:
             continue
         rerun_lib = bool(rerun_weak and bs == "WEAK_LIB")
         rerun_com = bool(rerun_weak and commentaire_weak)
-        if bs.startswith("OK") and lib_existing:
+        if bs.startswith("OK") and lib_existing and not dictee_retry_target:
             if not commentaire_weak and not libelle_weak_existing:
                 # si vous voulez aussi exiger commentaire :
                 # if (b.get("commentaire_propose_batch") or "").strip():
@@ -2087,7 +2361,7 @@ def main() -> int:
 
 
         t = safe_float(row_ui.get("t_audio"))
-        if t is None:
+        if t is None and not dictee_retry_target:
             b["batch_status"] = "SKIP_t_audio_absent"
             b["batch_ts"] = now_ts()
             n_skip += 1; n_done += 1
@@ -2097,8 +2371,8 @@ def main() -> int:
         done_llm += 1
 
         # 1) fenêtres transcription
-        trans_lib = extract_transcript_window(trs, t, lib_before, lib_after, max_chars=2000)
-        trans_com = extract_transcript_window(trs, t, com_before, com_after, max_chars=2000)
+        trans_lib = extract_transcript_window(trs, t, lib_before, lib_after, max_chars=2000) if t is not None else ""
+        trans_com = extract_transcript_window(trs, t, com_before, com_after, max_chars=2000) if t is not None else ""
 
         # dictee vient de row_ui
 
@@ -2182,7 +2456,12 @@ def main() -> int:
         else:
             dictee_block = ""   # IMPORTANT : pas de mot "dictée" dans le prompt
 
-        lib_dictee_block = "" if libelle_seed_source == "dictee_asr" else dictee_block
+        if dictee_retry_target and dictee_ok and (dictee_text or "").strip():
+            dictee_block = (
+                "Correction / complément de l'expert à appliquer prioritairement :\n"
+                f"{dictee_text.strip()}"
+            )
+        lib_dictee_block = dictee_block if dictee_retry_target else ("" if libelle_seed_source == "dictee_asr" else dictee_block)
 
         # 3) Prompts
         mapping_lib = {
@@ -2365,6 +2644,16 @@ def main() -> int:
         # comptage (une seule fois par ligne)
         b["batch_ts"] = now_ts()
         final_status = (b.get("batch_status") or "").strip().upper()
+        if dictee_retry_target:
+            row_ui["dictee_llm_ts"] = now_ts()
+            row_ui["dictee_llm_asr_ts"] = _clean_cell(row_ui.get("dictee_asr_ts"))
+            if final_status in ("OK_LIB", "OK_LIB_COM", "OK_LIB_COM_WEAK", "WEAK_LIB"):
+                row_ui["dictee_llm_status"] = "OK"
+                row_ui["dictee_llm_error"] = ""
+            else:
+                row_ui["dictee_llm_status"] = "ERR"
+                row_ui["dictee_llm_error"] = (b.get("llm_err_lib") or b.get("llm_err_com") or final_status or "LLM error")[:600]
+            ui_dirty = True
         if final_status == "WEAK_LIB":
             n_weak += 1
         elif lib_ok:
@@ -2409,6 +2698,10 @@ def main() -> int:
 
 
     # --- MODE REEL : écriture CSV (batch uniquement) ---
+    if ui_dirty:
+        atomic_write_csv(photos_csv, rows_ui, csv_fieldnames_without_internal(ui_fieldnames))
+        log.info("photos.csv dictee_llm mis a jour: %s", str(photos_csv))
+
     batch_write_ok = False
     try:
         if isinstance(batch_index, dict) and batch_index:
