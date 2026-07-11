@@ -36,8 +36,8 @@ from datetime import datetime
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 UPLOADS_DIR = os.path.join(BASE_DIR, "data", "uploads")
 TEMP_DIR = os.path.join(BASE_DIR, "data", "temp")
-LOCAL_BATCH_CACHE_DIR = os.path.join(BASE_DIR, "data", "batch_cache")
 AFFAIRES_ROOT = get_canonical_affaires_root()
+PCFIXE_LOCAL_AFFAIRES_ROOT = r"C:\Affaires"
 AUDIO_EXT = {".wav", ".mp3"}
 UI_DEFAULTS = {
     "photo_rel_native": "",
@@ -282,6 +282,11 @@ def _reset_derived_project_state(infos: dict) -> None:
     infos["photo_depart"] = max(1, int(infos.get("photo_depart", 1) or 1))
 
 
+def _pcfixe_root_affaires() -> str:
+    """Racine locale vue par le batch execute sur le PC fixe."""
+    return PCFIXE_LOCAL_AFFAIRES_ROOT
+
+
 def _normalize_sync_floor_values(infos: dict) -> bool:
     changed = False
     try:
@@ -354,8 +359,6 @@ def _apply_affaire_captation_change(
     id_affaire = normalize_id_affaire(id_affaire)
     id_captation = normalize_id_captation(id_captation)
     probe = detect_canonical_snapshot(id_affaire, id_captation)
-    local_batch_path = _build_local_batch_copy_path(id_affaire, id_captation)
-
     stop_audio_server_if_any()
     purge_audio_temp()
     _clear_local_progression_file()
@@ -365,9 +368,12 @@ def _apply_affaire_captation_change(
         loaded_infos, probe = load_canonical_snapshot_infos(id_affaire, id_captation)
         infos.clear()
         infos.update(loaded_infos)
-        infos["fichier_photos_batch"] = local_batch_path
+        infos["fichier_photos_batch"] = _resolve_photos_batch_path(
+            infos,
+            str(infos.get("fichier_photos", "") or "").strip(),
+        )
         infos.setdefault("pcfixe", {})
-        infos["pcfixe"]["root_affaires"] = get_canonical_affaires_root()
+        infos["pcfixe"]["root_affaires"] = _pcfixe_root_affaires()
         infos["pcfixe"]["fichier_photos_batch"] = str(probe["paths"]["photos_batch_csv"])
         notes.extend(_hydrate_local_audio_from_snapshot(infos))
         _seed_temp_from_infos(temp, infos)
@@ -395,9 +401,12 @@ def _apply_affaire_captation_change(
     infos["fichier_audio"] = ""
     infos["fichier_audio_compatible"] = ""
     infos["audio_compat_source"] = ""
-    infos["fichier_photos_batch"] = local_batch_path
+    infos["fichier_photos_batch"] = _resolve_photos_batch_path(
+        infos,
+        str(infos.get("fichier_photos", "") or "").strip(),
+    )
     infos.setdefault("pcfixe", {})
-    infos["pcfixe"]["root_affaires"] = get_canonical_affaires_root()
+    infos["pcfixe"]["root_affaires"] = _pcfixe_root_affaires()
     infos["pcfixe"]["fichier_photos_batch"] = str(build_canonical_snapshot_paths(id_affaire, id_captation)["photos_batch_csv"])
     _seed_temp_from_infos(temp, infos)
     notes.append("remise à zéro locale appliquée sans suppression des fichiers canoniques UNC")
@@ -411,14 +420,14 @@ def _rebuild_project_paths(infos: dict, temp: dict, id_affaire: str, id_captatio
         return
 
     existing_pcfixe = dict(infos.get("pcfixe", {}) or {})
-    root_affaires = str(existing_pcfixe.get("root_affaires") or "").strip()
+    root_affaires = _pcfixe_root_affaires()
     paths = _build_pcfixe_paths(id_affaire, id_captation)
 
     photos_real = _real_or_empty(temp.get("fichier_photos_reel", "")) or str(infos.get("fichier_photos", "") or "").strip()
     trans_real = _real_or_empty(temp.get("fichier_transcription_reel", "")) or str(infos.get("fichier_transcription", "") or "").strip()
     audio_src_real = _real_or_empty(temp.get("fichier_audio_source", "")) or str(infos.get("fichier_audio_source", "") or "").strip()
     ctx_real = _real_or_empty(temp.get("fichier_contexte_general_reel", "")) or str(infos.get("fichier_contexte_general", "") or "").strip()
-    batch_real = _build_local_batch_copy_path(id_affaire, id_captation)
+    batch_real = _resolve_photos_batch_path(infos, photos_real)
 
     infos["id_affaire"] = id_affaire
     infos["project_id"] = id_affaire
@@ -520,7 +529,7 @@ def _sanitize_affaire_captation_state(infos: dict, temp: dict, id_affaire: str, 
 
     pcfixe = dict(infos.get("pcfixe", {}) or {})
     if pcfixe:
-        root_affaires = str(pcfixe.get("root_affaires") or "").strip()
+        root_affaires = _pcfixe_root_affaires()
         rebuilt_pcfixe = {"root_affaires": root_affaires} if root_affaires else {}
         for key in PCFIXE_REBUILD_KEYS:
             if key == "root_affaires":
@@ -579,14 +588,19 @@ def _propose_photos_batch_path(photos_real: str) -> str:
     return str(photos_csv.with_name("photos_batch.csv"))
 
 
-def _build_local_batch_copy_path(id_affaire: str, id_captation: str) -> str:
-    id_affaire = str(id_affaire or "").strip()
-    id_captation = str(id_captation or "").strip()
-    if id_affaire and id_captation:
-        return str(Path(LOCAL_BATCH_CACHE_DIR) / id_affaire / id_captation / "photos_batch.csv")
-    if id_affaire:
-        return str(Path(LOCAL_BATCH_CACHE_DIR) / id_affaire / "photos_batch.csv")
-    return str(Path(LOCAL_BATCH_CACHE_DIR) / "photos_batch.csv")
+def _resolve_photos_batch_path(infos: dict, photos_real: str) -> str:
+    """Conserve le chemin métier déclaré, sinon place le batch à côté de photos.csv."""
+    declared = str((infos or {}).get("fichier_photos_batch", "") or "").strip()
+    if declared:
+        normalized = declared.replace("/", "\\").lower()
+        forbidden_markers = (
+            "\\annotationphotosgpt\\batch_pcfixe\\",
+            "\\annotationphotosgpt\\data\\batch_cache\\",
+        )
+        if not any(marker in normalized for marker in forbidden_markers):
+            return declared
+
+    return _propose_photos_batch_path(photos_real)
 
 def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -651,12 +665,11 @@ def _build_snapshot_infos(infos: dict, temp: dict, id_affaire: str, id_captation
     trans_real = _real_or_empty(temp.get("fichier_transcription_reel", "")) or str(snapshot.get("fichier_transcription", "") or "").strip()
     audio_src_real = _real_or_empty(temp.get("fichier_audio_source", "")) or str(snapshot.get("fichier_audio_source", "") or "").strip()
     ctx_real = _real_or_empty(temp.get("fichier_contexte_general_reel", "")) or str(snapshot.get("fichier_contexte_general", "") or "").strip()
-    batch_real = str(
-        st.session_state.get("photos_batch_path_candidate", "")
-        or snapshot.get("fichier_photos_batch", "")
-        or _build_local_batch_copy_path(id_affaire, id_captation)
-        or ""
-    ).strip()
+    batch_candidate = str(st.session_state.get("photos_batch_path_candidate", "") or "").strip()
+    batch_real = _resolve_photos_batch_path(
+        {"fichier_photos_batch": batch_candidate} if batch_candidate else snapshot,
+        photos_real,
+    )
 
     snapshot["id_affaire"] = id_affaire
     snapshot["id_captation"] = id_captation
@@ -722,7 +735,7 @@ def _publish_snapshot_capture(infos: dict, temp: dict, id_affaire: str, id_capta
 
     # On aligne aussi le bloc pcfixe du snapshot sur la vraie racine cible
     snapshot_infos.setdefault("pcfixe", {})
-    snapshot_infos["pcfixe"]["root_affaires"] = root_affaires
+    snapshot_infos["pcfixe"]["root_affaires"] = _pcfixe_root_affaires()
     snapshot_infos["pcfixe"]["config_llm"] = str(paths["config_llm"])
     snapshot_infos["pcfixe"]["fichier_photos_batch"] = str(paths["photos_dir"] / "photos_batch.csv")
 
@@ -1012,27 +1025,17 @@ def show_selection_interface():
         f"`{temp.get('fichier_photos_reel', '') or '—'}`"
     )
 
-    current_id_affaire = str(
-        temp.get("id_affaire")
-        or infos.get("id_affaire")
-        or infos.get("project_id")
-        or ""
-    ).strip()
-    current_id_captation = str(
-        temp.get("id_captation")
-        or infos.get("id_captation")
-        or infos.get("captation_id")
-        or ""
-    ).strip()
-
-    # Fichier batch (photos_batch.csv) : copie locale laptop dédiée
-    photos_batch_current = _build_local_batch_copy_path(current_id_affaire, current_id_captation)
+    # Fichier batch (photos_batch.csv) : chemin métier déclaré ou voisin de photos.csv
+    photos_batch_current = _resolve_photos_batch_path(
+        infos,
+        temp.get("fichier_photos_reel", "") or infos.get("fichier_photos", ""),
+    )
     exists_batch = bool(photos_batch_current) and os.path.exists(photos_batch_current)
 
     st.caption("📦 Fichier batch proposé (photos_batch.csv)")
     st.code(photos_batch_current if photos_batch_current else "(non défini)")
     if photos_batch_current:
-        st.caption("Copie locale laptop dédiée ; la synchronisation au lancement la réalimente depuis la source canonique du bloc pcfixe.")
+        st.caption("Chemin métier déclaré dans infos_projet.json, ou proposé à côté de photos.csv.")
     if exists_batch:
         st.success("✅ photos_batch.csv présent")
     else:
@@ -1466,9 +1469,10 @@ def show_selection_interface():
     # -----------------------------------------------------------------
     # Fichier batch (photos_batch.csv) : affichage + auto-proposition
     # -----------------------------------------------------------------
-    photos_batch_current = str(infos.get("fichier_photos_batch", "") or "").strip()
-    if not photos_batch_current:
-        photos_batch_current = _build_local_batch_copy_path(id_affaire_input, id_captation_input)
+    photos_batch_current = _resolve_photos_batch_path(
+        infos,
+        temp.get("fichier_photos_reel", "") or infos.get("fichier_photos", ""),
+    )
 
     exists_batch = bool(photos_batch_current) and os.path.exists(photos_batch_current)
 
@@ -1595,7 +1599,11 @@ def show_selection_interface():
             os.replace(tmp, photos_real)
 
         # Chemin batch (si proposé)
-        batch_path = str(st.session_state.get("photos_batch_path_candidate", "") or "").strip()
+        batch_candidate = str(st.session_state.get("photos_batch_path_candidate", "") or "").strip()
+        batch_path = _resolve_photos_batch_path(
+            {"fichier_photos_batch": batch_candidate} if batch_candidate else infos,
+            photos_real,
+        )
         if batch_path:
             infos["fichier_photos_batch"] = os.path.abspath(batch_path)
 

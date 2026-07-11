@@ -246,6 +246,37 @@ def read_json(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8-sig") as f:
         return json.load(f)
 
+
+PCFIXE_LOCAL_AFFAIRES_ROOT = r"C:\Affaires"
+PCFIXE_UNC_AFFAIRES_ROOTS = (
+    r"\\192.168.0.120\Affaires",
+    r"\\192.168.0.155\Affaires",
+    r"\\10.0.1.10\Affaires",
+)
+NAS_AFFAIRES_ROOT = r"\\192.168.1.20\Affaires"
+
+
+def normalize_pcfixe_root_affaires(value: Any) -> str:
+    raw = str(value or "").strip().rstrip("\\/")
+    if not raw:
+        return PCFIXE_LOCAL_AFFAIRES_ROOT
+
+    raw_lower = raw.lower()
+    for pcfixe_root in PCFIXE_UNC_AFFAIRES_ROOTS:
+        if raw_lower == pcfixe_root.lower():
+            return PCFIXE_LOCAL_AFFAIRES_ROOT
+
+    if raw_lower == NAS_AFFAIRES_ROOT.lower():
+        msg = (
+            "pcfixe.root_affaires contient la racine NAS; "
+            f"utilisation de {PCFIXE_LOCAL_AFFAIRES_ROOT} comme racine locale PC fixe."
+        )
+        log.warning(msg)
+        print(f"[WARN] {msg}")
+        return PCFIXE_LOCAL_AFFAIRES_ROOT
+
+    return raw
+
 def norm_bool(v: Any) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "oui", "ok", "y")
 
@@ -265,10 +296,15 @@ def resolve_img_path(row: dict) -> Path | None:
     # Normalisation séparateurs / fin de chemin
     base = base.rstrip("\\/")
 
-    # Mapping UNC -> local (PC fixe)
-    # Ajustez si nécessaire (IP, partage, lettre, etc.)
-    if base.lower().startswith(r"\\192.168.0.155\affaires".lower()):
-        base = "C:\\Affaires" + base[len(r"\\192.168.0.155\Affaires") :]
+    # Mapping UNC PC fixe -> chemin local quand le batch tourne sur le PC fixe.
+    for pcfixe_root in (
+        r"\\192.168.0.120\Affaires",
+        r"\\192.168.0.155\Affaires",
+        r"\\10.0.1.10\Affaires",
+    ):
+        if base.lower().startswith(pcfixe_root.lower()):
+            base = "C:\\Affaires" + base[len(pcfixe_root) :]
+            break
 
     try:
         p = Path(base) / name
@@ -1931,7 +1967,7 @@ def main() -> int:
 
     # 0) Construire UNE fois la sélection
 
-    pc_root = (pc.get("root_affaires") or r"C:\Affaires").rstrip("\\/")
+    pc_root = normalize_pcfixe_root_affaires(pc.get("root_affaires"))
     id_affaire = str(infos.get("id_affaire") or "").strip()
     if not id_affaire:
         raise RuntimeError("id_affaire manquant dans infos_projet.json")

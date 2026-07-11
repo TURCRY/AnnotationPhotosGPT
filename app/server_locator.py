@@ -10,12 +10,19 @@ import requests
 
 
 DEFAULT_FLASK_ENDPOINTS = (
-    "http://192.168.0.120:5050",
     "http://192.168.0.155:5050",
+    "http://192.168.0.120:5050",
     "http://10.0.1.10:5050",
 )
+LAN_FLASK_ENDPOINTS = (
+    "http://192.168.0.155:5050",
+    "http://192.168.0.120:5050",
+)
+VPN_FLASK_ENDPOINT = "http://10.0.1.10:5050"
 
 _CACHE_TTL_SECONDS = float(os.getenv("FLASK_ENDPOINT_CACHE_TTL", "60"))
+_PING_CONNECT_TIMEOUT = float(os.getenv("FLASK_PING_CONNECT_TIMEOUT", "1.5"))
+_PING_READ_TIMEOUT = float(os.getenv("FLASK_PING_READ_TIMEOUT", "5"))
 _cached_url: str | None = None
 _cached_until = 0.0
 
@@ -47,13 +54,51 @@ def _local_pcfixe_mode() -> bool:
     return "PCFIXE" in hostname
 
 
+def _iter_local_ipv4s() -> set[str]:
+    ips: set[str] = set()
+    try:
+        for item in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = item[4][0]
+            if ip:
+                ips.add(ip)
+    except OSError:
+        pass
+
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("10.0.1.10", 5050))
+            ip = probe.getsockname()[0]
+            if ip:
+                ips.add(ip)
+        finally:
+            probe.close()
+    except OSError:
+        pass
+
+    return ips
+
+
+def _vpn_active() -> bool:
+    forced = os.getenv("OPENVPN_ACTIVE") or os.getenv("VPN_ACTIVE")
+    if forced is not None and forced.strip():
+        return forced.strip().lower() in {"1", "true", "yes", "oui", "on"}
+    return any(ip.startswith("10.0.1.") for ip in _iter_local_ipv4s())
+
+
 def _candidate_urls(extra_candidates: Iterable[str] | None = None) -> list[str]:
     values: list[str] = []
     for key in ("SERVER_URL", "LOCAL_LLM_BASE_URL", "FLASK_SERVER_URL"):
         values.append(os.getenv(key, ""))
     if extra_candidates:
         values.extend(extra_candidates)
-    values.extend(DEFAULT_FLASK_ENDPOINTS)
+    if _vpn_active():
+        _log("VPN OpenVPN actif detecte: endpoint VPN prioritaire")
+        values.append(VPN_FLASK_ENDPOINT)
+        values.extend(LAN_FLASK_ENDPOINTS)
+    else:
+        _log("VPN OpenVPN inactif: endpoints LAN uniquement")
+        values.extend(LAN_FLASK_ENDPOINTS)
 
     allow_loopback = _local_pcfixe_mode()
     seen: set[str] = set()
@@ -70,20 +115,74 @@ def _candidate_urls(extra_candidates: Iterable[str] | None = None) -> list[str]:
     return urls
 
 
-def ping_endpoint(url: str, timeout: float = 1.5) -> bool:
+def _timeout_ms(timeout: float | tuple[float, float], index: int = 1) -> int:
+    if isinstance(timeout, tuple):
+        timeout = timeout[index]
+    return int(float(timeout) * 1000)
+
+
+def _is_connection_refused(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "connection refused" in text or "winerror 10061" in text or "errno 111" in text
+
+
+def ping_endpoint(url: str, timeout: float | tuple[float, float] | None = None) -> bool:
+    return bool(probe_flask_endpoint(url, timeout=timeout).get("ok"))
+
+
+def probe_flask_endpoint(url: str, timeout: float | tuple[float, float] | None = None) -> dict:
     base_url = _normalize_url(url)
     if not base_url:
-        return False
+        return {"url": "", "ok": False, "status": "Non teste", "detail": "URL vide", "elapsed_ms": None}
+    effective_timeout = timeout if timeout is not None else (_PING_CONNECT_TIMEOUT, _PING_READ_TIMEOUT)
+    started = time.monotonic()
+    host = urlparse(base_url).hostname or base_url
     try:
         response = requests.get(
             base_url + "/ping",
             headers={"Connection": "close"},
-            timeout=timeout,
+            timeout=effective_timeout,
         )
-        return bool(response.ok)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        if response.ok:
+            _log(f"{host} repondu en {elapsed_ms} ms")
+            return {
+                "url": base_url,
+                "ok": True,
+                "status": "Disponible",
+                "detail": f"HTTP {response.status_code}",
+                "elapsed_ms": elapsed_ms,
+            }
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            _log(f"{host} HTTPError {response.status_code} apres {elapsed_ms} ms: {exc}")
+        return {
+            "url": base_url,
+            "ok": False,
+            "status": "Indisponible",
+            "detail": f"HTTPError {response.status_code}",
+            "elapsed_ms": elapsed_ms,
+        }
+    except requests.ConnectTimeout as exc:
+        _log(f"{host} ConnectTimeout apres {_timeout_ms(effective_timeout, 0)} ms: {exc}")
+        return {"url": base_url, "ok": False, "status": "Delai depasse", "detail": "ConnectTimeout", "elapsed_ms": _timeout_ms(effective_timeout, 0)}
+    except requests.ReadTimeout as exc:
+        _log(f"{host} ReadTimeout apres {_timeout_ms(effective_timeout)} ms: {exc}")
+        return {"url": base_url, "ok": False, "status": "Delai depasse", "detail": "ReadTimeout", "elapsed_ms": _timeout_ms(effective_timeout)}
+    except requests.ConnectionError as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        kind = "ConnectionRefused" if _is_connection_refused(exc) else "ConnectionError"
+        _log(f"{host} {kind} apres {elapsed_ms} ms: {exc}")
+        return {"url": base_url, "ok": False, "status": "Indisponible", "detail": kind, "elapsed_ms": elapsed_ms}
+    except requests.HTTPError as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        _log(f"{host} HTTPError apres {elapsed_ms} ms: {exc}")
+        return {"url": base_url, "ok": False, "status": "Indisponible", "detail": f"HTTPError: {exc}", "elapsed_ms": elapsed_ms}
     except requests.RequestException as exc:
-        _log(f"ping failed for {base_url}: {exc}")
-        return False
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        _log(f"{host} RequestException apres {elapsed_ms} ms: {exc}")
+        return {"url": base_url, "ok": False, "status": "Indisponible", "detail": f"RequestException: {exc}", "elapsed_ms": elapsed_ms}
 
 
 def invalidate_flask_base_url(url: str | None = None) -> None:
@@ -97,7 +196,7 @@ def resolve_flask_base_url(
     *,
     force_refresh: bool = False,
     extra_candidates: Iterable[str] | None = None,
-    timeout: float = 1.5,
+    timeout: float | tuple[float, float] | None = None,
 ) -> str:
     global _cached_url, _cached_until
     now = time.monotonic()
@@ -112,10 +211,12 @@ def resolve_flask_base_url(
             _log(f"selected Flask endpoint: {url}")
             return url
 
-    fallback = candidates[0] if candidates else DEFAULT_FLASK_ENDPOINTS[0]
+    fallback = candidates[0] if candidates else _normalize_url(os.getenv("SERVER_URL", ""))
+    if not fallback:
+        fallback = VPN_FLASK_ENDPOINT if _vpn_active() else LAN_FLASK_ENDPOINTS[0]
     _cached_url = fallback
     _cached_until = now + min(_CACHE_TTL_SECONDS, 5)
-    _log(f"no endpoint answered /ping; fallback configured endpoint: {fallback}")
+    _log(f"aucun endpoint n'a repondu correctement a /ping; conservation du serveur configure/detecte: {fallback}")
     return fallback
 
 
@@ -123,7 +224,7 @@ def _resolve_next_flask_base_url(
     failed_url: str,
     *,
     extra_candidates: Iterable[str] | None = None,
-    timeout: float = 1.5,
+    timeout: float | tuple[float, float] | None = None,
 ) -> str | None:
     global _cached_url, _cached_until
     for url in _candidate_urls(extra_candidates):

@@ -584,8 +584,8 @@ report_name = f"annotation_photos_{id_affaire}_{id_captation}_V_{ts}.docx"
 # dossier cible canonique BE_Traitement_captations/compte_rendu_LLM
 pcfixe = infos.get("pcfixe", {}) or {}
 root_affaires = str(pcfixe.get("root_affaires") or "").strip()
-if not root_affaires.startswith("\\\\"):
-    root_affaires = r"\\192.168.0.155\Affaires"
+if not root_affaires:
+    root_affaires = r"C:\Affaires"
 
 output_dir = (
     Path(root_affaires)
