@@ -20,8 +20,9 @@ from compat_affaire_captation import normalize_infos_aliases
 from path_migration import migrate_local_user_paths, migrate_photo_dataframe_paths
 
 CANONICAL_UNC_AFFAIRES_ROOT = r"\\192.168.1.20\Affaires"
+PCFIXE_LOCAL_AFFAIRES_ROOT = r"C:\Affaires"
 _AFFAIRES_ROOT_RE = re.compile(
-    r"^(?P<root>(?:[A-Za-z]:|\\\\[^\\]+\\[^\\]+)\\Affaires)(?:\\(?P<suffix>.*))?$",
+    r"^(?P<root>(?:[A-Za-z]:\\Affaires|\\\\[^\\]+\\Affaires))(?:\\(?P<suffix>.*))?$",
     re.IGNORECASE,
 )
 
@@ -91,6 +92,38 @@ def build_canonical_snapshot_paths(id_affaire: str, id_captation: str) -> dict[s
     }
 
 
+def build_pcfixe_snapshot_paths(id_affaire: str, id_captation: str) -> dict[str, Path]:
+    root = Path(PCFIXE_LOCAL_AFFAIRES_ROOT) / str(id_affaire or "").strip()
+    base_cap = root / "AE_Expert_captations" / str(id_captation or "").strip()
+    trans_dir = root / "AF_Expert_ASR" / "transcriptions" / str(id_captation or "").strip()
+    photos_dir = base_cap / "photos"
+    return {
+        "root_affaire": root,
+        "base_cap": base_cap,
+        "photos_dir": photos_dir,
+        "audio_dir": base_cap / "audio",
+        "trans_dir": trans_dir,
+        "infos": trans_dir / "infos_projet.json",
+        "photos_csv": photos_dir / "photos.csv",
+        "photos_batch_csv": photos_dir / "photos_batch.csv",
+        "config_llm": trans_dir / "config_llm.json",
+        "prompt_gpt": trans_dir / "prompt_gpt.json",
+        "prompt_gpt_batch": trans_dir / "prompt_gpt_batch_only.json",
+    }
+
+
+def pcfixe_affaires_path(path_value: str) -> str:
+    raw = str(path_value or "").strip()
+    if not raw:
+        return ""
+    root, suffix = split_affaires_root_and_suffix(raw)
+    if not root:
+        return raw
+    if suffix:
+        return str(Path(PCFIXE_LOCAL_AFFAIRES_ROOT) / Path(suffix))
+    return PCFIXE_LOCAL_AFFAIRES_ROOT
+
+
 def detect_canonical_snapshot(id_affaire: str, id_captation: str) -> dict:
     paths = build_canonical_snapshot_paths(id_affaire, id_captation)
     photos_dir = paths["photos_dir"]
@@ -124,7 +157,26 @@ def load_canonical_snapshot_infos(id_affaire: str, id_captation: str) -> tuple[d
     infos = normalize_infos_aliases(canonicalize_infos_paths(infos))
     infos.setdefault("pcfixe", {})
     if isinstance(infos["pcfixe"], dict):
-        infos["pcfixe"]["root_affaires"] = CANONICAL_UNC_AFFAIRES_ROOT
+        pc_paths = build_pcfixe_snapshot_paths(id_affaire, id_captation)
+        pcfixe = infos["pcfixe"]
+        pcfixe["root_affaires"] = PCFIXE_LOCAL_AFFAIRES_ROOT
+        pcfixe["infos"] = str(pc_paths["infos"])
+        pcfixe["fichier_photos"] = str(pc_paths["photos_csv"])
+        pcfixe["fichier_photos_batch"] = str(pc_paths["photos_batch_csv"])
+        pcfixe["config_llm"] = str(pc_paths["config_llm"])
+        pcfixe["prompt_gpt"] = str(pc_paths["prompt_gpt"])
+        pcfixe["prompt_gpt_batch"] = str(pc_paths["prompt_gpt_batch"])
+        for key in (
+            "fichier_transcription",
+            "fichier_contexte_general",
+            "fichier_audio_source",
+            "audio_compat_source",
+            "fichier_audio",
+            "fichier_audio_compatible",
+        ):
+            value = pcfixe.get(key) or infos.get(key)
+            if value:
+                pcfixe[key] = pcfixe_affaires_path(str(value))
     infos["id_affaire"] = str(id_affaire or "").strip()
     infos["project_id"] = infos["id_affaire"]
     infos["id_captation"] = str(id_captation or "").strip()

@@ -609,7 +609,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
     os.replace(tmp, path)
 
 def _build_pcfixe_paths(id_affaire: str, id_captation: str, root_affaires: str | None = None) -> dict:
-    root = Path(root_affaires or get_canonical_affaires_root()) / id_affaire
+    root = Path(root_affaires or _pcfixe_root_affaires()) / id_affaire
     base_cap = root / "AE_Expert_captations" / id_captation
     trans_dir = root / "AF_Expert_ASR" / "transcriptions" / id_captation
     return {
@@ -617,6 +617,8 @@ def _build_pcfixe_paths(id_affaire: str, id_captation: str, root_affaires: str |
         "photos_dir": base_cap / "photos",
         "audio_dir": base_cap / "audio",
         "trans_dir": trans_dir,
+        "photos_csv": base_cap / "photos" / "photos.csv",
+        "photos_batch_csv": base_cap / "photos" / "photos_batch.csv",
         "config_llm": trans_dir / "config_llm.json",
         "prompt_gpt": trans_dir / "prompt_gpt.json",
         "prompt_gpt_batch": trans_dir / "prompt_gpt_batch_only.json",
@@ -687,6 +689,8 @@ def _build_snapshot_infos(infos: dict, temp: dict, id_affaire: str, id_captation
         snapshot["fichier_photos_batch"] = batch_real
 
     pcfixe = dict(snapshot.get("pcfixe", {}) or {})
+    pcfixe["root_affaires"] = _pcfixe_root_affaires()
+    pcfixe["infos"] = str(paths["infos"])
     if photos_real:
         pcfixe["fichier_photos"] = str(paths["photos_dir"] / Path(photos_real).name)
     if batch_real:
@@ -702,6 +706,8 @@ def _build_snapshot_infos(infos: dict, temp: dict, id_affaire: str, id_captation
     pcfixe["fichier_audio"] = str(paths["audio_dir"] / "audio_compatible.wav")
     pcfixe["fichier_audio_compatible"] = str(paths["audio_dir"] / "audio_compatible.wav")
     pcfixe["config_llm"] = str(paths["config_llm"])
+    pcfixe["prompt_gpt"] = str(paths["prompt_gpt"])
+    pcfixe["prompt_gpt_batch"] = str(paths["prompt_gpt_batch"])
 
     snapshot["pcfixe"] = pcfixe
     return snapshot
@@ -735,9 +741,14 @@ def _publish_snapshot_capture(infos: dict, temp: dict, id_affaire: str, id_capta
 
     # On aligne aussi le bloc pcfixe du snapshot sur la vraie racine cible
     snapshot_infos.setdefault("pcfixe", {})
+    pc_paths = _build_pcfixe_paths(id_affaire, id_captation)
     snapshot_infos["pcfixe"]["root_affaires"] = _pcfixe_root_affaires()
-    snapshot_infos["pcfixe"]["config_llm"] = str(paths["config_llm"])
-    snapshot_infos["pcfixe"]["fichier_photos_batch"] = str(paths["photos_dir"] / "photos_batch.csv")
+    snapshot_infos["pcfixe"]["infos"] = str(pc_paths["infos"])
+    snapshot_infos["pcfixe"]["config_llm"] = str(pc_paths["config_llm"])
+    snapshot_infos["pcfixe"]["prompt_gpt"] = str(pc_paths["prompt_gpt"])
+    snapshot_infos["pcfixe"]["prompt_gpt_batch"] = str(pc_paths["prompt_gpt_batch"])
+    snapshot_infos["pcfixe"]["fichier_photos"] = str(pc_paths["photos_csv"])
+    snapshot_infos["pcfixe"]["fichier_photos_batch"] = str(pc_paths["photos_batch_csv"])
 
     _atomic_write_text(paths["infos"], json.dumps(snapshot_infos, indent=2, ensure_ascii=False))
     _atomic_write_text(paths["config_llm"], (config_dir / "config.json").read_text(encoding="utf-8"))
