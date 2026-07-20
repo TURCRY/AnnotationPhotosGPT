@@ -655,6 +655,7 @@ def _build_spooler_job(record: dict) -> dict:
         "proper_names": str(Path(base_trans_dir) / "proper_names.txt"),
         "expected_csv": record["expected_csv"],
         "model_key": record.get("model_key") or "Voxtral_Mini_3B_Transformers",
+        "diarize": False,
     }
 
 
