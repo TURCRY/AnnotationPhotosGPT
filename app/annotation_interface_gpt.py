@@ -4,6 +4,7 @@ import numpy as np
 import soundfile as sf
 import time
 import os
+import shutil
 from openai import OpenAI
 import json
 from dotenv import load_dotenv
@@ -23,7 +24,7 @@ from PIL import Image
 import math
 import re
 from app.local_llm_client import LocalLLMClient
-from app.server_locator import DEFAULT_FLASK_ENDPOINTS, resolve_flask_base_url
+from app.server_locator import DEFAULT_FLASK_ENDPOINTS, resolve_flask_base_url, _vpn_active
 from app.wol_util import wake_on_lan, wait_for_server, is_server_up
 from utils import charger_transcription_flexible
 import inspect
@@ -35,6 +36,16 @@ import logging
 log = logging.getLogger("dictée_asr")
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG_DIR = _REPO_ROOT / "config"
+_DICTEES_ROOT = _REPO_ROOT / "data" / "dictees"
+_DICTEES_PENDING_DIR = _DICTEES_ROOT / "pending"
+_PCFIXE_AFFAIRES_SMB_ROOTS = (
+    r"\\10.0.1.10\Affaires",
+    r"\\192.168.0.155\Affaires",
+    r"\\192.168.0.120\Affaires",
+)
+_NAS_AFFAIRES_SMB_ROOT = r"\\192.168.1.20\Affaires"
+_PCFIXE_LOCAL_AFFAIRES_ROOT = r"C:\Affaires"
+_DICTEE_SCHEMA_VERSION = 1
 _LOCAL_LLM_BUSY_RESULT = "[LLM local occupe, reessayez dans quelques secondes.]"
 
 
@@ -317,6 +328,470 @@ def _audio_diag_verdict(audio_diag: dict) -> tuple[str, str]:
     return "audio exploitable", "success"
 
 
+def _perf_log(label: str, started_at: float) -> None:
+    print(f"[PERF] {label}: {time.perf_counter() - started_at:.3f}s")
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _safe_id_part(value: str, default: str = "item") -> str:
+    text = str(value or "").strip().replace("\\", "_").replace("/", "_")
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._")
+    return text[:96] or default
+
+
+def _dictation_registry_paths() -> tuple[Path, Path]:
+    _DICTEES_PENDING_DIR.mkdir(parents=True, exist_ok=True)
+    return _DICTEES_ROOT, _DICTEES_PENDING_DIR
+
+
+def _dictation_json_path(dictation_id: str) -> Path:
+    _, pending_dir = _dictation_registry_paths()
+    return pending_dir / f"{_safe_id_part(dictation_id, 'dictee')}.json"
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(str(tmp), str(path))
+
+
+def _load_dictation_record(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_dictation_record(record: dict) -> None:
+    _atomic_write_json(_dictation_json_path(str(record.get("dictation_id") or "")), record)
+
+
+def _iter_dictation_records(status: str | None = None) -> list[tuple[Path, dict]]:
+    _, pending_dir = _dictation_registry_paths()
+    rows: list[tuple[Path, dict]] = []
+    for path in sorted(pending_dir.glob("*.json")):
+        record = _load_dictation_record(path)
+        if not record:
+            continue
+        if status and str(record.get("status") or "").upper() != status.upper():
+            continue
+        rows.append((path, record))
+    return rows
+
+
+def _photo_stable_key(row, ui_index: int | None = None) -> str:
+    photo_rel = _ui_text(row.get("photo_rel_native"))
+    if photo_rel:
+        return photo_rel
+    nom = _ui_text(row.get("nom_fichier_image"))
+    if nom:
+        return nom
+    return f"ui_index:{ui_index}" if ui_index is not None else ""
+
+
+def _load_dictation_spooler_config(infos: dict | None = None) -> dict:
+    cfg = _load_json_file(_CONFIG_DIR / "config.json")
+    project_cfg_path = _resolve_project_config_llm_path(infos)
+    if project_cfg_path:
+        cfg = _deep_merge_dict(cfg, _load_json_file(project_cfg_path))
+    return cfg
+
+
+def _pcfixe_smb_roots_from_infos(pcfixe: dict) -> list[str]:
+    def _dedupe(values: list[str]) -> list[str]:
+        roots: list[str] = []
+        for value in values:
+            root = str(value or "").strip().rstrip("\\/")
+            if root and root.lower() not in {r.lower() for r in roots}:
+                roots.append(root)
+        return roots
+
+    def _is_vpn_root(value: str) -> bool:
+        root = str(value or "").strip().lower()
+        return root.startswith(r"\\10.0.1.")
+
+    def _is_lan_root(value: str) -> bool:
+        root = str(value or "").strip().lower()
+        return root.startswith(r"\\192.168.0.")
+
+    configured = str((pcfixe or {}).get("root_affaires") or "").strip().rstrip("\\/")
+    if configured.lower() == _NAS_AFFAIRES_SMB_ROOT.lower():
+        configured = ""
+
+    if _vpn_active():
+        roots = [r"\\10.0.1.10\Affaires"]
+        if configured and _is_vpn_root(configured):
+            roots.append(configured)
+        return _dedupe(roots[:2])
+
+    roots = []
+    if configured and _is_lan_root(configured):
+        roots.append(configured)
+    roots.extend([r"\\192.168.0.155\Affaires", r"\\192.168.0.120\Affaires"])
+    return _dedupe(roots)[:2]
+
+
+def _server_affaires_path(*parts: str) -> str:
+    suffix = "\\".join(str(p).strip("\\/") for p in parts if str(p or "").strip("\\/"))
+    return _PCFIXE_LOCAL_AFFAIRES_ROOT + ("\\" + suffix if suffix else "")
+
+
+def _server_affaires_suffix(path_value: str) -> str:
+    raw = str(path_value or "").strip().replace("/", "\\")
+    prefix = _PCFIXE_LOCAL_AFFAIRES_ROOT.lower()
+    if raw.lower() == prefix:
+        return ""
+    if raw.lower().startswith(prefix + "\\"):
+        return raw[len(_PCFIXE_LOCAL_AFFAIRES_ROOT) :].strip("\\")
+    raise RuntimeError(f"Chemin hors C:\\Affaires: {path_value}")
+
+
+def _smb_path_for_server_path(smb_root: str, server_path: str) -> Path:
+    suffix = _server_affaires_suffix(server_path)
+    return Path(str(smb_root).rstrip("\\/")) / Path(suffix)
+
+
+def _first_available_pcfixe_smb_root(pcfixe: dict) -> str:
+    for root in _pcfixe_smb_roots_from_infos(pcfixe):
+        try:
+            if Path(root).exists():
+                return root
+        except Exception:
+            continue
+    return ""
+
+
+def _expected_csv_read_candidates(record: dict) -> list[Path]:
+    expected = str(record.get("expected_csv") or "").strip()
+    candidates: list[Path] = []
+    if expected:
+        roots = []
+        submitted_root = str(record.get("submitted_smb_root") or "").strip()
+        if submitted_root:
+            roots.append(submitted_root)
+        for root in _PCFIXE_AFFAIRES_SMB_ROOTS:
+            if root.lower() not in {r.lower() for r in roots}:
+                roots.append(root)
+        for root in roots:
+            try:
+                candidates.append(_smb_path_for_server_path(root, expected))
+            except Exception:
+                pass
+        candidates.append(Path(expected))
+        try:
+            candidates.append(_smb_path_for_server_path(_NAS_AFFAIRES_SMB_ROOT, expected))
+        except Exception:
+            pass
+    return candidates
+
+
+def _persist_local_dictation(
+    *,
+    audio_bytes: bytes,
+    audio_diag: dict,
+    row,
+    ui_index: int,
+    infos: dict,
+    pcfixe: dict,
+    model_key: str,
+) -> dict:
+    started = time.perf_counter()
+    id_affaire, id_captation, _ = extract_affaire_captation(pcfixe)
+    photo_rel_native = _ui_text(row.get("photo_rel_native"))
+    nom_fichier_image = _ui_text(row.get("nom_fichier_image"))
+    photo_key = _photo_stable_key(row, ui_index)
+    dictation_id = "dictee_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + "_" + uuid.uuid4().hex[:8]
+    wav_name = f"{dictation_id}.wav"
+    server_audio_path = _server_affaires_path(
+        id_affaire,
+        "AF_Expert_ASR",
+        "transcriptions",
+        id_captation,
+        "asr_in",
+        wav_name,
+    )
+    local_wav_path = Path(server_audio_path)
+    local_wav_path.parent.mkdir(parents=True, exist_ok=True)
+    local_wav_path.write_bytes(audio_bytes)
+
+    server_out_dir = _server_affaires_path(
+        id_affaire,
+        "AF_Expert_ASR",
+        "transcriptions",
+        id_captation,
+        "asr_out",
+    )
+    expected_csv, photo_csv = _dictation_csv_candidates(server_audio_path, server_out_dir)
+    record = {
+        "schema_version": _DICTEE_SCHEMA_VERSION,
+        "dictation_id": dictation_id,
+        "created_at": _now_iso(),
+        "id_affaire": id_affaire,
+        "id_captation": id_captation,
+        "photo_key": photo_key,
+        "photo_rel_native": photo_rel_native,
+        "nom_fichier_image": nom_fichier_image,
+        "ui_index": int(ui_index),
+        "local_wav_path": str(local_wav_path),
+        "duration_s": float(audio_diag.get("duration_s") or 0.0),
+        "status": "LOCAL_PENDING",
+        "server_audio_path": server_audio_path,
+        "expected_csv": str(expected_csv),
+        "expected_photo_csv": str(photo_csv),
+        "spooler_job_id": dictation_id,
+        "submitted_at": "",
+        "completed_at": "",
+        "error": "",
+        "model_key": model_key,
+        "audio_sha256": hashlib.sha256(audio_bytes).hexdigest(),
+        "audio_size": len(audio_bytes),
+    }
+    _save_dictation_record(record)
+    print(f"[DICTEE] persisted_local id={dictation_id} wav={local_wav_path}")
+    _perf_log("dictee_persist_local", started)
+    return record
+
+
+def _mark_current_dictation_error(photos_df: pd.DataFrame, photos_csv: str, ui_index: int, exc: Exception) -> None:
+    err_text = str(exc)
+    photos_df.at[ui_index, "dictee_asr_status"] = (
+        "ERR_SILENT_AUDIO" if "silencieux ou inexploitable" in err_text else "ERR"
+    )
+    photos_df.at[ui_index, "dictee_asr_error"] = err_text
+    photos_df.at[ui_index, "dictee_asr_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+
+
+def _persist_current_micro_dictation(
+    *,
+    audio_in,
+    row,
+    ui_index: int,
+    infos: dict,
+    photos_df: pd.DataFrame,
+    photos_csv: str,
+    mic_nonce_key: str,
+    saved_audio_sha_key: str,
+) -> tuple[dict | None, bool, bool]:
+    if audio_in is None:
+        return None, False, False
+
+    audio_bytes = audio_in.getvalue()
+    audio_sha = hashlib.sha256(audio_bytes).hexdigest()
+    if st.session_state.get(saved_audio_sha_key) == audio_sha:
+        return None, False, False
+
+    audio_diag = _analyze_audio_bytes(audio_bytes)
+    log.info(
+        "[ASR][DICTEE] sr=%sHz channels=%s frames=%s duration=%.3fs rms=%.8f peak=%.8f silent=%s",
+        audio_diag["sample_rate"],
+        audio_diag["channels"],
+        audio_diag["frames"],
+        audio_diag["duration_s"],
+        audio_diag["rms"],
+        audio_diag["peak"],
+        audio_diag["is_effectively_silent"],
+    )
+    if audio_diag["is_effectively_silent"]:
+        raise RuntimeError(
+            "Audio dicté silencieux ou inexploitable. Vérifiez le micro, le niveau d'entrée et réessayez."
+        )
+    if float(audio_diag.get("duration_s") or 0.0) < 0.5:
+        raise RuntimeError("Audio dicte trop court (< 0,5 s).")
+
+    _, pcfixe = _require_server_project_context(infos)
+    appcfg = _load_dictation_spooler_config(infos)
+    model_key = str(appcfg.get("dictation_asr_model") or _resolve_local_asr_model_key(appcfg)).strip()
+    record = _persist_local_dictation(
+        audio_bytes=audio_bytes,
+        audio_diag=audio_diag,
+        row=row,
+        ui_index=ui_index,
+        infos=infos,
+        pcfixe=pcfixe,
+        model_key=model_key,
+    )
+    submitted = _submit_dictation_to_pcfixe(record, pcfixe)
+    existing_dictee_text = _ui_text(photos_df.at[ui_index, "dictee_asr_text"])
+    photos_df.at[ui_index, "dictee_audio_path_pcfixe"] = record.get("server_audio_path", "")
+    photos_df.at[ui_index, "dictee_asr_status"] = (
+        "OK" if existing_dictee_text else ("SUBMITTED" if submitted else "LOCAL_PENDING")
+    )
+    photos_df.at[ui_index, "dictee_asr_error"] = ""
+    photos_df.at[ui_index, "dictee_asr_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    photos_df.at[ui_index, "dictee_asr_csv_path_pcfixe"] = record.get("expected_csv", "")
+    photos_df.at[ui_index, "dictee_asr_photo_csv_path_pcfixe"] = record.get("expected_photo_csv", "")
+    photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+    st.session_state[saved_audio_sha_key] = audio_sha
+    st.session_state[mic_nonce_key] = int(st.session_state.get(mic_nonce_key, 0)) + 1
+    return record, submitted, True
+
+
+def _build_spooler_job(record: dict) -> dict:
+    base_trans_dir = _server_affaires_path(
+        record.get("id_affaire", ""),
+        "AF_Expert_ASR",
+        "transcriptions",
+        record.get("id_captation", ""),
+    )
+    return {
+        "job_id": record["spooler_job_id"],
+        "type": "asr_voxtral",
+        "affaire": record["id_affaire"],
+        "captation": record["id_captation"],
+        "audio_path": record["server_audio_path"],
+        "output_dir": _server_affaires_path(
+            record.get("id_affaire", ""),
+            "AF_Expert_ASR",
+            "transcriptions",
+            record.get("id_captation", ""),
+            "asr_out",
+        ),
+        "proper_names": str(Path(base_trans_dir) / "proper_names.txt"),
+        "expected_csv": record["expected_csv"],
+        "model_key": record.get("model_key") or "Voxtral_Mini_3B_Transformers",
+    }
+
+
+def _submit_dictation_to_pcfixe(record: dict, pcfixe: dict) -> bool:
+    started = time.perf_counter()
+    root = _first_available_pcfixe_smb_root(pcfixe)
+    if not root:
+        record["status"] = "LOCAL_PENDING"
+        record["error"] = "PC fixe SMB indisponible"
+        _save_dictation_record(record)
+        print(f"[DICTEE] pcfixe_unavailable id={record.get('dictation_id')}")
+        _perf_log("dictee_submit_pcfixe", started)
+        return False
+
+    try:
+        local_wav = Path(str(record.get("local_wav_path") or ""))
+        if not local_wav.exists():
+            raise RuntimeError(f"WAV local introuvable: {local_wav}")
+
+        wav_dest = _smb_path_for_server_path(root, record["server_audio_path"])
+        wav_dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(local_wav), str(wav_dest))
+        if not wav_dest.exists() or wav_dest.stat().st_size != local_wav.stat().st_size:
+            raise RuntimeError(f"Verification copie WAV echouee: {wav_dest}")
+        print(f"[DICTEE] wav_copied id={record.get('dictation_id')} dest={wav_dest}")
+
+        job = _build_spooler_job(record)
+        queued_dir = Path(str(root).rstrip("\\/")) / "_jobs" / "queued"
+        queued_dir.mkdir(parents=True, exist_ok=True)
+        final_job = queued_dir / f"{record['spooler_job_id']}.json"
+        tmp_job = queued_dir / f"{record['spooler_job_id']}.json.tmp"
+        tmp_job.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(str(tmp_job), str(final_job))
+
+        record["status"] = "SUBMITTED"
+        record["submitted_at"] = _now_iso()
+        record["submitted_smb_root"] = root
+        record["error"] = ""
+        _save_dictation_record(record)
+        print(f"[DICTEE] job_submitted id={record.get('dictation_id')} job={final_job}")
+        _perf_log("dictee_submit_pcfixe", started)
+        return True
+    except Exception as exc:
+        record["status"] = "LOCAL_PENDING"
+        record["error"] = str(exc)
+        _save_dictation_record(record)
+        print(f"[DICTEE] pcfixe_unavailable id={record.get('dictation_id')} error={exc}")
+        _perf_log("dictee_submit_pcfixe", started)
+        return False
+
+
+def _append_dictee_text_to_photo(
+    *,
+    photos_df: pd.DataFrame,
+    photos_csv: str,
+    record: dict,
+    text: str,
+) -> bool:
+    photo_rel = _ui_text(record.get("photo_rel_native"))
+    nom = _ui_text(record.get("nom_fichier_image"))
+    target_idx = None
+    if photo_rel and "photo_rel_native" in photos_df.columns:
+        matches = photos_df.index[photos_df["photo_rel_native"].astype(str).str.strip() == photo_rel].tolist()
+        if matches:
+            target_idx = matches[0]
+    if target_idx is None and nom and "nom_fichier_image" in photos_df.columns:
+        matches = photos_df.index[photos_df["nom_fichier_image"].astype(str).str.strip() == nom].tolist()
+        if matches:
+            target_idx = matches[0]
+    if target_idx is None:
+        record["error"] = f"Photo introuvable pour photo_rel_native={photo_rel!r} nom={nom!r}"
+        _save_dictation_record(record)
+        return False
+
+    previous = _ui_text(photos_df.at[target_idx, "dictee_asr_text"] if "dictee_asr_text" in photos_df.columns else "")
+    aggregated = previous + ("\n\n" if previous else "") + text.strip()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    photos_df.at[target_idx, "dictee_asr_text"] = aggregated
+    photos_df.at[target_idx, "dictee_asr_status"] = "OK"
+    photos_df.at[target_idx, "dictee_asr_ts"] = now
+    photos_df.at[target_idx, "dictee_asr_error"] = ""
+    photos_df.at[target_idx, "dictee_audio_path_pcfixe"] = record.get("server_audio_path", "")
+    photos_df.at[target_idx, "dictee_asr_csv_path_pcfixe"] = record.get("expected_csv", "")
+    photos_df.at[target_idx, "dictee_asr_photo_csv_path_pcfixe"] = record.get("expected_photo_csv", "")
+    photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+    st.session_state[f"dictee_{int(target_idx)}"] = aggregated
+    return True
+
+
+def _submit_local_pending_dictees(infos: dict) -> tuple[int, int]:
+    _, pcfixe = _require_server_project_context(infos)
+    submitted = 0
+    remaining = 0
+    for _, record in _iter_dictation_records("LOCAL_PENDING"):
+        if _submit_dictation_to_pcfixe(record, pcfixe):
+            submitted += 1
+        else:
+            remaining += 1
+    return submitted, remaining
+
+
+def _refresh_submitted_local_dictees(
+    *,
+    photos_df: pd.DataFrame,
+    photos_csv: str,
+) -> tuple[int, int]:
+    completed = 0
+    still_pending = 0
+    for _, record in _iter_dictation_records("SUBMITTED"):
+        csv_path = next((p for p in _expected_csv_read_candidates(record) if p.exists()), None)
+        if not csv_path:
+            still_pending += 1
+            continue
+        text = _read_dictee_text_from_csv(str(csv_path))
+        if not text:
+            record["status"] = "FAILED"
+            record["error"] = f"CSV present mais texte vide: {csv_path}"
+            _save_dictation_record(record)
+            continue
+        if _append_dictee_text_to_photo(
+            photos_df=photos_df,
+            photos_csv=photos_csv,
+            record=record,
+            text=text,
+        ):
+            record["status"] = "COMPLETED"
+            record["completed_at"] = _now_iso()
+            record["error"] = ""
+            _save_dictation_record(record)
+            completed += 1
+            print(f"[DICTEE] completed id={record.get('dictation_id')} csv={csv_path}")
+        else:
+            record["status"] = "FAILED"
+            _save_dictation_record(record)
+    return completed, still_pending
+
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
@@ -553,7 +1028,7 @@ def _refresh_pending_dictee(
 
 
 def _is_dictee_pending(value) -> bool:
-    return _ui_text(value).upper() in {"PENDING", "TODO", "BUSY"}
+    return _ui_text(value).upper() in {"PENDING", "TODO", "BUSY", "LOCAL_PENDING", "SUBMITTED"}
 
 
 def _refresh_all_pending_dictees(
@@ -596,6 +1071,26 @@ def _next_actionable_photo_index(
         if nom_image in annoted_names:
             continue
         if _is_dictee_pending(row.get("dictee_asr_status")):
+            continue
+        return idx
+    return None
+
+
+def _next_non_validated_photo_index(
+    photos_df: pd.DataFrame,
+    annoted_names: set[str],
+    *,
+    start_after: int | None = None,
+) -> int | None:
+    total = len(photos_df)
+    if total <= 0:
+        return None
+
+    start_idx = 0 if start_after is None else max(0, int(start_after) + 1)
+    for idx in range(start_idx, total):
+        row = photos_df.iloc[idx]
+        nom_image = str(row.get("nom_fichier_image") or "").strip()
+        if nom_image in annoted_names:
             continue
         return idx
     return None
@@ -1912,11 +2407,21 @@ def show_annotation_interface():
         key="edit_mode",
     )
 
-    _refresh_all_pending_dictees(
-        photos_df,
-        photos_csv=photos_csv,
-        infos=infos,
-    )
+    col_dictee_submit, col_dictee_refresh = st.columns(2)
+    with col_dictee_submit:
+        if st.button("Soumettre les dictées locales en attente", key="submit_local_dictees"):
+            try:
+                submitted, remaining = _submit_local_pending_dictees(infos)
+                st.success(f"{submitted} dictée(s) soumise(s) ; {remaining} reste(nt) en attente.")
+            except Exception as exc:
+                st.error(f"Soumission des dictées locales impossible : {exc}")
+    with col_dictee_refresh:
+        if st.button("Rafraîchir les transcriptions", key="refresh_local_dictees"):
+            completed, still_pending = _refresh_submitted_local_dictees(
+                photos_df=photos_df,
+                photos_csv=photos_csv,
+            )
+            st.success(f"{completed} transcription(s) complétée(s) ; {still_pending} encore en attente.")
 
     # --- Déterminer la première photo non annotée ---
     annoted_names = set(annotations_df["nom_fichier_image"].astype(str))
@@ -2828,23 +3333,20 @@ def show_annotation_interface():
                             st.warning("⛔ Aucun texte utilisable pour le commentaire (extrait vide).")
 
                     # --- Dictée micro : ASR -> aide libellé/commentaire ---
+                    dictation_nav_feedback = _ui_text(st.session_state.pop("dictation_nav_feedback", ""))
+                    if dictation_nav_feedback:
+                        st.success(dictation_nav_feedback)
+
                     dictee_expanded = _is_dictee_pending(row.get("dictee_asr_status")) or (
                         _ui_text(st.session_state.get(f"dictee_feedback_{i}")) == "pending"
                     )
                     with st.expander("🎙️ Dictée micro → proposer libellé & commentaire", expanded=dictee_expanded):
-                        refreshed_status, refreshed_text, refreshed_csv_path, refreshed_photo_csv_path = _refresh_pending_dictee(
-                            i,
-                            row,
-                            photos_df=photos_df,
-                            photos_csv=photos_csv,
-                            infos=infos,
-                        )
-                        persisted_dictee_text = _ui_text(refreshed_text or row.get("dictee_asr_text"))
-                        persisted_dictee_status = _ui_text(refreshed_status or row.get("dictee_asr_status"))
+                        persisted_dictee_text = _ui_text(row.get("dictee_asr_text"))
+                        persisted_dictee_status = _ui_text(row.get("dictee_asr_status"))
                         persisted_dictee_ts = _ui_text(row.get("dictee_asr_ts"))
                         persisted_audio_path = _ui_text(row.get("dictee_audio_path_pcfixe"))
-                        persisted_dictee_csv_path = _ui_text(refreshed_csv_path or row.get("dictee_asr_csv_path_pcfixe"))
-                        persisted_dictee_photo_csv_path = _ui_text(refreshed_photo_csv_path or row.get("dictee_asr_photo_csv_path_pcfixe"))
+                        persisted_dictee_csv_path = _ui_text(row.get("dictee_asr_csv_path_pcfixe"))
+                        persisted_dictee_photo_csv_path = _ui_text(row.get("dictee_asr_photo_csv_path_pcfixe"))
                         has_persisted_audio = bool(persisted_audio_path)
                         has_persisted_text = bool(persisted_dictee_text)
 
@@ -2855,12 +3357,12 @@ def show_annotation_interface():
                         has_current_dictee_text = bool(current_dictee_text)
 
                         dictee_feedback = _ui_text(st.session_state.pop(f"dictee_feedback_{i}", ""))
-                        if dictee_feedback == "success":
+                        if dictee_feedback == "submitted":
+                            st.success("✓ Dictée enregistrée — transcription en attente")
+                        elif dictee_feedback == "local_pending":
+                            st.success("✓ Dictée enregistrée localement — en attente de soumission")
+                        elif dictee_feedback == "success":
                             st.success("Dictée transcrite.")
-                        elif dictee_feedback == "pending":
-                            st.info("⏳ Dictée envoyée au serveur. La transcription sera rechargée automatiquement dès qu'elle sera disponible.")
-                        elif dictee_feedback == "busy":
-                            st.warning("ASR occupé : la dictée est conservée et sera reprise par le batch.")
                         elif dictee_feedback == "empty":
                             st.warning("Dictee traitee, mais aucun texte ASR n'a ete renvoye.")
 
@@ -2877,8 +3379,8 @@ def show_annotation_interface():
                             st.caption("Derniere dictee connue : " + " | ".join(meta))
 
                         st.text_area("Texte dicté (ASR)", value=current_dictee_text, height=120, disabled=True)
-                        if persisted_dictee_status == "PENDING":
-                            st.info("⏳ Transcription en cours (serveur). Vous pouvez passer à une autre photo et revenir plus tard.")
+                        if persisted_dictee_status in {"LOCAL_PENDING", "SUBMITTED", "PENDING"}:
+                            st.info("⏳ Dictée enregistrée. Utilisez les boutons globaux pour soumettre ou rafraîchir les transcriptions.")
                         elif persisted_dictee_status == "BUSY":
                             st.warning("ASR occupé : la dictée est conservée et sera reprise par le batch.")
                         elif persisted_dictee_status == "OK" and has_current_dictee_text:
@@ -2893,25 +3395,14 @@ def show_annotation_interface():
                         else:
                             st.caption("Aucune dictée exploitable n'est actuellement disponible.")
 
-                        next_actionable_idx = _next_actionable_photo_index(
-                            photos_df,
-                            annoted_names,
-                            start_after=i,
+                        photo_key_for_widget = _safe_id_part(_photo_stable_key(row, i), f"photo_{i}")
+                        mic_nonce_key = f"mic_nonce_{photo_key_for_widget}"
+                        saved_audio_sha_key = f"mic_saved_sha_{photo_key_for_widget}"
+                        st.session_state.setdefault(mic_nonce_key, 0)
+                        audio_in = st.audio_input(
+                            "Enregistrer (micro)",
+                            key=f"mic_{photo_key_for_widget}_{st.session_state[mic_nonce_key]}",
                         )
-                        if edit_mode == "Séquentiel (sécurisé)" and persisted_dictee_status == "PENDING":
-                            if st.button(
-                                "➡️ Passer à la photo suivante (ASR en cours)",
-                                key=f"skip_pending_{i}",
-                                disabled=next_actionable_idx is None,
-                                help="La photo courante reste en attente de transcription côté serveur. Vous pourrez y revenir plus tard pour récupérer le texte.",
-                            ):
-                                if next_actionable_idx is not None:
-                                    st.session_state["seq_override_index"] = int(next_actionable_idx)
-                                    st.rerun()
-                            if next_actionable_idx is None:
-                                st.caption("Aucune autre photo actionnable n'est disponible pour l'instant. Revenez plus tard dès qu'une transcription sera terminée.")
-
-                        audio_in = st.audio_input("Enregistrer (micro)", key=f"mic_{i}")
                         has_new_audio = audio_in is not None
                         live_audio_diag = None
                         live_audio_diag_error = ""
@@ -2945,7 +3436,45 @@ def show_annotation_interface():
                                     "testez un autre périphérique d'entrée et fermez les autres applications "
                                     "susceptibles de monopoliser le micro."
                                 )
-                        st.caption("Le bouton ci-dessous sert uniquement à transcrire un nouvel enregistrement micro. Le texte affiché ci-dessus, s'il existe, est déjà réutilisé automatiquement par les boutons GPT de libellé/commentaire.")
+                        next_non_validated_idx = _next_non_validated_photo_index(
+                            photos_df,
+                            annoted_names,
+                            start_after=i,
+                        )
+                        if edit_mode == "Séquentiel (sécurisé)":
+                            if st.button(
+                                "➡️ Passer à la photo suivante",
+                                key=f"seq_next_non_validating_{i}",
+                                disabled=next_non_validated_idx is None,
+                                help="Navigue sans valider la photo courante et sans attendre l'ASR.",
+                            ):
+                                if next_non_validated_idx is not None:
+                                    try:
+                                        _record, _submitted, persisted_now = _persist_current_micro_dictation(
+                                            audio_in=audio_in,
+                                            row=row,
+                                            ui_index=i,
+                                            infos=infos,
+                                            photos_df=photos_df,
+                                            photos_csv=photos_csv,
+                                            mic_nonce_key=mic_nonce_key,
+                                            saved_audio_sha_key=saved_audio_sha_key,
+                                        )
+                                        if persisted_now:
+                                            st.session_state["dictation_nav_feedback"] = (
+                                                "✓ Dictée de la photo précédente enregistrée"
+                                            )
+                                        st.session_state["seq_override_index"] = int(next_non_validated_idx)
+                                        st.rerun()
+                                    except Exception as e:
+                                        _mark_current_dictation_error(photos_df, photos_csv, i, e)
+                                        st.error(f"Dictée non enregistrée : {e}")
+                                        st.info(
+                                            "La photo courante reste affichée pour éviter de perdre une dictée non sauvegardée."
+                                        )
+                            if next_non_validated_idx is None:
+                                st.caption("Aucune autre photo non validée.")
+                        st.caption("Le bouton ci-dessous enregistre la dictée et tente une soumission courte au spooler PC fixe. Aucune transcription Voxtral n'est attendue dans l'interface.")
                         try:
                             project_id, _pcfixe_preview = _require_server_project_context(infos)
                         except Exception as e:
@@ -2954,10 +3483,10 @@ def show_annotation_interface():
 
                         if project_id:
                             if st.button(
-                                "🪄 Transcrire cet enregistrement et l'ajouter aux prompts GPT",
+                                "Enregistrer cette dictée",
                                 key=f"mic_go_{i}",
                                 disabled=not has_new_audio,
-                                help="Enregistrez d'abord un nouvel audio micro pour lancer une nouvelle transcription.",
+                                help="Enregistrez d'abord un nouvel audio micro.",
                             ):
                                 try:
                                     if audio_in is None:
@@ -2968,193 +3497,23 @@ def show_annotation_interface():
                                         else:
                                             st.warning("Aucune dictée exploitable n'est actuellement disponible.")
                                     else:
-                                        audio_bytes = audio_in.getvalue()
-                                        audio_diag = _analyze_audio_bytes(audio_bytes)
-                                        log.info(
-                                            "[ASR][DICTEE] sr=%sHz channels=%s frames=%s duration=%.3fs rms=%.8f peak=%.8f silent=%s",
-                                            audio_diag["sample_rate"],
-                                            audio_diag["channels"],
-                                            audio_diag["frames"],
-                                            audio_diag["duration_s"],
-                                            audio_diag["rms"],
-                                            audio_diag["peak"],
-                                            audio_diag["is_effectively_silent"],
-                                        )
-                                        if audio_diag["is_effectively_silent"]:
-                                            raise RuntimeError(
-                                                "Audio dicté silencieux ou inexploitable. Vérifiez le micro, le niveau d'entrée et réessayez."
-                                            )
-                                        fname = f"mic_{uuid.uuid4().hex}.wav"
-
-                                        appcfg = _load_app_config(infos)
-                                        local_cfg = appcfg.get("local_llm", {}) or {}
-                                        client = LocalLLMClient(
-                                            base_url=(local_cfg.get("base_url") or resolve_flask_base_url()),
-                                            api_key=(local_cfg.get("api_key") or ""),
-                                            timeout=float(local_cfg.get("timeout") or 30),
+                                        _record, submitted, _persisted_now = _persist_current_micro_dictation(
+                                            audio_in=audio_in,
+                                            row=row,
+                                            ui_index=i,
+                                            infos=infos,
+                                            photos_df=photos_df,
+                                            photos_csv=photos_csv,
+                                            mic_nonce_key=mic_nonce_key,
+                                            saved_audio_sha_key=saved_audio_sha_key,
                                         )
 
-                                        asr_backend = str(appcfg.get("asr_backend", "local")).lower().strip()
-
-                                        audio_path_server = None
-                                        texte_dictee = ""
-
-                                        if asr_backend == "local":
-                                            project_id, pcfixe = _require_server_project_context(infos)
-                                            dictation_duration_s = float(audio_diag.get("duration_s") or 0.0)
-                                            dictation_asr_options = _build_dictation_local_asr_options(
-                                                appcfg,
-                                                dictation_duration_s,
-                                            )
-
-                                            # (A) sous-répertoire relatif sous la racine canonique Affaires pour /files
-                                            #     area="asr_in" pointe déjà vers le dossier asr_in ;
-                                            #     subdir ne doit donc PAS le rajouter une seconde fois.
-                                            subdir_base = compute_asr_subdir_from_pcfixe(pcfixe)
-                                            if not subdir_base:
-                                                raise RuntimeError(
-                                                    "Sous-repertoire ASR serveur vide : upload /files annule."
-                                                )
-                                            subdir_in = subdir_base
-
-                                            # (B) chemin ABSOLU côté PC fixe pour la sortie CSV
-                                            out_dir_abs = compute_asr_out_dir_from_pcfixe(pcfixe)
-                                            if not os.path.isabs(out_dir_abs):
-                                                raise RuntimeError(
-                                                    "Chemin de sortie ASR non absolu : appel /asr_voxtral annule."
-                                                )
-
-                                            # 1) Upload wav -> asr_in (PC fixe)
-                                            audio_path_server = client.upload_file_bytes(
-                                                file_bytes=audio_bytes,
-                                                filename=fname,
-                                                project_id=project_id,
-                                                area="asr_in",
-                                                overwrite=True,
-                                                subdir=subdir_in,   # ✅ aiguillage
-                                            )
-
-                                            raw_csv_candidate, photo_csv_candidate = _dictation_csv_candidates(audio_path_server, out_dir_abs)
-                                            dictee_csv_path = str(raw_csv_candidate) if raw_csv_candidate else ""
-                                            dictee_photo_csv_path = str(photo_csv_candidate) if photo_csv_candidate else ""
-                                            now_dictee = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                            photos_df.at[i, "dictee_audio_path_pcfixe"] = audio_path_server
-                                            photos_df.at[i, "dictee_asr_text"] = ""
-                                            photos_df.at[i, "dictee_asr_status"] = "PENDING"
-                                            photos_df.at[i, "dictee_asr_error"] = ""
-                                            photos_df.at[i, "dictee_asr_ts"] = now_dictee
-                                            if dictee_csv_path:
-                                                photos_df.at[i, "dictee_asr_csv_path_pcfixe"] = dictee_csv_path
-                                            if dictee_photo_csv_path:
-                                                photos_df.at[i, "dictee_asr_photo_csv_path_pcfixe"] = dictee_photo_csv_path
-                                            photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
-                                            root_in_abs = compute_dictee_target_dir(pcfixe)
-
-                                            _check_under(audio_path_server, root_in_abs, "WAV dictÃ©e (asr_in)")
-
-                                            # 2) ASR -> /asr_voxtral en mode non bloquant + export CSV dans asr_out
-                                            try:
-                                                client.asr_voxtral(
-                                                    audio_path_server,
-                                                    model_key=dictation_asr_options["model_key"],
-                                                    lang="fr",
-                                                    timestamps=True,
-                                                    auto_chunk=dictation_asr_options["auto_chunk"],
-                                                    cpu=dictation_asr_options["cpu"],
-                                                    no4bit=dictation_asr_options["no4bit"],
-                                                    chunk=dictation_asr_options["chunk"],
-                                                    stride=dictation_asr_options["stride"],
-                                                    diarize=False,
-                                                    output_csv_dir=out_dir_abs,     # ASR CSV output on PC fixe
-                                                    export_raw_csv=True,
-                                                    export_photo_csv=True,
-                                                    export_chat_csv=False,
-                                                    export_chat_docx=False,
-                                                    temperature=0.0,
-                                                    top_p=0.9,
-                                                    max_new_tokens=768,
-                                                    batch_size=dictation_asr_options["batch_size"],
-                                                    client_tag=dictation_asr_options["client_tag"],
-                                                    return_payload=False,
-                                                    request_timeout=8,
-                                                    allow_timeout_success=True,
-                                                )
-                                            except Exception as asr_exc:
-                                                err_text = str(asr_exc)
-                                                now_dictee = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                                photos_df.at[i, "dictee_audio_path_pcfixe"] = audio_path_server
-                                                photos_df.at[i, "dictee_asr_ts"] = now_dictee
-                                                if _is_asr_busy_error(asr_exc):
-                                                    photos_df.at[i, "dictee_asr_status"] = "BUSY"
-                                                    photos_df.at[i, "dictee_asr_error"] = "HTTP 409: ASR Voxtral deja en cours"
-                                                    photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
-                                                    st.session_state[f"dictee_{i}"] = ""
-                                                    st.session_state[f"dictee_feedback_{i}"] = "busy"
-                                                    st.session_state["seq_override_index"] = int(i)
-                                                    st.warning("ASR occupé : la dictée est conservée et sera reprise par le batch.")
-                                                    st.rerun()
-                                                photos_df.at[i, "dictee_asr_status"] = "ERR"
-                                                photos_df.at[i, "dictee_asr_error"] = err_text
-                                                photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
-                                                st.error(f"Erreur dictÃ©e/ASR : {asr_exc}")
-                                                st.stop()
-
-                                            texte_dictee = ""
-                                            dictee_csv_path = str(raw_csv_candidate) if raw_csv_candidate else ""
-                                            dictee_photo_csv_path = str(photo_csv_candidate) if photo_csv_candidate else ""
-
-                                            # --- après client.asr_voxtral(..., return_payload=True) ---
-                                            root_in_abs = compute_dictee_target_dir(pcfixe)
-                                            _check_under(audio_path_server, root_in_abs, "WAV dictée (asr_in)")
-                                            if dictee_csv_path and Path(dictee_csv_path).exists():
-                                                _check_under(dictee_csv_path, out_dir_abs, "CSV ASR brut (asr_out)")
-
-                                            if dictee_photo_csv_path and Path(dictee_photo_csv_path).exists():
-                                                _check_under(dictee_photo_csv_path, out_dir_abs, "CSV ASR photo (asr_out)")
-
-                                            # 3) Persist dans le CSV photos (laptop)
-                                            photos_df.at[i, "dictee_audio_path_pcfixe"] = audio_path_server
-                                            photos_df.at[i, "dictee_asr_text"] = texte_dictee
-                                            photos_df.at[i, "dictee_asr_status"] = "PENDING"
-                                            photos_df.at[i, "dictee_asr_error"] = ""
-                                            photos_df.at[i, "dictee_asr_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                                            if dictee_csv_path:
-                                                photos_df.at[i, "dictee_asr_csv_path_pcfixe"] = dictee_csv_path
-                                            if dictee_photo_csv_path:
-                                                photos_df.at[i, "dictee_asr_photo_csv_path_pcfixe"] = dictee_photo_csv_path
-
-
-                                        elif asr_backend == "openai":
-                                            # OpenAI : pas besoin d’upload /files (sauf audit volontaire)
-                                            texte_dictee = asr_dictee(audio_bytes, audio_path_server=None, lang="fr")
-
-                                            photos_df.at[i, "dictee_audio_path_pcfixe"] = ""  # pas d’upload
-                                            photos_df.at[i, "dictee_asr_text"] = texte_dictee
-                                            photos_df.at[i, "dictee_asr_status"] = "OK"
-                                            photos_df.at[i, "dictee_asr_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                                            photos_df.at[i, "dictee_audio_sha256"] = hashlib.sha256(audio_bytes).hexdigest()
-                                            photos_df.at[i, "dictee_audio_size"] = len(audio_bytes)
-
-                                        else:
-                                            raise RuntimeError(f"asr_backend invalide: {asr_backend}")
-
-                                        # Sauvegarde CSV photos + UI
-                                        photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
-
-                                        st.session_state[f"dictee_{i}"] = texte_dictee
-                                        st.session_state[f"dictee_feedback_{i}"] = "pending" if asr_backend == "local" else ("success" if texte_dictee else "empty")
-                                        if asr_backend == "local":
-                                            st.session_state["seq_override_index"] = int(i)
+                                        st.session_state[f"dictee_feedback_{i}"] = "submitted" if submitted else "local_pending"
+                                        st.session_state["seq_override_index"] = int(i)
                                         st.rerun()
 
                                 except Exception as e:
-                                    err_text = str(e)
-                                    photos_df.at[i, "dictee_asr_status"] = "ERR_SILENT_AUDIO" if "silencieux ou inexploitable" in err_text else "ERR"
-                                    photos_df.at[i, "dictee_asr_error"] = err_text
-                                    photos_df.at[i, "dictee_asr_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                    photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+                                    _mark_current_dictation_error(photos_df, photos_csv, i, e)
                                     st.error(f"Erreur dictée/ASR : {e}")
                    
 
@@ -3385,7 +3744,4 @@ def show_annotation_interface():
 #                if st.button("➡️ Passer à la photo suivante"):
 #                    st.session_state["photo_index_actuel"] = i + 1
 #                    st.rerun() 
-#           
-        
-
-            
+#
