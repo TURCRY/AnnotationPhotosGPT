@@ -642,6 +642,9 @@ def _build_spooler_job(record: dict) -> dict:
     return {
         "job_id": record["spooler_job_id"],
         "type": "asr_voxtral",
+        "dictation_id": record["dictation_id"],
+        "photo_rel_native": record["photo_rel_native"],
+        "nom_fichier_image": record.get("nom_fichier_image", ""),
         "affaire": record["id_affaire"],
         "captation": record["id_captation"],
         "audio_path": record["server_audio_path"],
