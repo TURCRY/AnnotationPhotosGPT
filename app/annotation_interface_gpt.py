@@ -32,12 +32,15 @@ import uuid
 import io
 import hashlib
 import logging
+import socket
 
 log = logging.getLogger("dictée_asr")
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG_DIR = _REPO_ROOT / "config"
 _DICTEES_ROOT = _REPO_ROOT / "data" / "dictees"
 _DICTEES_PENDING_DIR = _DICTEES_ROOT / "pending"
+_SYNC_PENDING_DIR = _REPO_ROOT / "data" / "sync_pending"
+_PHOTOS_NAS_PENDING_PATH = _SYNC_PENDING_DIR / "photos_nas_pending.json"
 _PCFIXE_AFFAIRES_SMB_ROOTS = (
     r"\\10.0.1.10\Affaires",
     r"\\192.168.0.155\Affaires",
@@ -47,6 +50,7 @@ _NAS_AFFAIRES_SMB_ROOT = r"\\192.168.1.20\Affaires"
 _PCFIXE_LOCAL_AFFAIRES_ROOT = r"C:\Affaires"
 _DICTEE_SCHEMA_VERSION = 1
 _LOCAL_LLM_BUSY_RESULT = "[LLM local occupe, reessayez dans quelques secondes.]"
+_UNC_PROBE_TIMEOUT_S = 0.6
 
 
 def _load_env_for_runtime_config() -> None:
@@ -441,6 +445,469 @@ def _server_affaires_path(*parts: str) -> str:
     return _PCFIXE_LOCAL_AFFAIRES_ROOT + ("\\" + suffix if suffix else "")
 
 
+def _canonical_laptop_photos_dir(infos: dict) -> Path:
+    id_affaire = _ui_text((infos or {}).get("id_affaire") or (infos or {}).get("project_id"))
+    id_captation = _ui_text((infos or {}).get("id_captation") or (infos or {}).get("captation_id"))
+    if not id_affaire or not id_captation:
+        raise RuntimeError("id_affaire/id_captation absents : miroir C:\\Affaires impossible.")
+    return (
+        Path(_PCFIXE_LOCAL_AFFAIRES_ROOT)
+        / id_affaire
+        / "AE_Expert_captations"
+        / id_captation
+        / "photos"
+    )
+
+
+def _nas_photos_csv_path(infos: dict) -> Path | None:
+    pcfixe = (infos or {}).get("pcfixe") or {}
+    if not isinstance(pcfixe, dict):
+        return None
+    raw = _ui_text(pcfixe.get("fichier_photos"))
+    return Path(raw) if raw else None
+
+
+def _unc_host(path: str | Path) -> str:
+    raw = str(path or "").strip().replace("/", "\\")
+    if not raw.startswith("\\\\"):
+        return ""
+    parts = [p for p in raw.split("\\") if p]
+    return parts[0] if parts else ""
+
+
+def _unc_available(path: str | Path, timeout_s: float = _UNC_PROBE_TIMEOUT_S) -> bool:
+    host = _unc_host(path)
+    if not host:
+        return True
+    try:
+        with socket.create_connection((host, 445), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
+def _atomic_tmp_path(target: Path, suffix: str = ".tmp") -> Path:
+    return target.with_name(f".apg-tmp-{os.getpid()}-{uuid.uuid4().hex}-{target.name}{suffix}")
+
+
+def _atomic_write_dataframe_csv(df: pd.DataFrame, path: str | Path) -> Path:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _atomic_tmp_path(target)
+    try:
+        df.to_csv(tmp, sep=";", encoding="utf-8-sig", index=False)
+        os.replace(str(tmp), str(target))
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+    return target
+
+
+def _atomic_write_dataframe_xlsx(df: pd.DataFrame, path: str | Path) -> Path:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _atomic_tmp_path(target, suffix=".tmp.xlsx")
+    try:
+        df.to_excel(tmp, index=False, engine="openpyxl")
+        os.replace(str(tmp), str(target))
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+    return target
+
+
+def _copy_file_atomic(src: str | Path, dst: str | Path) -> Path:
+    src_path = Path(src)
+    dst_path = Path(dst)
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _atomic_tmp_path(dst_path)
+    try:
+        shutil.copy2(str(src_path), str(tmp))
+        os.replace(str(tmp), str(dst_path))
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+    return dst_path
+
+
+def _atomic_write_json_file(path: str | Path, payload: dict) -> Path:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _atomic_tmp_path(target)
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(str(tmp), str(target))
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+    return target
+
+
+def _sha256_file(path: str | Path) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _photo_rel_at(photos_df: pd.DataFrame, idx: int) -> str:
+    try:
+        if "photo_rel_native" in photos_df.columns:
+            return _ui_text(photos_df.at[idx, "photo_rel_native"])
+    except Exception:
+        pass
+    return ""
+
+
+def _photos_csv_profile(path: str | Path) -> dict:
+    p = Path(path)
+    if not p.exists():
+        return {"path": str(p), "exists": False}
+    profile = {
+        "path": str(p),
+        "exists": True,
+        "sha256": _sha256_file(p),
+        "rows": 0,
+        "dictee_cells": 0,
+        "max_ts": "",
+    }
+    try:
+        df = pd.read_csv(p, sep=";", encoding="utf-8-sig")
+    except Exception as exc:
+        profile["error"] = str(exc)
+        return profile
+    profile["rows"] = int(len(df))
+    dictee_cols = [c for c in df.columns if str(c).startswith("dictee_") or str(c) == "dictation_id"]
+    if dictee_cols:
+        profile["dictee_cells"] = int(
+            df[dictee_cols].fillna("").astype(str).apply(lambda col: col.str.strip().ne("").sum()).sum()
+        )
+    max_values = []
+    for col in ("dictee_asr_ts", "ui_ts"):
+        if col not in df.columns:
+            continue
+        parsed = pd.to_datetime(df[col], errors="coerce")
+        if parsed.notna().any():
+            max_values.append(parsed.max())
+    if max_values:
+        profile["max_ts"] = max(max_values).isoformat(sep=" ", timespec="seconds")
+    return profile
+
+
+def _profile_signature(profile: dict) -> tuple:
+    return (
+        bool(profile.get("exists")),
+        profile.get("sha256", ""),
+        int(profile.get("rows") or 0),
+        int(profile.get("dictee_cells") or 0),
+        profile.get("max_ts", ""),
+    )
+
+
+def _profile_has_business_changes(profile: dict) -> bool:
+    return bool(int(profile.get("dictee_cells") or 0) > 0 or profile.get("max_ts"))
+
+
+def _conflict_backup_path(path: Path, source_name: str, stamp: str) -> Path:
+    return path.with_name(f"{path.name}.sync-conflict-{stamp}-{source_name}.bak")
+
+
+def _create_photos_csv_conflict_backups(profiles: dict) -> list[str]:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backups: list[str] = []
+    for source_name, profile in profiles.items():
+        if not profile.get("exists") or not _profile_has_business_changes(profile):
+            continue
+        src = Path(_ui_text(profile.get("path")))
+        if _unc_host(src) and not _unc_available(src):
+            continue
+        backup = _conflict_backup_path(src, source_name, stamp)
+        shutil.copy2(str(src), str(backup))
+        backups.append(str(backup))
+    return backups
+
+
+def _load_pending_nas_registry() -> dict:
+    if not _PHOTOS_NAS_PENDING_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(_PHOTOS_NAS_PENDING_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("[PHOTOS_SYNC] pending registry unreadable: %s", exc)
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_pending_nas_registry(payload: dict) -> None:
+    _atomic_write_json_file(_PHOTOS_NAS_PENDING_PATH, payload)
+
+
+def _delete_pending_nas_registry() -> None:
+    try:
+        _PHOTOS_NAS_PENDING_PATH.unlink(missing_ok=True)
+    except Exception as exc:
+        log.warning("[PHOTOS_SYNC] pending registry delete failed: %s", exc)
+
+
+def _sync_photos_csv_on_launch(infos: dict, photos_csv: str) -> None:
+    work_csv = Path(str(photos_csv or "").strip())
+    if not str(work_csv).strip():
+        return
+    mirror_csv = _canonical_laptop_photos_dir(infos) / "photos.csv"
+    nas_csv = _nas_photos_csv_path(infos)
+
+    profiles = {
+        "work": _photos_csv_profile(work_csv),
+        "mirror": _photos_csv_profile(mirror_csv),
+    }
+    if nas_csv and _unc_available(nas_csv):
+        profiles["nas"] = _photos_csv_profile(nas_csv)
+    else:
+        profiles["nas"] = {"path": str(nas_csv or ""), "exists": False, "error": "NAS indisponible ou non configure"}
+
+    st.session_state["photos_csv_source_profiles"] = profiles
+    existing = {name: p for name, p in profiles.items() if p.get("exists")}
+    if not existing:
+        return
+
+    work = profiles["work"]
+    if not work.get("exists"):
+        for name in ("nas", "mirror"):
+            candidate = profiles.get(name, {})
+            if candidate.get("exists") and not candidate.get("error"):
+                _copy_file_atomic(candidate["path"], work_csv)
+                st.caption(f"photos.csv retenu depuis {name} : {candidate['path']}")
+                return
+
+    signatures = {name: _profile_signature(p) for name, p in existing.items()}
+    if len(set(signatures.values())) <= 1:
+        return
+
+    comparable = {
+        name: {
+            "path": p.get("path"),
+            "sha256": p.get("sha256"),
+            "rows": p.get("rows"),
+            "dictee_cells": p.get("dictee_cells"),
+            "max_ts": p.get("max_ts"),
+            "error": p.get("error", ""),
+        }
+        for name, p in profiles.items()
+    }
+    changed_sources = [name for name, p in existing.items() if _profile_has_business_changes(p)]
+    if len(changed_sources) >= 2:
+        conflict_signature = json.dumps(comparable, ensure_ascii=False, sort_keys=True)
+        if st.session_state.get("photos_csv_conflict_signature") != conflict_signature:
+            backups = _create_photos_csv_conflict_backups(existing)
+            st.session_state["photos_csv_conflict_signature"] = conflict_signature
+            st.session_state["photos_csv_conflict_backups"] = backups
+            comparable["conflict_backups"] = backups
+        st.session_state["photos_csv_sync_conflict"] = comparable
+    log.warning("[PHOTOS_SYNC] photos.csv divergence on launch: %s", json.dumps(comparable, ensure_ascii=False))
+    st.warning("Conflit photos.csv detecte entre travail, C:\\Affaires et/ou NAS : aucune copie automatique.")
+
+
+def _record_photos_persistence_state(**payload) -> None:
+    state = {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "local_saved": False,
+        "canonical_mirror_saved": False,
+        "nas_saved": False,
+        **payload,
+    }
+    st.session_state["photos_persistence_state"] = state
+    log.info("[PHOTOS_SYNC] %s", json.dumps(state, ensure_ascii=False, sort_keys=True))
+
+
+def _clear_nas_pending() -> None:
+    st.session_state["nas_sync_pending"] = False
+    st.session_state.pop("nas_sync_pending_payload", None)
+    st.session_state["nas_sync_error"] = ""
+    _delete_pending_nas_registry()
+
+
+def _set_nas_pending(payload: dict, error: Exception | str) -> None:
+    previous = _load_pending_nas_registry()
+    previous_attempts = int(previous.get("attempts") or previous.get("tentatives") or 0)
+    payload_attempts = int(payload.get("attempts") or payload.get("tentatives") or 0)
+    attempts = max(previous_attempts, payload_attempts) + 1
+    pending_payload = {
+        "reason": _ui_text(payload.get("reason")) or "photos_csv_sync",
+        "photo_rel_native": _ui_text(payload.get("photo_rel_native")),
+        "work_csv": _ui_text(payload.get("work_csv")),
+        "mirror_csv": _ui_text(payload.get("mirror_csv")),
+        "mirror_xlsx": _ui_text(payload.get("mirror_xlsx")),
+        "nas_csv": _ui_text(payload.get("nas_csv")),
+        "local_hash": _ui_text(payload.get("local_hash")),
+        "mirror_hash": _ui_text(payload.get("mirror_hash")),
+        "last_error": str(error),
+        "derniere_erreur": str(error),
+        "attempts": attempts,
+        "tentatives": attempts,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _write_pending_nas_registry(pending_payload)
+    st.session_state["nas_sync_pending"] = True
+    st.session_state["nas_sync_pending_payload"] = pending_payload
+    st.session_state["nas_sync_error"] = str(error)
+
+
+def _try_copy_to_nas(
+    *,
+    mirror_csv: Path,
+    mirror_xlsx: Path,
+    nas_csv: Path | None,
+    reason: str,
+    photo_rel_native: str,
+) -> dict:
+    result = {
+        "nas_saved": False,
+        "nas_csv": str(nas_csv or ""),
+        "nas_xlsx": "",
+        "nas_hash": "",
+        "nas_xlsx_hash": "",
+        "nas_error": "",
+    }
+    if nas_csv is None:
+        result["nas_error"] = "infos.pcfixe.fichier_photos absent"
+        return result
+    if not _unc_available(nas_csv):
+        result["nas_error"] = f"SMB indisponible ou trop lent ({_UNC_PROBE_TIMEOUT_S:.1f}s): {_unc_host(nas_csv)}"
+        return result
+    try:
+        _copy_file_atomic(mirror_csv, nas_csv)
+        result["nas_hash"] = _sha256_file(nas_csv)
+        if result["nas_hash"] != _sha256_file(mirror_csv):
+            raise RuntimeError(f"Hash different apres copie NAS: {nas_csv}")
+
+        if mirror_xlsx.exists():
+            nas_xlsx = nas_csv.with_suffix(".xlsx")
+            _copy_file_atomic(mirror_xlsx, nas_xlsx)
+            result["nas_xlsx"] = str(nas_xlsx)
+            result["nas_xlsx_hash"] = _sha256_file(nas_xlsx)
+            if result["nas_xlsx_hash"] != _sha256_file(mirror_xlsx):
+                raise RuntimeError(f"Hash different apres copie NAS: {nas_xlsx}")
+        result["nas_saved"] = True
+        _clear_nas_pending()
+        log.info(
+            "[PHOTOS_SYNC] nas_saved reason=%s photo_rel_native=%s nas=%s",
+            reason,
+            photo_rel_native,
+            nas_csv,
+        )
+    except Exception as exc:
+        result["nas_error"] = str(exc)
+    return result
+
+
+def _retry_pending_nas_sync(infos: dict) -> bool:
+    pending = st.session_state.get("nas_sync_pending_payload")
+    if not st.session_state.get("nas_sync_pending") or not isinstance(pending, dict):
+        pending = _load_pending_nas_registry()
+    if not isinstance(pending, dict) or not pending:
+        return False
+    st.session_state["nas_sync_pending"] = True
+    st.session_state["nas_sync_pending_payload"] = pending
+    mirror_csv = Path(_ui_text(pending.get("mirror_csv")))
+    mirror_xlsx_raw = _ui_text(pending.get("mirror_xlsx"))
+    mirror_xlsx = Path(mirror_xlsx_raw) if mirror_xlsx_raw else Path("__photos_xlsx_absent__")
+    nas_csv = Path(_ui_text(pending.get("nas_csv"))) if _ui_text(pending.get("nas_csv")) else _nas_photos_csv_path(infos)
+    if not mirror_csv.exists():
+        _set_nas_pending(pending, f"Miroir introuvable pour reprise NAS: {mirror_csv}")
+        return False
+    result = _try_copy_to_nas(
+        mirror_csv=mirror_csv,
+        mirror_xlsx=mirror_xlsx,
+        nas_csv=nas_csv,
+        reason=_ui_text(pending.get("reason")) or "retry_pending",
+        photo_rel_native=_ui_text(pending.get("photo_rel_native")),
+    )
+    if result["nas_saved"]:
+        return True
+    _set_nas_pending(pending, result["nas_error"])
+    return False
+
+
+def _persist_photos_csv(
+    photos_df: pd.DataFrame,
+    photos_csv: str,
+    infos: dict,
+    *,
+    reason: str = "",
+    photo_rel_native: str = "",
+    maintain_xlsx: bool = True,
+) -> None:
+    _retry_pending_nas_sync(infos)
+    state_payload = {
+        "reason": reason,
+        "photo_rel_native": photo_rel_native,
+        "work_csv": str(photos_csv),
+        "mirror_csv": "",
+        "nas_csv": "",
+        "local_saved": False,
+        "canonical_mirror_saved": False,
+        "nas_saved": False,
+    }
+    work_csv = _atomic_write_dataframe_csv(photos_df, photos_csv)
+    state_payload["work_csv"] = str(work_csv)
+    state_payload["local_saved"] = True
+    state_payload["local_hash"] = _sha256_file(work_csv)
+    st.session_state["canonical_mirror_pending"] = False
+    st.session_state["canonical_mirror_error"] = ""
+
+    work_xlsx = work_csv.with_suffix(".xlsx")
+    if maintain_xlsx:
+        try:
+            _atomic_write_dataframe_xlsx(photos_df, work_xlsx)
+            state_payload["work_xlsx"] = str(work_xlsx)
+            state_payload["local_xlsx_hash"] = _sha256_file(work_xlsx)
+        except Exception as exc:
+            st.warning(f"Recreation photos.xlsx impossible : {exc}")
+
+    try:
+        canonical_dir = _canonical_laptop_photos_dir(infos)
+        mirror_csv = canonical_dir / "photos.csv"
+        state_payload["mirror_csv"] = str(mirror_csv)
+        _copy_file_atomic(work_csv, mirror_csv)
+        mirror_hash = _sha256_file(mirror_csv)
+        state_payload["mirror_hash"] = mirror_hash
+        if state_payload["local_hash"] != mirror_hash:
+            raise RuntimeError(f"Hash different apres copie miroir: {mirror_csv}")
+        state_payload["canonical_mirror_saved"] = True
+
+        mirror_xlsx = canonical_dir / "photos.xlsx"
+        if maintain_xlsx and work_xlsx.exists():
+            _copy_file_atomic(work_xlsx, mirror_xlsx)
+            mirror_xlsx_hash = _sha256_file(mirror_xlsx)
+            state_payload["mirror_xlsx"] = str(mirror_xlsx)
+            state_payload["mirror_xlsx_hash"] = mirror_xlsx_hash
+            if state_payload.get("local_xlsx_hash") != mirror_xlsx_hash:
+                raise RuntimeError(f"Hash different apres copie miroir: {mirror_xlsx}")
+
+        nas_csv = _nas_photos_csv_path(infos)
+        state_payload["nas_csv"] = str(nas_csv or "")
+        nas_result = _try_copy_to_nas(
+            mirror_csv=mirror_csv,
+            mirror_xlsx=mirror_xlsx,
+            nas_csv=nas_csv,
+            reason=reason,
+            photo_rel_native=photo_rel_native,
+        )
+        state_payload.update(nas_result)
+        if nas_result["nas_saved"]:
+            st.session_state["nas_sync_error"] = ""
+        else:
+            _set_nas_pending(state_payload, nas_result["nas_error"])
+            st.warning("Sauvegarde locale effectuée — synchronisation NAS en attente")
+        _record_photos_persistence_state(**state_payload)
+    except Exception as exc:
+        st.session_state["canonical_mirror_pending"] = True
+        st.session_state["canonical_mirror_error"] = str(exc)
+        _record_photos_persistence_state(**{**state_payload, "canonical_mirror_error": str(exc)})
+        st.warning(f"Miroir canonique en attente : {exc}")
+
+
 def _server_affaires_suffix(path_value: str) -> str:
     raw = str(path_value or "").strip().replace("/", "\\")
     prefix = _PCFIXE_LOCAL_AFFAIRES_ROOT.lower()
@@ -557,14 +1024,26 @@ def _persist_local_dictation(
     return record
 
 
-def _mark_current_dictation_error(photos_df: pd.DataFrame, photos_csv: str, ui_index: int, exc: Exception) -> None:
+def _mark_current_dictation_error(
+    photos_df: pd.DataFrame,
+    photos_csv: str,
+    infos: dict,
+    ui_index: int,
+    exc: Exception,
+) -> None:
     err_text = str(exc)
     photos_df.at[ui_index, "dictee_asr_status"] = (
         "ERR_SILENT_AUDIO" if "silencieux ou inexploitable" in err_text else "ERR"
     )
     photos_df.at[ui_index, "dictee_asr_error"] = err_text
     photos_df.at[ui_index, "dictee_asr_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+    _persist_photos_csv(
+        photos_df,
+        photos_csv,
+        infos,
+        reason="dictation_error",
+        photo_rel_native=_photo_rel_at(photos_df, ui_index),
+    )
 
 
 def _persist_current_micro_dictation(
@@ -626,11 +1105,16 @@ def _persist_current_micro_dictation(
     photos_df.at[ui_index, "dictee_asr_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     photos_df.at[ui_index, "dictee_asr_csv_path_pcfixe"] = record.get("expected_csv", "")
     photos_df.at[ui_index, "dictee_asr_photo_csv_path_pcfixe"] = record.get("expected_photo_csv", "")
-    photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+    _persist_photos_csv(
+        photos_df,
+        photos_csv,
+        infos,
+        reason="dictation_persisted",
+        photo_rel_native=_ui_text(record.get("photo_rel_native")),
+    )
     st.session_state[saved_audio_sha_key] = audio_sha
     st.session_state[mic_nonce_key] = int(st.session_state.get(mic_nonce_key, 0)) + 1
     return record, submitted, True
-
 
 def _build_spooler_job(record: dict) -> dict:
     base_trans_dir = _server_affaires_path(
@@ -714,6 +1198,7 @@ def _append_dictee_text_to_photo(
     *,
     photos_df: pd.DataFrame,
     photos_csv: str,
+    infos: dict,
     record: dict,
     text: str,
 ) -> bool:
@@ -743,7 +1228,13 @@ def _append_dictee_text_to_photo(
     photos_df.at[target_idx, "dictee_audio_path_pcfixe"] = record.get("server_audio_path", "")
     photos_df.at[target_idx, "dictee_asr_csv_path_pcfixe"] = record.get("expected_csv", "")
     photos_df.at[target_idx, "dictee_asr_photo_csv_path_pcfixe"] = record.get("expected_photo_csv", "")
-    photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+    _persist_photos_csv(
+        photos_df,
+        photos_csv,
+        infos,
+        reason="dictation_asr_completed",
+        photo_rel_native=photo_rel,
+    )
     st.session_state[f"dictee_{int(target_idx)}"] = aggregated
     return True
 
@@ -764,6 +1255,7 @@ def _refresh_submitted_local_dictees(
     *,
     photos_df: pd.DataFrame,
     photos_csv: str,
+    infos: dict,
 ) -> tuple[int, int]:
     completed = 0
     still_pending = 0
@@ -781,6 +1273,7 @@ def _refresh_submitted_local_dictees(
         if _append_dictee_text_to_photo(
             photos_df=photos_df,
             photos_csv=photos_csv,
+            infos=infos,
             record=record,
             text=text,
         ):
@@ -1012,7 +1505,13 @@ def _refresh_pending_dictee(
             photos_df.at[i, "dictee_asr_csv_path_pcfixe"] = csv_path
         if photo_csv_path:
             photos_df.at[i, "dictee_asr_photo_csv_path_pcfixe"] = photo_csv_path
-        photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+        _persist_photos_csv(
+            photos_df,
+            photos_csv,
+            infos,
+            reason="dictation_pending_refresh_ok",
+            photo_rel_native=_photo_rel_at(photos_df, i),
+        )
         st.session_state[f"dictee_{i}"] = reloaded_text
         return "OK", reloaded_text, csv_path, photo_csv_path
 
@@ -1025,7 +1524,13 @@ def _refresh_pending_dictee(
             photos_df.at[i, "dictee_asr_csv_path_pcfixe"] = csv_path
         if photo_csv_path:
             photos_df.at[i, "dictee_asr_photo_csv_path_pcfixe"] = photo_csv_path
-        photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+        _persist_photos_csv(
+            photos_df,
+            photos_csv,
+            infos,
+            reason="dictation_pending_refresh_err",
+            photo_rel_native=_photo_rel_at(photos_df, i),
+        )
         return "ERR", text, csv_path, photo_csv_path
 
     return status, text, csv_path, photo_csv_path
@@ -1931,7 +2436,21 @@ def build_vlm_context_guided(ctx_general: dict, transcription_extrait: str) -> s
         + "\n".join([f"- {it}" for it in items])
     )
 
-def ensure_desc_vlm(i, row_view, guide_src: str, *, photos_df, photos_csv, mission, context_system, context_user="", vlm_system="", vlm_user="", force: bool = False) -> str:
+def ensure_desc_vlm(
+    i,
+    row_view,
+    guide_src: str,
+    *,
+    photos_df,
+    photos_csv,
+    infos,
+    mission,
+    context_system,
+    context_user="",
+    vlm_system="",
+    vlm_user="",
+    force: bool = False,
+) -> str:
     if not force:
         # 1) priorité absolue : UI explicite
         desc = _ui_text(row_view.get("description_vlm_ui"))
@@ -1963,7 +2482,13 @@ def ensure_desc_vlm(i, row_view, guide_src: str, *, photos_df, photos_csv, missi
         photos_df.at[i, "ui_ts"] = now
         photo_dirty = True
         if photo_dirty:
-            photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+            _persist_photos_csv(
+                photos_df,
+                photos_csv,
+                infos,
+                reason="vlm_image_missing",
+                photo_rel_native=_photo_rel_at(photos_df, i),
+            )
         return ""
 
     ctx_general = {
@@ -1988,7 +2513,13 @@ def ensure_desc_vlm(i, row_view, guide_src: str, *, photos_df, photos_csv, missi
     photos_df.at[i, "vlm_ui_ts"] = now
     photos_df.at[i, "ui_ts"] = now
 
-    photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+    _persist_photos_csv(
+        photos_df,
+        photos_csv,
+        infos,
+        reason="vlm_description",
+        photo_rel_native=_photo_rel_at(photos_df, i),
+    )
 
     return desc_new or ""
 
@@ -2253,7 +2784,15 @@ def show_annotation_interface():
     # ─────────────────────────────────────────────────────────────
     # 🔄 Gestion de session d’annotation : chargement des photos
     # ─────────────────────────────────────────────────────────────
+    _sync_photos_csv_on_launch(infos, photos_csv)
+    _retry_pending_nas_sync(infos)
     photos_df = read_csv_fallback(photos_csv, sep=";")
+    if st.session_state.get("canonical_mirror_pending"):
+        err = _ui_text(st.session_state.get("canonical_mirror_error"))
+        st.warning("Miroir canonique en attente" + (f" : {err}" if err else "."))
+    if st.session_state.get("nas_sync_pending"):
+        err = _ui_text(st.session_state.get("nas_sync_error"))
+        st.warning("Sauvegarde locale effectuée — synchronisation NAS en attente" + (f" : {err}" if err else "."))
     photos_df = _ensure_photo_text_columns(
         photos_df,
         [
@@ -2424,6 +2963,7 @@ def show_annotation_interface():
             completed, still_pending = _refresh_submitted_local_dictees(
                 photos_df=photos_df,
                 photos_csv=photos_csv,
+                infos=infos,
             )
             st.success(f"{completed} transcription(s) complétée(s) ; {still_pending} encore en attente.")
 
@@ -2664,7 +3204,13 @@ def show_annotation_interface():
             st.info("⏳ Photo antérieure au début du fichier audio : pas de lecture possible.")
 
         if photo_dirty:
-            photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+            _persist_photos_csv(
+                photos_df,
+                photos_csv,
+                infos,
+                reason="audio_sync_fields",
+                photo_rel_native=_photo_rel_at(photos_df, i),
+            )
 
         # 2) Photo (2/3) et info (1/3)
         
@@ -2766,6 +3312,7 @@ def show_annotation_interface():
                                 desc_new = ensure_desc_vlm(
                                     i, row_view, guide_src=guide_src,
                                     photos_df=photos_df, photos_csv=photos_csv,
+                                    infos=infos,
                                     mission=mission, context_system=context_system,
                                     context_user=context_user, vlm_system=vlm_system, vlm_user=vlm_user,
                                     force=False,
@@ -2790,6 +3337,7 @@ def show_annotation_interface():
                             desc_new = ensure_desc_vlm(
                                 i, row_view, guide_src=guide_src,
                                 photos_df=photos_df, photos_csv=photos_csv,
+                                infos=infos,
                                 mission=mission, context_system=context_system,
                                 context_user=context_user, vlm_system=vlm_system, vlm_user=vlm_user,
                                 force=True,
@@ -3055,6 +3603,7 @@ def show_annotation_interface():
                             desc_vlm = ensure_desc_vlm(
                                 i, row_view, guide_src=guide_src,
                                 photos_df=photos_df, photos_csv=photos_csv,
+                                infos=infos,
                                 mission=mission, context_system=context_system,
                                 context_user=context_user, vlm_system=vlm_system, vlm_user=vlm_user
                             )
@@ -3127,6 +3676,7 @@ def show_annotation_interface():
                             desc_vlm = ensure_desc_vlm(
                                 i, row_view, guide_src=guide_src,
                                 photos_df=photos_df, photos_csv=photos_csv,
+                                infos=infos,
                                 mission=mission, context_system=context_system,
                                 context_user=context_user, vlm_system=vlm_system, vlm_user=vlm_user
                             )
@@ -3208,6 +3758,7 @@ def show_annotation_interface():
                             desc_vlm = ensure_desc_vlm(
                                 i, row_view, guide_src=guide_src,
                                 photos_df=photos_df, photos_csv=photos_csv,
+                                infos=infos,
                                 mission=mission, context_system=context_system,
                                 context_user=context_user, vlm_system=vlm_system, vlm_user=vlm_user
                             )
@@ -3268,7 +3819,13 @@ def show_annotation_interface():
                                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                 photos_df.at[i, "libelle_ui_ts"] = now
                                 photos_df.at[i, "ui_ts"] = now
-                                photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+                                _persist_photos_csv(
+                                    photos_df,
+                                    photos_csv,
+                                    infos,
+                                    reason="gpt_libelle",
+                                    photo_rel_native=_photo_rel_at(photos_df, i),
+                                )
                                 if libelle_source_kind != "extrait_lib":
                                     st.info(f"Libellé recalculé avec source de secours : {libelle_source_kind}.")
                             elif not local_request_blocked:
@@ -3330,7 +3887,13 @@ def show_annotation_interface():
                                 photos_df.at[i, "ui_ts"] = now
                                 photo_dirty = True
                                 if photo_dirty:
-                                    photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+                                    _persist_photos_csv(
+                                        photos_df,
+                                        photos_csv,
+                                        infos,
+                                        reason="gpt_commentaire",
+                                        photo_rel_native=_photo_rel_at(photos_df, i),
+                                    )
                                 st.rerun()                                
 
                         elif not local_request_blocked:
@@ -3471,7 +4034,7 @@ def show_annotation_interface():
                                         st.session_state["seq_override_index"] = int(next_non_validated_idx)
                                         st.rerun()
                                     except Exception as e:
-                                        _mark_current_dictation_error(photos_df, photos_csv, i, e)
+                                        _mark_current_dictation_error(photos_df, photos_csv, infos, i, e)
                                         st.error(f"Dictée non enregistrée : {e}")
                                         st.info(
                                             "La photo courante reste affichée pour éviter de perdre une dictée non sauvegardée."
@@ -3517,7 +4080,7 @@ def show_annotation_interface():
                                         st.rerun()
 
                                 except Exception as e:
-                                    _mark_current_dictation_error(photos_df, photos_csv, i, e)
+                                    _mark_current_dictation_error(photos_df, photos_csv, infos, i, e)
                                     st.error(f"Erreur dictée/ASR : {e}")
                    
 
@@ -3543,7 +4106,13 @@ def show_annotation_interface():
                             if k in st.session_state:
                                 del st.session_state[k]
 
-                        photos_df.to_csv(photos_csv, sep=";", encoding="utf-8-sig", index=False)
+                        _persist_photos_csv(
+                            photos_df,
+                            photos_csv,
+                            infos,
+                            reason="back_to_batch",
+                            photo_rel_native=_photo_rel_at(photos_df, i),
+                        )
                         st.rerun()
 
 
@@ -3729,11 +4298,12 @@ def show_annotation_interface():
             }
 
             if photo_dirty:
-                photos_df.to_csv(
+                _persist_photos_csv(
+                    photos_df,
                     photos_csv,
-                    sep=";",
-                    encoding="utf-8-sig",
-                    index=False
+                    infos,
+                    reason="annotation_saved",
+                    photo_rel_native=_photo_rel_at(photos_df, i),
                 )
 
             os.makedirs("data", exist_ok=True)
