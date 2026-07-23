@@ -41,6 +41,7 @@ _DICTEES_ROOT = _REPO_ROOT / "data" / "dictees"
 _DICTEES_PENDING_DIR = _DICTEES_ROOT / "pending"
 _SYNC_PENDING_DIR = _REPO_ROOT / "data" / "sync_pending"
 _PHOTOS_NAS_PENDING_PATH = _SYNC_PENDING_DIR / "photos_nas_pending.json"
+_GTP_EXPORTS_NAS_PENDING_PATH = _SYNC_PENDING_DIR / "gtp_exports_nas_pending.json"
 _PCFIXE_AFFAIRES_SMB_ROOTS = (
     r"\\10.0.1.10\Affaires",
     r"\\192.168.0.155\Affaires",
@@ -467,6 +468,11 @@ def _nas_photos_csv_path(infos: dict) -> Path | None:
     return Path(raw) if raw else None
 
 
+def _nas_photos_dir(infos: dict) -> Path | None:
+    nas_csv = _nas_photos_csv_path(infos)
+    return nas_csv.parent if nas_csv else None
+
+
 def _unc_host(path: str | Path) -> str:
     raw = str(path or "").strip().replace("/", "\\")
     if not raw.startswith("\\\\"):
@@ -733,6 +739,7 @@ def _set_nas_pending(payload: dict, error: Exception | str) -> None:
     payload_attempts = int(payload.get("attempts") or payload.get("tentatives") or 0)
     attempts = max(previous_attempts, payload_attempts) + 1
     pending_payload = {
+        "operation_id": _ui_text(payload.get("operation_id")),
         "reason": _ui_text(payload.get("reason")) or "photos_csv_sync",
         "photo_rel_native": _ui_text(payload.get("photo_rel_native")),
         "work_csv": _ui_text(payload.get("work_csv")),
@@ -829,6 +836,280 @@ def _retry_pending_nas_sync(infos: dict) -> bool:
     return False
 
 
+def _load_gpt_exports_pending_registry() -> dict:
+    if not _GTP_EXPORTS_NAS_PENDING_PATH.exists():
+        return {"entries": {}}
+    try:
+        payload = json.loads(_GTP_EXPORTS_NAS_PENDING_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("[GTP_EXPORT_SYNC] pending registry unreadable: %s", exc)
+        return {"entries": {}}
+    if not isinstance(payload, dict):
+        return {"entries": {}}
+    payload.setdefault("entries", {})
+    if not isinstance(payload["entries"], dict):
+        payload["entries"] = {}
+    return payload
+
+
+def _write_gpt_exports_pending_registry(payload: dict) -> None:
+    payload = payload if isinstance(payload, dict) else {}
+    payload.setdefault("entries", {})
+    _atomic_write_json_file(_GTP_EXPORTS_NAS_PENDING_PATH, payload)
+
+
+def _gpt_pending_key(nas_path: str | Path) -> str:
+    return hashlib.sha256(str(nas_path).casefold().encode("utf-8")).hexdigest()[:24]
+
+
+def _register_gpt_export_pending(
+    *,
+    infos: dict,
+    local_path: Path,
+    nas_path: Path,
+    file_type: str,
+    error: Exception | str,
+    status: str = "pending",
+    operation_id: str = "",
+) -> dict:
+    payload = _load_gpt_exports_pending_registry()
+    entries = payload.setdefault("entries", {})
+    key = _gpt_pending_key(nas_path)
+    previous = entries.get(key, {}) if isinstance(entries.get(key), dict) else {}
+    retry_count = int(previous.get("retry_count") or previous.get("attempts") or previous.get("tentatives") or 0) + 1
+    now = datetime.now().isoformat(timespec="seconds")
+    local_sha256 = _sha256_file(local_path) if local_path.exists() else ""
+    entry = {
+        "operation_id": _ui_text(operation_id) or _ui_text(previous.get("operation_id")) or uuid.uuid4().hex,
+        "affaire": _ui_text((infos or {}).get("id_affaire") or (infos or {}).get("project_id")),
+        "captation": _ui_text((infos or {}).get("id_captation") or (infos or {}).get("captation_id")),
+        "type": file_type,
+        "local_path": str(local_path),
+        "nas_path": str(nas_path),
+        "local_sha256": local_sha256,
+        "created_at": previous.get("created_at") or now,
+        "last_attempt_at": now,
+        "retry_count": retry_count,
+        "last_error": str(error),
+        "status": status,
+    }
+    entries[key] = entry
+    _write_gpt_exports_pending_registry(payload)
+    st.session_state["gtp_exports_sync_pending"] = True
+    st.session_state["gtp_exports_sync_pending_payload"] = payload
+    return entry
+
+
+def _clear_gpt_export_pending(nas_path: str | Path) -> None:
+    payload = _load_gpt_exports_pending_registry()
+    entries = payload.setdefault("entries", {})
+    entries.pop(_gpt_pending_key(nas_path), None)
+    if entries:
+        _write_gpt_exports_pending_registry(payload)
+        st.session_state["gtp_exports_sync_pending"] = True
+        st.session_state["gtp_exports_sync_pending_payload"] = payload
+    else:
+        try:
+            _GTP_EXPORTS_NAS_PENDING_PATH.unlink(missing_ok=True)
+        except Exception:
+            _write_gpt_exports_pending_registry(payload)
+        st.session_state["gtp_exports_sync_pending"] = False
+        st.session_state.pop("gtp_exports_sync_pending_payload", None)
+
+
+def _conflict_backup_existing_nas(path: Path) -> str:
+    if not path.exists():
+        return ""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = path.with_name(f"{path.name}.conflict-{stamp}.nas.bak")
+    shutil.copy2(str(path), str(backup))
+    return str(backup)
+
+
+def _copy_file_atomic_verified(src: Path, dst: Path) -> dict:
+    src = Path(src)
+    dst = Path(dst)
+    if not src.is_file():
+        raise FileNotFoundError(f"Fichier source introuvable : {src}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    src_hash = _sha256_file(src)
+    src_size = src.stat().st_size
+    if dst.exists():
+        dst_hash = _sha256_file(dst)
+        if dst_hash == src_hash:
+            return {"ok": True, "already": True, "sha256": src_hash, "size": src_size, "path": str(dst)}
+        backup = _conflict_backup_existing_nas(dst)
+        raise FileExistsError(f"Conflit NAS : {dst} existe avec un hash different. Sauvegarde creee : {backup}")
+    tmp = _atomic_tmp_path(dst)
+    try:
+        shutil.copy2(str(src), str(tmp))
+        if tmp.stat().st_size != src_size:
+            raise RuntimeError(f"Taille differente avant publication NAS : {dst}")
+        if _sha256_file(tmp) != src_hash:
+            raise RuntimeError(f"Hash different avant publication NAS : {dst}")
+        os.replace(str(tmp), str(dst))
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+    final_hash = _sha256_file(dst)
+    if final_hash != src_hash:
+        raise RuntimeError(f"Hash different apres publication NAS : {dst}")
+    return {"ok": True, "already": False, "sha256": final_hash, "size": src_size, "path": str(dst)}
+
+
+def _retry_pending_gpt_exports(infos: dict) -> dict:
+    payload = _load_gpt_exports_pending_registry()
+    entries = payload.get("entries", {})
+    result = {"resolved": 0, "pending": 0, "conflicts": 0, "errors": []}
+    if not entries:
+        st.session_state["gtp_exports_sync_pending"] = False
+        return result
+    for key, entry in list(entries.items()):
+        local_path = Path(_ui_text(entry.get("local_path")))
+        nas_path = Path(_ui_text(entry.get("nas_path")))
+        expected_hash = _ui_text(entry.get("local_sha256"))
+        if not local_path.is_file():
+            entry["status"] = "pending"
+            entry["last_error"] = f"Fichier local introuvable : {local_path}"
+            entry["last_attempt_at"] = datetime.now().isoformat(timespec="seconds")
+            entry["retry_count"] = int(entry.get("retry_count") or 0) + 1
+            result["pending"] += 1
+            continue
+        if nas_path.exists() and _sha256_file(nas_path) == expected_hash:
+            entries.pop(key, None)
+            result["resolved"] += 1
+            continue
+        try:
+            if not _unc_available(nas_path):
+                raise ConnectionError(f"NAS indisponible ou trop lent ({_UNC_PROBE_TIMEOUT_S:.1f}s): {_unc_host(nas_path)}")
+            _copy_file_atomic_verified(local_path, nas_path)
+            entries.pop(key, None)
+            result["resolved"] += 1
+        except FileExistsError as exc:
+            entry["status"] = "conflict"
+            entry["last_error"] = str(exc)
+            entry["last_attempt_at"] = datetime.now().isoformat(timespec="seconds")
+            entry["retry_count"] = int(entry.get("retry_count") or 0) + 1
+            result["conflicts"] += 1
+            result["errors"].append(str(exc))
+        except Exception as exc:
+            entry["status"] = "pending"
+            entry["last_error"] = str(exc)
+            entry["last_attempt_at"] = datetime.now().isoformat(timespec="seconds")
+            entry["retry_count"] = int(entry.get("retry_count") or 0) + 1
+            result["pending"] += 1
+            result["errors"].append(str(exc))
+    if entries:
+        _write_gpt_exports_pending_registry(payload)
+        st.session_state["gtp_exports_sync_pending"] = True
+        st.session_state["gtp_exports_sync_pending_payload"] = payload
+    else:
+        try:
+            _GTP_EXPORTS_NAS_PENDING_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
+        st.session_state["gtp_exports_sync_pending"] = False
+        st.session_state.pop("gtp_exports_sync_pending_payload", None)
+    return result
+
+
+def _publish_validated_annotation_file(
+    *,
+    infos: dict,
+    local_path: Path,
+    nas_path: Path,
+    file_type: str,
+    operation_id: str = "",
+) -> dict:
+    result = {
+        "operation_id": operation_id,
+        "file_type": file_type,
+        "local_path": str(local_path),
+        "nas_path": str(nas_path),
+        "local_hash": _sha256_file(local_path) if local_path.exists() else "",
+        "nas_saved": False,
+        "pending": False,
+        "conflict": False,
+        "error": "",
+    }
+    try:
+        if not _unc_available(nas_path):
+            raise ConnectionError(f"NAS indisponible ou trop lent ({_UNC_PROBE_TIMEOUT_S:.1f}s): {_unc_host(nas_path)}")
+        copy_result = _copy_file_atomic_verified(local_path, nas_path)
+        result.update({"nas_saved": True, "nas_hash": copy_result.get("sha256", ""), "nas_size": copy_result.get("size", "")})
+        _clear_gpt_export_pending(nas_path)
+    except FileExistsError as exc:
+        result.update({"conflict": True, "error": str(exc)})
+        _register_gpt_export_pending(infos=infos, local_path=local_path, nas_path=nas_path, file_type=file_type, error=exc, status="conflict", operation_id=operation_id)
+    except Exception as exc:
+        result.update({"pending": True, "error": str(exc)})
+        _register_gpt_export_pending(infos=infos, local_path=local_path, nas_path=nas_path, file_type=file_type, error=exc, status="pending", operation_id=operation_id)
+    return result
+
+
+def _write_and_publish_validated_annotations(
+    annotations_df: pd.DataFrame,
+    annotations_path: str | Path,
+    infos: dict,
+    *,
+    operation_id: str = "",
+) -> dict:
+    operation_id = _ui_text(operation_id) or uuid.uuid4().hex
+    work_csv = Path(annotations_path)
+    filename_csv = work_csv.name
+    filename_xlsx = work_csv.with_suffix(".xlsx").name
+    canonical_dir = _canonical_laptop_photos_dir(infos)
+    local_csv = canonical_dir / filename_csv
+    local_xlsx = canonical_dir / filename_xlsx
+    nas_dir = _nas_photos_dir(infos)
+    if nas_dir is None:
+        raise RuntimeError("Chemin NAS photos introuvable dans infos.pcfixe.fichier_photos")
+    nas_csv = nas_dir / filename_csv
+    nas_xlsx = nas_dir / filename_xlsx
+
+    local_csv = _atomic_write_dataframe_csv(annotations_df, local_csv)
+    local_xlsx = _atomic_write_dataframe_xlsx(annotations_df, local_xlsx)
+
+    work_results = []
+    if str(work_csv.resolve()).casefold() != str(local_csv.resolve()).casefold():
+        _copy_file_atomic(local_csv, work_csv)
+        work_results.append(str(work_csv))
+    work_xlsx = work_csv.with_suffix(".xlsx")
+    if str(work_xlsx.resolve()).casefold() != str(local_xlsx.resolve()).casefold():
+        _copy_file_atomic(local_xlsx, work_xlsx)
+        work_results.append(str(work_xlsx))
+
+    csv_result = _publish_validated_annotation_file(infos=infos, local_path=local_csv, nas_path=nas_csv, file_type="gtp_csv", operation_id=operation_id)
+    xlsx_result = _publish_validated_annotation_file(infos=infos, local_path=local_xlsx, nas_path=nas_xlsx, file_type="gtp_xlsx", operation_id=operation_id)
+    partial = bool(csv_result.get("nas_saved")) != bool(xlsx_result.get("nas_saved"))
+    state = {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "operation_id": operation_id,
+        "csv": csv_result,
+        "xlsx": xlsx_result,
+        "partial": partial,
+        "work_compat_copies": work_results,
+    }
+    st.session_state["gtp_exports_publish_state"] = state
+    log.info("[GTP_EXPORT_SYNC] %s", json.dumps(state, ensure_ascii=False, sort_keys=True))
+    return state
+
+
+def _annotation_operation_status(gtp_state: dict, photos_state: dict) -> dict:
+    csv = (gtp_state or {}).get("csv", {}) if isinstance(gtp_state, dict) else {}
+    xlsx = (gtp_state or {}).get("xlsx", {}) if isinstance(gtp_state, dict) else {}
+    photos_state = photos_state if isinstance(photos_state, dict) else {}
+    if csv.get("conflict") or xlsx.get("conflict") or photos_state.get("conflict"):
+        status = "conflict"
+    elif not csv.get("nas_saved") or not photos_state.get("nas_saved"):
+        status = "pending"
+    elif xlsx.get("pending") or xlsx.get("conflict") or (gtp_state or {}).get("partial"):
+        status = "partial"
+    else:
+        status = "success"
+    return {"operation_id": (gtp_state or {}).get("operation_id") or photos_state.get("operation_id", ""), "status": status}
+
+
 def _persist_photos_csv(
     photos_df: pd.DataFrame,
     photos_csv: str,
@@ -837,9 +1118,11 @@ def _persist_photos_csv(
     reason: str = "",
     photo_rel_native: str = "",
     maintain_xlsx: bool = True,
+    operation_id: str = "",
 ) -> None:
     _retry_pending_nas_sync(infos)
     state_payload = {
+        "operation_id": _ui_text(operation_id),
         "reason": reason,
         "photo_rel_native": photo_rel_native,
         "work_csv": str(photos_csv),
@@ -2786,6 +3069,7 @@ def show_annotation_interface():
     # ─────────────────────────────────────────────────────────────
     _sync_photos_csv_on_launch(infos, photos_csv)
     _retry_pending_nas_sync(infos)
+    _retry_pending_gpt_exports(infos)
     photos_df = read_csv_fallback(photos_csv, sep=";")
     if st.session_state.get("canonical_mirror_pending"):
         err = _ui_text(st.session_state.get("canonical_mirror_error"))
@@ -4304,7 +4588,20 @@ def show_annotation_interface():
                     infos,
                     reason="annotation_saved",
                     photo_rel_native=_photo_rel_at(photos_df, i),
+                    operation_id=annotation_operation_id,
                 )
+                operation_state = _annotation_operation_status(
+                    publish_state,
+                    st.session_state.get("photos_persistence_state", {}),
+                )
+                if operation_state["status"] == "success":
+                    st.info("Export GTP CSV/XLSX et photos.csv publi?s localement et sur le NAS.")
+                elif operation_state["status"] == "partial":
+                    st.warning("Publication partielle : CSV GTP valide, reprise NAS en attente pour une ressource non bloquante.")
+                elif operation_state["status"] == "conflict":
+                    st.error("Conflit NAS sur une ressource de l?op?ration : aucune ?criture divergente n?a ?t? ?cras?e.")
+                else:
+                    st.warning("Enregistr? localement ? publication NAS en attente.")
 
             os.makedirs("data", exist_ok=True)
             with open("data/progression_annotation.json", "w", encoding="utf-8") as f:
