@@ -4599,9 +4599,9 @@ def show_annotation_interface():
                 elif operation_state["status"] == "partial":
                     st.warning("Publication partielle : CSV GTP valide, reprise NAS en attente pour une ressource non bloquante.")
                 elif operation_state["status"] == "conflict":
-                    st.error("Conflit NAS sur une ressource de l?op?ration : aucune ?criture divergente n?a ?t? ?cras?e.")
+                    st.error("Conflit NAS sur une ressource de l’opération : aucune écriture divergente n’a été écrasée.")
                 else:
-                    st.warning("Enregistr? localement ? publication NAS en attente.")
+                    st.warning("Enregistré localement — publication NAS en attente.")
 
             os.makedirs("data", exist_ok=True)
             with open("data/progression_annotation.json", "w", encoding="utf-8") as f:
