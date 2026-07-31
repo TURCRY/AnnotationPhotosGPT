@@ -78,8 +78,8 @@ def _is_llm_runtime_message(value: str) -> bool:
         "[Erreur LLM local:",
         "[Erreur GPT OpenAI :",
         "[Erreur config LLM:",
-        "[RÃ©ponse LLM local vide ou inexploitable]",
-        "[LLM local occupÃ©,",
+        "[Réponse LLM local vide ou inexploitable]",
+        "[LLM local occupé,",
         "[LLM local ok=False:",
     )
     return any(text.startswith(prefix) for prefix in prefixes)
@@ -468,6 +468,14 @@ def _nas_photos_csv_path(infos: dict) -> Path | None:
     return Path(raw) if raw else None
 
 
+def _nas_photos_batch_path(infos: dict) -> Path | None:
+    pcfixe = (infos or {}).get("pcfixe") or {}
+    if not isinstance(pcfixe, dict):
+        return None
+    raw = _ui_text(pcfixe.get("fichier_photos_batch"))
+    return Path(raw) if raw else None
+
+
 def _nas_photos_dir(infos: dict) -> Path | None:
     nas_csv = _nas_photos_csv_path(infos)
     return nas_csv.parent if nas_csv else None
@@ -496,12 +504,21 @@ def _atomic_tmp_path(target: Path, suffix: str = ".tmp") -> Path:
     return target.with_name(f".apg-tmp-{os.getpid()}-{uuid.uuid4().hex}-{target.name}{suffix}")
 
 
+def _fsync_path(path: Path) -> None:
+    try:
+        with Path(path).open("rb") as f:
+            os.fsync(f.fileno())
+    except Exception:
+        pass
+
+
 def _atomic_write_dataframe_csv(df: pd.DataFrame, path: str | Path) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = _atomic_tmp_path(target)
     try:
         df.to_csv(tmp, sep=";", encoding="utf-8-sig", index=False)
+        _fsync_path(tmp)
         os.replace(str(tmp), str(target))
     finally:
         if tmp.exists():
@@ -515,6 +532,7 @@ def _atomic_write_dataframe_xlsx(df: pd.DataFrame, path: str | Path) -> Path:
     tmp = _atomic_tmp_path(target, suffix=".tmp.xlsx")
     try:
         df.to_excel(tmp, index=False, engine="openpyxl")
+        _fsync_path(tmp)
         os.replace(str(tmp), str(target))
     finally:
         if tmp.exists():
@@ -529,6 +547,7 @@ def _copy_file_atomic(src: str | Path, dst: str | Path) -> Path:
     tmp = _atomic_tmp_path(dst_path)
     try:
         shutil.copy2(str(src_path), str(tmp))
+        _fsync_path(tmp)
         os.replace(str(tmp), str(dst_path))
     finally:
         if tmp.exists():
@@ -858,6 +877,22 @@ def _write_gpt_exports_pending_registry(payload: dict) -> None:
     _atomic_write_json_file(_GTP_EXPORTS_NAS_PENDING_PATH, payload)
 
 
+def _set_gpt_exports_sync_pending(is_pending: bool, payload: dict | None = None) -> None:
+    st.session_state["gpt_exports_sync_pending"] = bool(is_pending)
+    st.session_state["gtp_exports_sync_pending"] = bool(is_pending)
+    if payload is None:
+        st.session_state.pop("gpt_exports_sync_pending_payload", None)
+        st.session_state.pop("gtp_exports_sync_pending_payload", None)
+    else:
+        st.session_state["gpt_exports_sync_pending_payload"] = payload
+        st.session_state["gtp_exports_sync_pending_payload"] = payload
+
+
+def _set_gpt_exports_publish_state(state: dict) -> None:
+    st.session_state["gpt_exports_publish_state"] = state
+    st.session_state["gtp_exports_publish_state"] = state
+
+
 def _gpt_pending_key(nas_path: str | Path) -> str:
     return hashlib.sha256(str(nas_path).casefold().encode("utf-8")).hexdigest()[:24]
 
@@ -887,16 +922,19 @@ def _register_gpt_export_pending(
         "local_path": str(local_path),
         "nas_path": str(nas_path),
         "local_sha256": local_sha256,
+        "sha256_local": local_sha256,
+        "file_type": file_type,
         "created_at": previous.get("created_at") or now,
         "last_attempt_at": now,
-        "retry_count": retry_count,
         "last_error": str(error),
+        "retry_count": retry_count,
+        "attempts": retry_count,
+        "tentatives": retry_count,
         "status": status,
     }
     entries[key] = entry
     _write_gpt_exports_pending_registry(payload)
-    st.session_state["gtp_exports_sync_pending"] = True
-    st.session_state["gtp_exports_sync_pending_payload"] = payload
+    _set_gpt_exports_sync_pending(True, payload)
     return entry
 
 
@@ -906,15 +944,13 @@ def _clear_gpt_export_pending(nas_path: str | Path) -> None:
     entries.pop(_gpt_pending_key(nas_path), None)
     if entries:
         _write_gpt_exports_pending_registry(payload)
-        st.session_state["gtp_exports_sync_pending"] = True
-        st.session_state["gtp_exports_sync_pending_payload"] = payload
+        _set_gpt_exports_sync_pending(True, payload)
     else:
         try:
             _GTP_EXPORTS_NAS_PENDING_PATH.unlink(missing_ok=True)
         except Exception:
             _write_gpt_exports_pending_registry(payload)
-        st.session_state["gtp_exports_sync_pending"] = False
-        st.session_state.pop("gtp_exports_sync_pending_payload", None)
+        _set_gpt_exports_sync_pending(False)
 
 
 def _conflict_backup_existing_nas(path: Path) -> str:
@@ -937,12 +973,21 @@ def _copy_file_atomic_verified(src: Path, dst: Path) -> dict:
     if dst.exists():
         dst_hash = _sha256_file(dst)
         if dst_hash == src_hash:
-            return {"ok": True, "already": True, "sha256": src_hash, "size": src_size, "path": str(dst)}
+            return {
+                "ok": True,
+                "already": True,
+                "sha256": src_hash,
+                "size": src_size,
+                "path": str(dst),
+            }
         backup = _conflict_backup_existing_nas(dst)
-        raise FileExistsError(f"Conflit NAS : {dst} existe avec un hash different. Sauvegarde creee : {backup}")
+        raise FileExistsError(
+            f"Conflit NAS : {dst} existe avec un hash different. Sauvegarde creee : {backup}"
+        )
     tmp = _atomic_tmp_path(dst)
     try:
         shutil.copy2(str(src), str(tmp))
+        _fsync_path(tmp)
         if tmp.stat().st_size != src_size:
             raise RuntimeError(f"Taille differente avant publication NAS : {dst}")
         if _sha256_file(tmp) != src_hash:
@@ -962,17 +1007,15 @@ def _retry_pending_gpt_exports(infos: dict) -> dict:
     entries = payload.get("entries", {})
     result = {"resolved": 0, "pending": 0, "conflicts": 0, "errors": []}
     if not entries:
-        st.session_state["gtp_exports_sync_pending"] = False
+        _set_gpt_exports_sync_pending(False)
         return result
     for key, entry in list(entries.items()):
         local_path = Path(_ui_text(entry.get("local_path")))
         nas_path = Path(_ui_text(entry.get("nas_path")))
-        expected_hash = _ui_text(entry.get("local_sha256"))
+        expected_hash = _ui_text(entry.get("local_sha256") or entry.get("sha256_local"))
         if not local_path.is_file():
-            entry["status"] = "pending"
             entry["last_error"] = f"Fichier local introuvable : {local_path}"
             entry["last_attempt_at"] = datetime.now().isoformat(timespec="seconds")
-            entry["retry_count"] = int(entry.get("retry_count") or 0) + 1
             result["pending"] += 1
             continue
         if nas_path.exists() and _sha256_file(nas_path) == expected_hash:
@@ -986,30 +1029,36 @@ def _retry_pending_gpt_exports(infos: dict) -> dict:
             entries.pop(key, None)
             result["resolved"] += 1
         except FileExistsError as exc:
-            entry["status"] = "conflict"
-            entry["last_error"] = str(exc)
-            entry["last_attempt_at"] = datetime.now().isoformat(timespec="seconds")
-            entry["retry_count"] = int(entry.get("retry_count") or 0) + 1
+            entry.update({
+                "status": "conflict",
+                "last_error": str(exc),
+                "last_attempt_at": datetime.now().isoformat(timespec="seconds"),
+                "retry_count": int(entry.get("retry_count") or entry.get("attempts") or 0) + 1,
+            })
+            entry["attempts"] = entry["retry_count"]
+            entry["tentatives"] = entry["retry_count"]
             result["conflicts"] += 1
             result["errors"].append(str(exc))
         except Exception as exc:
-            entry["status"] = "pending"
-            entry["last_error"] = str(exc)
-            entry["last_attempt_at"] = datetime.now().isoformat(timespec="seconds")
-            entry["retry_count"] = int(entry.get("retry_count") or 0) + 1
+            entry.update({
+                "status": "pending",
+                "last_error": str(exc),
+                "last_attempt_at": datetime.now().isoformat(timespec="seconds"),
+                "retry_count": int(entry.get("retry_count") or entry.get("attempts") or 0) + 1,
+            })
+            entry["attempts"] = entry["retry_count"]
+            entry["tentatives"] = entry["retry_count"]
             result["pending"] += 1
             result["errors"].append(str(exc))
     if entries:
         _write_gpt_exports_pending_registry(payload)
-        st.session_state["gtp_exports_sync_pending"] = True
-        st.session_state["gtp_exports_sync_pending_payload"] = payload
+        _set_gpt_exports_sync_pending(True, payload)
     else:
         try:
             _GTP_EXPORTS_NAS_PENDING_PATH.unlink(missing_ok=True)
         except Exception:
             pass
-        st.session_state["gtp_exports_sync_pending"] = False
-        st.session_state.pop("gtp_exports_sync_pending_payload", None)
+        _set_gpt_exports_sync_pending(False)
     return result
 
 
@@ -1036,14 +1085,34 @@ def _publish_validated_annotation_file(
         if not _unc_available(nas_path):
             raise ConnectionError(f"NAS indisponible ou trop lent ({_UNC_PROBE_TIMEOUT_S:.1f}s): {_unc_host(nas_path)}")
         copy_result = _copy_file_atomic_verified(local_path, nas_path)
-        result.update({"nas_saved": True, "nas_hash": copy_result.get("sha256", ""), "nas_size": copy_result.get("size", "")})
+        result.update({
+            "nas_saved": True,
+            "nas_hash": copy_result.get("sha256", ""),
+            "nas_size": copy_result.get("size", ""),
+        })
         _clear_gpt_export_pending(nas_path)
     except FileExistsError as exc:
         result.update({"conflict": True, "error": str(exc)})
-        _register_gpt_export_pending(infos=infos, local_path=local_path, nas_path=nas_path, file_type=file_type, error=exc, status="conflict", operation_id=operation_id)
+        _register_gpt_export_pending(
+            infos=infos,
+            local_path=local_path,
+            nas_path=nas_path,
+            file_type=file_type,
+            error=exc,
+            status="conflict",
+            operation_id=operation_id,
+        )
     except Exception as exc:
         result.update({"pending": True, "error": str(exc)})
-        _register_gpt_export_pending(infos=infos, local_path=local_path, nas_path=nas_path, file_type=file_type, error=exc, status="pending", operation_id=operation_id)
+        _register_gpt_export_pending(
+            infos=infos,
+            local_path=local_path,
+            nas_path=nas_path,
+            file_type=file_type,
+            error=exc,
+            status="pending",
+            operation_id=operation_id,
+        )
     return result
 
 
@@ -1079,8 +1148,20 @@ def _write_and_publish_validated_annotations(
         _copy_file_atomic(local_xlsx, work_xlsx)
         work_results.append(str(work_xlsx))
 
-    csv_result = _publish_validated_annotation_file(infos=infos, local_path=local_csv, nas_path=nas_csv, file_type="gtp_csv", operation_id=operation_id)
-    xlsx_result = _publish_validated_annotation_file(infos=infos, local_path=local_xlsx, nas_path=nas_xlsx, file_type="gtp_xlsx", operation_id=operation_id)
+    csv_result = _publish_validated_annotation_file(
+        infos=infos,
+        local_path=local_csv,
+        nas_path=nas_csv,
+        file_type="gtp_csv",
+        operation_id=operation_id,
+    )
+    xlsx_result = _publish_validated_annotation_file(
+        infos=infos,
+        local_path=local_xlsx,
+        nas_path=nas_xlsx,
+        file_type="gtp_xlsx",
+        operation_id=operation_id,
+    )
     partial = bool(csv_result.get("nas_saved")) != bool(xlsx_result.get("nas_saved"))
     state = {
         "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -1090,24 +1171,9 @@ def _write_and_publish_validated_annotations(
         "partial": partial,
         "work_compat_copies": work_results,
     }
-    st.session_state["gtp_exports_publish_state"] = state
+    _set_gpt_exports_publish_state(state)
     log.info("[GTP_EXPORT_SYNC] %s", json.dumps(state, ensure_ascii=False, sort_keys=True))
     return state
-
-
-def _annotation_operation_status(gtp_state: dict, photos_state: dict) -> dict:
-    csv = (gtp_state or {}).get("csv", {}) if isinstance(gtp_state, dict) else {}
-    xlsx = (gtp_state or {}).get("xlsx", {}) if isinstance(gtp_state, dict) else {}
-    photos_state = photos_state if isinstance(photos_state, dict) else {}
-    if csv.get("conflict") or xlsx.get("conflict") or photos_state.get("conflict"):
-        status = "conflict"
-    elif not csv.get("nas_saved") or not photos_state.get("nas_saved"):
-        status = "pending"
-    elif xlsx.get("pending") or xlsx.get("conflict") or (gtp_state or {}).get("partial"):
-        status = "partial"
-    else:
-        status = "success"
-    return {"operation_id": (gtp_state or {}).get("operation_id") or photos_state.get("operation_id", ""), "status": status}
 
 
 def _persist_photos_csv(
@@ -1119,6 +1185,7 @@ def _persist_photos_csv(
     photo_rel_native: str = "",
     maintain_xlsx: bool = True,
     operation_id: str = "",
+    create_backup: bool = False,
 ) -> None:
     _retry_pending_nas_sync(infos)
     state_payload = {
@@ -1132,6 +1199,13 @@ def _persist_photos_csv(
         "canonical_mirror_saved": False,
         "nas_saved": False,
     }
+    photos_csv_path = Path(photos_csv)
+    if create_backup and photos_csv_path.exists():
+        backup = photos_csv_path.with_name(
+            f"{photos_csv_path.stem}.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}{photos_csv_path.suffix}"
+        )
+        shutil.copy2(photos_csv_path, backup)
+        state_payload["backup_csv"] = str(backup)
     work_csv = _atomic_write_dataframe_csv(photos_df, photos_csv)
     state_payload["work_csv"] = str(work_csv)
     state_payload["local_saved"] = True
@@ -1189,6 +1263,232 @@ def _persist_photos_csv(
         st.session_state["canonical_mirror_error"] = str(exc)
         _record_photos_persistence_state(**{**state_payload, "canonical_mirror_error": str(exc)})
         st.warning(f"Miroir canonique en attente : {exc}")
+
+
+def _csv_has_coherent_photos_schema(path: Path) -> bool:
+    try:
+        df = pd.read_csv(path, sep=";", encoding="utf-8-sig")
+    except Exception:
+        return False
+    return bool(not df.empty and "photo_rel_native" in df.columns and "nom_fichier_image" in df.columns)
+
+
+_PHOTOS_BATCH_MTIME_TOLERANCE_SECONDS = 2.0
+
+
+def _affaires_path_suffix(path_value: str | Path) -> str:
+    raw = str(path_value or "").strip().replace("/", "\\").rstrip("\\")
+    marker = "\\Affaires"
+    lower = raw.lower()
+    idx = lower.find(marker.lower())
+    if idx < 0:
+        return ""
+    return raw[idx + len(marker):].strip("\\")
+
+
+def _canonical_nas_photos_batch_path(infos: dict) -> Path | None:
+    pcfixe = (infos or {}).get("pcfixe") or {}
+    if not isinstance(pcfixe, dict):
+        pcfixe = {}
+    raw = _ui_text(pcfixe.get("fichier_photos_batch"))
+    if raw:
+        path = Path(raw)
+        suffix = _affaires_path_suffix(path)
+        if suffix:
+            return Path(_NAS_AFFAIRES_SMB_ROOT) / Path(suffix)
+        return path
+    try:
+        local_batch = _canonical_laptop_photos_dir(infos) / "photos_batch.csv"
+    except Exception:
+        return None
+    suffix = _affaires_path_suffix(local_batch)
+    if not suffix:
+        return None
+    return Path(_NAS_AFFAIRES_SMB_ROOT) / Path(suffix)
+
+
+def _photos_batch_profile(label: str, path: Path | None) -> dict:
+    profile = {
+        "label": label,
+        "path": str(path or ""),
+        "exists": False,
+        "mtime": 0.0,
+        "modified": "",
+        "size": "",
+        "sha256": "",
+        "schema_ok": False,
+        "error": "",
+    }
+    if path is None:
+        profile["error"] = "chemin non resolu"
+        return profile
+    try:
+        if _unc_host(path) and not _unc_available(path):
+            profile["error"] = f"SMB indisponible: {_unc_host(path)}"
+            return profile
+        if not path.is_file():
+            profile["error"] = "fichier absent"
+            return profile
+        stat = path.stat()
+        profile.update({
+            "exists": True,
+            "mtime": float(stat.st_mtime),
+            "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            "size": str(stat.st_size),
+            "sha256": _sha256_file(path),
+            "schema_ok": _csv_has_coherent_photos_schema(path),
+            "error": "",
+        })
+    except Exception as exc:
+        profile["error"] = str(exc)
+    return profile
+
+
+def _same_path(left: Path | None, right: Path | None) -> bool:
+    if left is None or right is None:
+        return False
+    return str(left).replace("/", "\\").rstrip("\\").casefold() == str(right).replace("/", "\\").rstrip("\\").casefold()
+
+
+def _copy_photos_batch_if_needed(source: Path, target: Path, profiles: dict[str, dict]) -> bool:
+    if _same_path(source, target):
+        return False
+    target_profile = _photos_batch_profile("target", target)
+    if (
+        target_profile.get("exists")
+        and target_profile.get("sha256")
+        and target_profile.get("sha256") == profiles["source"]["sha256"]
+    ):
+        return False
+    _copy_file_atomic(source, target)
+    return True
+
+
+def _photos_batch_conflict(message: str, profiles: dict[str, dict]) -> None:
+    rows = [
+        {
+            "emplacement": label,
+            "chemin": profile.get("path", ""),
+            "present": "oui" if profile.get("exists") else "non",
+            "date": profile.get("modified", ""),
+            "taille": profile.get("size", ""),
+            "sha256": profile.get("sha256", ""),
+            "schema_ok": "oui" if profile.get("schema_ok") else "non",
+            "erreur": profile.get("error", ""),
+        }
+        for label, profile in profiles.items()
+    ]
+    st.session_state["photos_batch_sync_conflict"] = {
+        "message": message,
+        "profiles": rows,
+    }
+    st.warning(message + " Aucune copie automatique de photos_batch.csv.")
+    for row in rows:
+        st.warning(
+            "photos_batch.csv {emplacement}: {chemin} | date={date} | taille={taille} | sha256={sha256} | present={present}".format(
+                **row
+            )
+        )
+
+
+def _sync_photos_batch_from_canonical(infos: dict) -> None:
+    local_batch_raw = str((infos or {}).get("fichier_photos_batch") or "").strip()
+    if not local_batch_raw:
+        return
+    local_batch = Path(local_batch_raw)
+    try:
+        pcfixe_batch = _canonical_laptop_photos_dir(infos) / "photos_batch.csv"
+        nas_batch = _canonical_nas_photos_batch_path(infos) or _nas_photos_batch_path(infos)
+        paths = {
+            "pcfixe": pcfixe_batch,
+            "nas": nas_batch,
+            "travail": local_batch,
+        }
+        profiles = {
+            label: _photos_batch_profile(label, path)
+            for label, path in paths.items()
+        }
+        st.session_state["photos_batch_sync_profiles"] = profiles
+        st.session_state.pop("photos_batch_sync_conflict", None)
+
+        existing = {label: profile for label, profile in profiles.items() if profile.get("exists")}
+        if not existing:
+            st.caption("photos_batch.csv absent sur PC fixe canonique, NAS et fichier de travail.")
+            return
+
+        invalid = {label: profile for label, profile in existing.items() if not profile.get("schema_ok")}
+        if invalid:
+            _photos_batch_conflict("Schema photos_batch.csv incoherent.", profiles)
+            return
+
+        hashes = {profile.get("sha256") for profile in existing.values() if profile.get("sha256")}
+        if len(existing) == 3 and len(hashes) == 1:
+            st.caption("photos_batch.csv deja aligne sur PC fixe, NAS et fichier de travail.")
+            return
+
+        mtimes = [float(profile.get("mtime") or 0.0) for profile in existing.values()]
+        if max(mtimes) - min(mtimes) <= _PHOTOS_BATCH_MTIME_TOLERANCE_SECONDS and len(hashes) > 1:
+            _photos_batch_conflict("Conflit photos_batch.csv : dates proches mais hashes differents.", profiles)
+            return
+
+        newest_mtime = max(mtimes)
+        newest = {
+            label: profile
+            for label, profile in existing.items()
+            if newest_mtime - float(profile.get("mtime") or 0.0) <= _PHOTOS_BATCH_MTIME_TOLERANCE_SECONDS
+        }
+        newest_hashes = {profile.get("sha256") for profile in newest.values() if profile.get("sha256")}
+        if len(newest_hashes) > 1:
+            _photos_batch_conflict("Conflit photos_batch.csv : plusieurs sources recentes divergent.", profiles)
+            return
+
+        if "travail" in newest and (
+            "pcfixe" not in newest
+            or profiles["travail"].get("sha256") != profiles["pcfixe"].get("sha256")
+        ):
+            _photos_batch_conflict("Fichier de travail photos_batch.csv plus recent que les sources canoniques.", profiles)
+            return
+
+        if "pcfixe" in newest:
+            source = paths["pcfixe"]
+            source_profile = profiles["pcfixe"]
+            copied_work = False
+            if source and (not profiles["travail"].get("exists") or profiles["travail"].get("sha256") != source_profile.get("sha256")):
+                copied_work = _copy_photos_batch_if_needed(
+                    source,
+                    local_batch,
+                    {"source": source_profile},
+                )
+            st.warning("photos_batch.csv PC fixe plus recent : publication NAS en retard, non effectuee automatiquement.")
+            st.caption(
+                "photos_batch.csv retenu depuis le PC fixe canonique : "
+                + str(source)
+                + (" (copie travail mise a jour)" if copied_work else "")
+            )
+            return
+
+        if "nas" in newest:
+            source = paths["nas"]
+            source_profile = profiles["nas"]
+            copied = []
+            if source is None:
+                return
+            if not profiles["travail"].get("exists") or profiles["travail"].get("sha256") != source_profile.get("sha256"):
+                if _copy_photos_batch_if_needed(source, local_batch, {"source": source_profile}):
+                    copied.append("travail")
+            if not profiles["pcfixe"].get("exists") or profiles["pcfixe"].get("sha256") != source_profile.get("sha256"):
+                if _copy_photos_batch_if_needed(source, pcfixe_batch, {"source": source_profile}):
+                    copied.append("PC fixe")
+            st.caption(
+                f"photos_batch.csv retenu depuis le NAS : {source}"
+                + (f" ; copie vers {', '.join(copied)}" if copied else "")
+            )
+            return
+
+        if profiles["travail"].get("exists"):
+            st.caption(f"photos_batch.csv retenu depuis le fichier de travail : {local_batch}")
+    except Exception as exc:
+        st.warning(f"Synchronisation locale photos_batch.csv impossible : {exc}")
 
 
 def _server_affaires_suffix(path_value: str) -> str:
@@ -1339,14 +1639,15 @@ def _persist_current_micro_dictation(
     photos_csv: str,
     mic_nonce_key: str,
     saved_audio_sha_key: str,
-) -> tuple[dict | None, bool, bool]:
+    submit_to_pcfixe: bool = True,
+) -> tuple[dict | None, bool, str]:
     if audio_in is None:
-        return None, False, False
+        return None, False, "absent"
 
     audio_bytes = audio_in.getvalue()
     audio_sha = hashlib.sha256(audio_bytes).hexdigest()
     if st.session_state.get(saved_audio_sha_key) == audio_sha:
-        return None, False, False
+        return None, False, "already_saved"
 
     audio_diag = _analyze_audio_bytes(audio_bytes)
     log.info(
@@ -1367,8 +1668,11 @@ def _persist_current_micro_dictation(
         raise RuntimeError("Audio dicte trop court (< 0,5 s).")
 
     _, pcfixe = _require_server_project_context(infos)
-    appcfg = _load_dictation_spooler_config(infos)
-    model_key = str(appcfg.get("dictation_asr_model") or _resolve_local_asr_model_key(appcfg)).strip()
+    if submit_to_pcfixe:
+        appcfg = _load_dictation_spooler_config(infos)
+        model_key = str(appcfg.get("dictation_asr_model") or _resolve_local_asr_model_key(appcfg)).strip()
+    else:
+        model_key = "Voxtral_Mini_3B_Transformers"
     record = _persist_local_dictation(
         audio_bytes=audio_bytes,
         audio_diag=audio_diag,
@@ -1378,7 +1682,7 @@ def _persist_current_micro_dictation(
         pcfixe=pcfixe,
         model_key=model_key,
     )
-    submitted = _submit_dictation_to_pcfixe(record, pcfixe)
+    submitted = _submit_dictation_to_pcfixe(record, pcfixe) if submit_to_pcfixe else False
     existing_dictee_text = _ui_text(photos_df.at[ui_index, "dictee_asr_text"])
     photos_df.at[ui_index, "dictee_audio_path_pcfixe"] = record.get("server_audio_path", "")
     photos_df.at[ui_index, "dictee_asr_status"] = (
@@ -1397,7 +1701,8 @@ def _persist_current_micro_dictation(
     )
     st.session_state[saved_audio_sha_key] = audio_sha
     st.session_state[mic_nonce_key] = int(st.session_state.get(mic_nonce_key, 0)) + 1
-    return record, submitted, True
+    return record, submitted, "persisted"
+
 
 def _build_spooler_job(record: dict) -> dict:
     base_trans_dir = _server_affaires_path(
@@ -1484,18 +1789,32 @@ def _append_dictee_text_to_photo(
     infos: dict,
     record: dict,
     text: str,
+    expected_ui_index: int | None = None,
 ) -> bool:
     photo_rel = _ui_text(record.get("photo_rel_native"))
     nom = _ui_text(record.get("nom_fichier_image"))
     target_idx = None
-    if photo_rel and "photo_rel_native" in photos_df.columns:
-        matches = photos_df.index[photos_df["photo_rel_native"].astype(str).str.strip() == photo_rel].tolist()
-        if matches:
-            target_idx = matches[0]
-    if target_idx is None and nom and "nom_fichier_image" in photos_df.columns:
-        matches = photos_df.index[photos_df["nom_fichier_image"].astype(str).str.strip() == nom].tolist()
-        if matches:
-            target_idx = matches[0]
+    if expected_ui_index is not None:
+        try:
+            candidate_idx = int(expected_ui_index)
+        except Exception:
+            candidate_idx = -1
+        if 0 <= candidate_idx < len(photos_df):
+            target_idx = candidate_idx
+            mapping_ok, mapping_error = _record_matches_photo(record, photos_df.iloc[target_idx], row_index=target_idx)
+            if not mapping_ok:
+                record["error"] = mapping_error
+                _save_dictation_record(record)
+                return False
+    else:
+        if photo_rel and "photo_rel_native" in photos_df.columns:
+            matches = photos_df.index[photos_df["photo_rel_native"].astype(str).str.strip() == photo_rel].tolist()
+            if matches:
+                target_idx = matches[0]
+        if target_idx is None and nom and "nom_fichier_image" in photos_df.columns:
+            matches = photos_df.index[photos_df["nom_fichier_image"].astype(str).str.strip() == nom].tolist()
+            if matches:
+                target_idx = matches[0]
     if target_idx is None:
         record["error"] = f"Photo introuvable pour photo_rel_native={photo_rel!r} nom={nom!r}"
         _save_dictation_record(record)
@@ -1539,36 +1858,40 @@ def _refresh_submitted_local_dictees(
     photos_df: pd.DataFrame,
     photos_csv: str,
     infos: dict,
-) -> tuple[int, int]:
-    completed = 0
-    still_pending = 0
-    for _, record in _iter_dictation_records("SUBMITTED"):
-        csv_path = next((p for p in _expected_csv_read_candidates(record) if p.exists()), None)
-        if not csv_path:
-            still_pending += 1
-            continue
-        text = _read_dictee_text_from_csv(str(csv_path))
-        if not text:
-            record["status"] = "FAILED"
-            record["error"] = f"CSV present mais texte vide: {csv_path}"
-            _save_dictation_record(record)
-            continue
-        if _append_dictee_text_to_photo(
-            photos_df=photos_df,
-            photos_csv=photos_csv,
-            infos=infos,
-            record=record,
-            text=text,
-        ):
-            record["status"] = "COMPLETED"
-            record["completed_at"] = _now_iso()
-            record["error"] = ""
-            _save_dictation_record(record)
-            completed += 1
-            print(f"[DICTEE] completed id={record.get('dictation_id')} csv={csv_path}")
-        else:
-            record["status"] = "FAILED"
-            _save_dictation_record(record)
+    apply: bool = False,
+    return_plan: bool = False,
+) -> tuple[int, int] | tuple[int, int, dict[str, object]]:
+    plan = _build_dictation_reconciliation_plan(photos_df, infos=infos)
+    still_pending = int(plan.get("summary", {}).get("still_pending", 0))
+    if not apply:
+        st.session_state["dictee_reconciliation_plan"] = plan
+        summary = plan.get("summary", {}) if isinstance(plan, dict) else {}
+        st.info(
+            "Previsualisation ASR uniquement : "
+            f"{int(summary.get('would_update') or 0)} ligne(s) seraient propagee(s), "
+            f"{still_pending} restent en attente. Aucune modification de photos.csv n'a ete ecrite."
+        )
+        if return_plan:
+            return 0, still_pending, plan
+        return 0, still_pending
+    completed = _apply_dictation_reconciliation_plan(
+        photos_df,
+        photos_csv=photos_csv,
+        infos=infos,
+        plan=plan,
+    )
+    if completed:
+        for item in plan.get("rows", []):
+            if isinstance(item, dict) and item.get("action") == "update":
+                record = _load_dictation_record(_dictation_json_path(_ui_text(item.get("dictation_id"))))
+                if record:
+                    record["status"] = "COMPLETED"
+                    record["completed_at"] = _now_iso()
+                    record["error"] = ""
+                    _save_dictation_record(record)
+    st.session_state["dictee_reconciliation_plan"] = plan
+    if return_plan:
+        return completed, still_pending, plan
     return completed, still_pending
 
 
@@ -1739,10 +2062,210 @@ def _read_dictee_text_from_csv(csv_path: str) -> str:
         df = read_csv_fallback(str(p), sep=";")
     except Exception:
         return ""
-    if df is None or df.empty or "text" not in df.columns:
+    if df is None or df.empty:
         return ""
-    parts = [str(v).strip() for v in df["text"].tolist() if str(v or "").strip() and str(v).strip().lower() != "nan"]
+    text_col = next((col for col in ("text", "texte", "dictee_asr_text") if col in df.columns), "")
+    if not text_col:
+        return ""
+    parts = [str(v).strip() for v in df[text_col].tolist() if str(v or "").strip() and str(v).strip().lower() != "nan"]
     return "\n".join(parts).strip()
+
+
+def _dictation_id_from_path(path_value: str | Path) -> str:
+    raw = str(path_value or "").strip()
+    if not raw:
+        return ""
+    name = Path(raw).name
+    if "(wav)" in name:
+        return name.split("(wav)", 1)[0]
+    if name.lower().endswith(".wav"):
+        return Path(name).stem
+    if name.lower().endswith(".csv"):
+        return Path(name).stem
+    return Path(name).stem
+
+
+def _record_matches_photo(record: dict, row, *, row_index: int) -> tuple[bool, str]:
+    if not isinstance(record, dict) or not record:
+        return True, ""
+    row_rel = _ui_text(row.get("photo_rel_native"))
+    row_name = _ui_text(row.get("nom_fichier_image"))
+    rec_rel = _ui_text(record.get("photo_rel_native"))
+    rec_name = _ui_text(record.get("nom_fichier_image"))
+    if rec_rel and row_rel and rec_rel != row_rel:
+        return False, f"mapping photo invalide: record photo_rel_native={rec_rel!r}, ligne={row_rel!r}"
+    if rec_name and row_name and rec_name != row_name:
+        return False, f"mapping photo invalide: record nom_fichier_image={rec_name!r}, ligne={row_name!r}"
+    if not (rec_rel or rec_name):
+        return False, f"photo cible inconnue dans le registre pour la ligne {row_index}"
+    return True, ""
+
+
+def _dictation_records_by_id() -> dict[str, dict]:
+    return {
+        str(record.get("dictation_id") or ""): record
+        for _, record in _iter_dictation_records()
+        if str(record.get("dictation_id") or "")
+    }
+
+
+def _find_concurrent_dictation_results(
+    *,
+    dictation_id: str,
+    row,
+    records_by_id: dict[str, dict],
+) -> list[dict[str, str]]:
+    row_rel = _ui_text(row.get("photo_rel_native"))
+    row_name = _ui_text(row.get("nom_fichier_image"))
+    out: list[dict[str, str]] = []
+    for other_id, record in records_by_id.items():
+        if not other_id or other_id == dictation_id:
+            continue
+        rec_rel = _ui_text(record.get("photo_rel_native"))
+        rec_name = _ui_text(record.get("nom_fichier_image"))
+        if not ((row_rel and rec_rel == row_rel) or (row_name and rec_name == row_name)):
+            continue
+        csv_path = Path(_ui_text(record.get("expected_csv")))
+        photo_csv_path = Path(_ui_text(record.get("expected_photo_csv")))
+        if csv_path.exists() or photo_csv_path.exists():
+            out.append({
+                "dictation_id": other_id,
+                "csv_path": str(csv_path if csv_path.exists() else ""),
+                "photo_csv_path": str(photo_csv_path if photo_csv_path.exists() else ""),
+                "status": _ui_text(record.get("status")),
+            })
+    return out
+
+
+def _build_dictation_reconciliation_plan(
+    photos_df: pd.DataFrame,
+    *,
+    infos: dict,
+    records_by_id: dict[str, dict] | None = None,
+) -> dict[str, object]:
+    rows: list[dict[str, object]] = []
+    summary = {
+        "would_update": 0,
+        "still_pending": 0,
+        "duplicates": 0,
+        "orphans": 0,
+        "conflicts": 0,
+        "invalid_mappings": 0,
+    }
+    if "dictee_asr_status" not in photos_df.columns:
+        return {"summary": summary, "rows": rows}
+    try:
+        _, pcfixe = _require_server_project_context(infos)
+        out_dir_abs = compute_asr_out_dir_from_pcfixe(pcfixe)
+    except Exception as exc:
+        return {"summary": {**summary, "error": str(exc)}, "rows": rows}
+
+    records_by_id = records_by_id if records_by_id is not None else _dictation_records_by_id()
+    for idx in range(len(photos_df)):
+        row = photos_df.iloc[idx]
+        status = _ui_text(row.get("dictee_asr_status")).upper()
+        if status not in {"SUBMITTED", "LOCAL_PENDING", "PENDING", "TODO", "BUSY"}:
+            continue
+        audio_path = _ui_text(row.get("dictee_audio_path_pcfixe"))
+        if not audio_path:
+            continue
+        dictation_id = _dictation_id_from_path(audio_path)
+        csv_path = _ui_text(row.get("dictee_asr_csv_path_pcfixe"))
+        photo_csv_path = _ui_text(row.get("dictee_asr_photo_csv_path_pcfixe"))
+        raw_candidate, photo_candidate = _dictation_csv_candidates(audio_path, out_dir_abs)
+        if not csv_path:
+            csv_path = str(raw_candidate)
+        if not photo_csv_path:
+            photo_csv_path = str(photo_candidate)
+        raw_csv = Path(csv_path)
+        photo_csv = Path(photo_csv_path)
+        text = _read_dictee_text_from_csv(str(raw_csv)) or _read_dictee_text_from_csv(str(photo_csv))
+        record = records_by_id.get(dictation_id, {})
+        mapping_ok, mapping_error = _record_matches_photo(record, row, row_index=idx)
+        concurrent = _find_concurrent_dictation_results(
+            dictation_id=dictation_id,
+            row=row,
+            records_by_id=records_by_id,
+        )
+        action = "unchanged"
+        reason = ""
+        if not text:
+            summary["still_pending"] += 1
+            reason = "aucun résultat ASR exact pour le WAV référencé"
+        elif not photo_csv.exists():
+            summary["conflicts"] += 1
+            reason = "CSV (photo) absent pour le WAV référencé"
+        elif not mapping_ok:
+            summary["invalid_mappings"] += 1
+            reason = mapping_error
+        elif status == "LOCAL_PENDING":
+            summary["conflicts"] += 1
+            reason = "LOCAL_PENDING conservé : résultat exact présent mais validation explicite requise"
+        else:
+            action = "update"
+            summary["would_update"] += 1
+            reason = "résultat exact prêt à propager"
+        if concurrent:
+            summary["duplicates"] += len(concurrent)
+            if action != "update":
+                reason = (reason + " ; " if reason else "") + f"{len(concurrent)} résultat(s) concurrent(s)"
+        rows.append({
+            "index": idx,
+            "nom_fichier_image": _ui_text(row.get("nom_fichier_image")),
+            "photo_rel_native": _ui_text(row.get("photo_rel_native")),
+            "dictation_id": dictation_id,
+            "status": status,
+            "action": action,
+            "reason": reason,
+            "text": text,
+            "text_preview": text[:160],
+            "csv_path": str(raw_csv),
+            "photo_csv_path": str(photo_csv),
+            "photo_csv_exists": photo_csv.exists(),
+            "audio_path": audio_path,
+            "audio_sha256": _ui_text(row.get("dictee_audio_sha256")),
+            "concurrent_results": concurrent,
+        })
+    return {"summary": summary, "rows": rows}
+
+
+def _apply_dictation_reconciliation_plan(
+    photos_df: pd.DataFrame,
+    *,
+    photos_csv: str,
+    infos: dict,
+    plan: dict[str, object],
+) -> int:
+    changed = 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for item in plan.get("rows", []):
+        if not isinstance(item, dict) or item.get("action") != "update":
+            continue
+        idx = int(item["index"])
+        text = _ui_text(item.get("text"))
+        if not text:
+            continue
+        photos_df.at[idx, "dictee_asr_text"] = text
+        photos_df.at[idx, "dictee_asr_status"] = "OK"
+        photos_df.at[idx, "dictee_asr_ts"] = now
+        photos_df.at[idx, "dictee_asr_error"] = ""
+        photos_df.at[idx, "dictee_audio_path_pcfixe"] = _ui_text(item.get("audio_path"))
+        photos_df.at[idx, "dictee_asr_csv_path_pcfixe"] = _ui_text(item.get("csv_path"))
+        photos_df.at[idx, "dictee_asr_photo_csv_path_pcfixe"] = _ui_text(item.get("photo_csv_path"))
+        if _ui_text(item.get("audio_sha256")):
+            photos_df.at[idx, "dictee_audio_sha256"] = _ui_text(item.get("audio_sha256"))
+        st.session_state[f"dictee_{idx}"] = text
+        changed += 1
+    if changed:
+        _persist_photos_csv(
+            photos_df,
+            photos_csv,
+            infos,
+            reason="dictation_asr_reconciliation",
+            maintain_xlsx=False,
+            create_backup=True,
+        )
+    return changed
 
 
 def _is_asr_busy_error(exc: Exception) -> bool:
@@ -1780,42 +2303,9 @@ def _refresh_pending_dictee(
 
     reloaded_text = _read_dictee_text_from_csv(csv_path or photo_csv_path)
     if reloaded_text:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        photos_df.at[i, "dictee_asr_text"] = reloaded_text
-        photos_df.at[i, "dictee_asr_status"] = "OK"
-        photos_df.at[i, "dictee_asr_ts"] = now
-        if csv_path:
-            photos_df.at[i, "dictee_asr_csv_path_pcfixe"] = csv_path
-        if photo_csv_path:
-            photos_df.at[i, "dictee_asr_photo_csv_path_pcfixe"] = photo_csv_path
-        _persist_photos_csv(
-            photos_df,
-            photos_csv,
-            infos,
-            reason="dictation_pending_refresh_ok",
-            photo_rel_native=_photo_rel_at(photos_df, i),
-        )
-        st.session_state[f"dictee_{i}"] = reloaded_text
-        return "OK", reloaded_text, csv_path, photo_csv_path
-
-    csv_exists = bool((csv_path and Path(csv_path).exists()) or (photo_csv_path and Path(photo_csv_path).exists()))
-    if csv_exists:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        photos_df.at[i, "dictee_asr_status"] = "ERR"
-        photos_df.at[i, "dictee_asr_ts"] = now
-        if csv_path:
-            photos_df.at[i, "dictee_asr_csv_path_pcfixe"] = csv_path
-        if photo_csv_path:
-            photos_df.at[i, "dictee_asr_photo_csv_path_pcfixe"] = photo_csv_path
-        _persist_photos_csv(
-            photos_df,
-            photos_csv,
-            infos,
-            reason="dictation_pending_refresh_err",
-            photo_rel_native=_photo_rel_at(photos_df, i),
-        )
-        return "ERR", text, csv_path, photo_csv_path
-
+        st.session_state.setdefault("dictee_reconciliation_preview_required", True)
+    elif (csv_path and Path(csv_path).exists()) or (photo_csv_path and Path(photo_csv_path).exists()):
+        st.session_state.setdefault("dictee_reconciliation_preview_required", True)
     return status, text, csv_path, photo_csv_path
 
 
@@ -2415,7 +2905,7 @@ def generer_texte_gpt(role_systeme: str, prompt_user: str) -> str:
                                 or j.get("detail")
                                 or j.get("message")
                                 or j.get("reponse")
-                                or "RÃ©ponse rejetÃ©e par le serveur."
+                                or "Réponse rejetée par le serveur."
                             )
                             return f"[LLM local ok=False: {reason}]"
 
@@ -2912,7 +3402,7 @@ def show_annotation_interface():
         # État d’avancement (optionnel)
         etat_avancement = data.get("etat_avancement", "")
         if etat_avancement:
-            context_user = (context_user + "\n\nÉtat d’avancement : " + etat_avancement).strip() 
+            context_user = (context_user + "\n\nÉtat d’avancement : " + etat_avancement).strip()
 
 
     # ─────────────────────────────────────────────────────────────
@@ -3077,6 +3567,15 @@ def show_annotation_interface():
     if st.session_state.get("nas_sync_pending"):
         err = _ui_text(st.session_state.get("nas_sync_error"))
         st.warning("Sauvegarde locale effectuée — synchronisation NAS en attente" + (f" : {err}" if err else "."))
+    if st.session_state.get("gpt_exports_sync_pending"):
+        st.warning("Enregistré localement — publication NAS en attente pour un export *_GTP_*.csv/xlsx.")
+        if st.button("Retenter la publication NAS des exports GTP", key="retry_gpt_exports_nas"):
+            retry_result = _retry_pending_gpt_exports(infos)
+            if retry_result.get("pending") or retry_result.get("conflicts"):
+                st.warning(f"Publication GTP encore incomplète : {retry_result}")
+            else:
+                st.success("Publications GTP en attente résolues.")
+            st.rerun()
     photos_df = _ensure_photo_text_columns(
         photos_df,
         [
@@ -3235,6 +3734,53 @@ def show_annotation_interface():
     )
 
     col_dictee_submit, col_dictee_refresh = st.columns(2)
+    reconciliation_plan = st.session_state.get("dictee_reconciliation_plan")
+    if isinstance(reconciliation_plan, dict):
+        summary = reconciliation_plan.get("summary", {}) if isinstance(reconciliation_plan.get("summary"), dict) else {}
+        rows = [row for row in reconciliation_plan.get("rows", []) if isinstance(row, dict)]
+        preview_rows = [
+            {
+                "photo": row.get("nom_fichier_image", ""),
+                "dictation_id": row.get("dictation_id", ""),
+                "statut": row.get("status", ""),
+                "action": row.get("action", ""),
+                "raison": row.get("reason", ""),
+                "texte": row.get("text_preview", ""),
+                "csv": row.get("csv_path", ""),
+                "csv_photo": row.get("photo_csv_path", ""),
+                "concurrents": len(row.get("concurrent_results") or []),
+            }
+            for row in rows
+        ]
+        st.caption(
+            "Previsualisation ASR : "
+            f"{int(summary.get('would_update') or 0)} propagation(s), "
+            f"{int(summary.get('still_pending') or 0)} pending, "
+            f"{int(summary.get('duplicates') or 0)} concurrent(s), "
+            f"{int(summary.get('orphans') or 0)} orphelin(s), "
+            f"{int(summary.get('conflicts') or 0) + int(summary.get('invalid_mappings') or 0)} conflit(s)."
+        )
+        if preview_rows:
+            st.dataframe(preview_rows, use_container_width=True)
+        can_apply_reconciliation = int(summary.get("would_update") or 0) > 0
+        if st.button(
+            "Appliquer la reconciliation ASR validee",
+            key="apply_local_dictee_reconciliation",
+            disabled=not can_apply_reconciliation,
+        ):
+            completed, still_pending, plan = _refresh_submitted_local_dictees(
+                photos_df=photos_df,
+                photos_csv=photos_csv,
+                infos=infos,
+                apply=True,
+                return_plan=True,
+            )
+            st.session_state["dictee_reconciliation_plan"] = plan
+            st.success(
+                f"{completed} transcription(s) propagee(s) dans photos.csv ; "
+                f"{still_pending} encore reellement en attente."
+            )
+            st.rerun()
     with col_dictee_submit:
         if st.button("Soumettre les dictées locales en attente", key="submit_local_dictees"):
             try:
@@ -3260,17 +3806,32 @@ def show_annotation_interface():
         for idx in range(len(photos_df))
     )
     seq_override_index = st.session_state.pop("seq_override_index", None)
+    seq_context_key = "|".join(
+        [
+            _ui_text(infos.get("id_affaire") or infos.get("project_id")),
+            _ui_text(infos.get("id_captation") or infos.get("captation_id")),
+            str(Path(photos_csv).resolve()),
+        ]
+    )
 
     if edit_mode == "Séquentiel (sécurisé)":
+        if st.session_state.get("seq_current_context") != seq_context_key:
+            st.session_state["seq_current_context"] = seq_context_key
+            if first_non is not None:
+                st.session_state["seq_current_index"] = int(first_non)
+            else:
+                st.session_state.pop("seq_current_index", None)
+
         if isinstance(seq_override_index, int):
             override_ok = 0 <= seq_override_index < len(photos_df)
             if override_ok:
-                target_indices = [seq_override_index]
-            elif first_non is not None:
-                target_indices = [first_non]
-            else:
-                target_indices = []
+                st.session_state["seq_current_index"] = int(seq_override_index)
+
+        seq_current_index = st.session_state.get("seq_current_index")
+        if isinstance(seq_current_index, int) and 0 <= seq_current_index < len(photos_df):
+            target_indices = [seq_current_index]
         elif first_non is not None:
+            st.session_state["seq_current_index"] = int(first_non)
             target_indices = [first_non]
         else:
             if has_pending_unannotated:
@@ -3294,6 +3855,7 @@ def show_annotation_interface():
     # ─────────────────────────────────────────────────────────────
 
     photos_batch_csv = str(infos.get("fichier_photos_batch", "") or "").strip()
+    _sync_photos_batch_from_canonical(infos)
     batch_df = None
     photos_view_df = photos_df
 
@@ -3869,7 +4431,7 @@ def show_annotation_interface():
                     )
 
                     # --- Regénérer LIBELLÉ ---
-                    if st.button("↻ Regénérer libellé", key=f"regen_lab_{i}"):
+                    if st.button("↻ Régénérer libellé", key=f"regen_lab_{i}"):
 
                         extrait_lib = _normalize_text(texte_lib, "libelle")
                         extrait_com = _normalize_text(texte_com, "commentaire")
@@ -3950,7 +4512,7 @@ def show_annotation_interface():
 
 
                     # --- Regénérer COMMENTAIRE ---
-                    if st.button("↻ Regénérer comment.", key=f"regen_com_{i}"):
+                    if st.button("↻ Régénérer comment.", key=f"regen_com_{i}"):
 
                         extrait_com = _normalize_text(texte_com, "commentaire")
                         desc_vlm = pick_desc_vlm(row_view)
@@ -4301,7 +4863,7 @@ def show_annotation_interface():
                             ):
                                 if next_non_validated_idx is not None:
                                     try:
-                                        _record, _submitted, persisted_now = _persist_current_micro_dictation(
+                                        _record, _submitted, dictation_save_status = _persist_current_micro_dictation(
                                             audio_in=audio_in,
                                             row=row,
                                             ui_index=i,
@@ -4310,13 +4872,15 @@ def show_annotation_interface():
                                             photos_csv=photos_csv,
                                             mic_nonce_key=mic_nonce_key,
                                             saved_audio_sha_key=saved_audio_sha_key,
+                                            submit_to_pcfixe=False,
                                         )
-                                        if persisted_now:
+                                        if dictation_save_status == "persisted":
                                             st.session_state["dictation_nav_feedback"] = (
-                                                "✓ Dictée de la photo précédente enregistrée"
+                                                "✓ Dictée de la photo précédente enregistrée localement"
                                             )
-                                        st.session_state["seq_override_index"] = int(next_non_validated_idx)
-                                        st.rerun()
+                                        if dictation_save_status in {"absent", "already_saved", "persisted"}:
+                                            st.session_state["seq_current_index"] = int(next_non_validated_idx)
+                                            st.rerun()
                                     except Exception as e:
                                         _mark_current_dictation_error(photos_df, photos_csv, infos, i, e)
                                         st.error(f"Dictée non enregistrée : {e}")
@@ -4348,7 +4912,7 @@ def show_annotation_interface():
                                         else:
                                             st.warning("Aucune dictée exploitable n'est actuellement disponible.")
                                     else:
-                                        _record, submitted, _persisted_now = _persist_current_micro_dictation(
+                                        _record, submitted, dictation_save_status = _persist_current_micro_dictation(
                                             audio_in=audio_in,
                                             row=row,
                                             ui_index=i,
@@ -4359,7 +4923,14 @@ def show_annotation_interface():
                                             saved_audio_sha_key=saved_audio_sha_key,
                                         )
 
-                                        st.session_state[f"dictee_feedback_{i}"] = "submitted" if submitted else "local_pending"
+                                        if dictation_save_status == "persisted":
+                                            st.session_state[f"dictee_feedback_{i}"] = "submitted" if submitted else "local_pending"
+                                        elif dictation_save_status == "already_saved":
+                                            st.session_state[f"dictee_feedback_{i}"] = (
+                                                "submitted"
+                                                if _ui_text(photos_df.at[i, "dictee_asr_status"]).upper() == "SUBMITTED"
+                                                else "local_pending"
+                                            )
                                         st.session_state["seq_override_index"] = int(i)
                                         st.rerun()
 
@@ -4543,14 +5114,27 @@ def show_annotation_interface():
             annotations_df = annotations_df[annotations_df["nom_fichier_image"] != nom_image]
             annotations_df = pd.concat([annotations_df, pd.DataFrame([ligne])], ignore_index=True)
             annotations_df = annotations_df.reindex(columns=ANNOT_COLS)
-            annotations_df.to_csv(annotations_path, sep=";", index=False, encoding="utf-8-sig")
+            annotation_operation_id = f"annotation_saved-{datetime.now().strftime('%Y%m%d_%H%M%S')}-{uuid.uuid4().hex[:8]}"
             try:
-                base = Path(annotations_path).with_suffix("")
-                with pd.ExcelWriter(f"{base}.xlsx", engine="openpyxl") as xw:
-                    annotations_df.to_excel(xw, index=False)
-                st.info("📄 Export Excel mis à jour.")
+                publish_state = _write_and_publish_validated_annotations(
+                    annotations_df,
+                    annotations_path,
+                    infos,
+                    operation_id=annotation_operation_id,
+                )
+                csv_state = publish_state.get("csv", {})
+                xlsx_state = publish_state.get("xlsx", {})
+                if publish_state.get("partial"):
+                    st.warning("Publication NAS partielle des exports GTP : CSV/XLSX incohérents, reprise en attente.")
+                elif csv_state.get("conflict") or xlsx_state.get("conflict"):
+                    st.error("Conflit NAS sur un export GTP : aucune écriture divergente n'a été écrasée.")
+                elif csv_state.get("pending") or xlsx_state.get("pending"):
+                    st.warning("Enregistré localement — publication NAS en attente")
+                else:
+                    st.info("Export GTP CSV/XLSX publié localement et sur le NAS.")
             except Exception as e:
-                st.warning(f"⚠️ Export Excel impossible : {e}")
+                st.error(f"Export GTP impossible : {e}")
+                st.stop()
 
             # Persister la rotation dans le CSV photos
             if "orientation_photo" in photos_df.columns:
@@ -4590,18 +5174,6 @@ def show_annotation_interface():
                     photo_rel_native=_photo_rel_at(photos_df, i),
                     operation_id=annotation_operation_id,
                 )
-                operation_state = _annotation_operation_status(
-                    publish_state,
-                    st.session_state.get("photos_persistence_state", {}),
-                )
-                if operation_state["status"] == "success":
-                    st.info("Export GTP CSV/XLSX et photos.csv publi?s localement et sur le NAS.")
-                elif operation_state["status"] == "partial":
-                    st.warning("Publication partielle : CSV GTP valide, reprise NAS en attente pour une ressource non bloquante.")
-                elif operation_state["status"] == "conflict":
-                    st.error("Conflit NAS sur une ressource de l’opération : aucune écriture divergente n’a été écrasée.")
-                else:
-                    st.warning("Enregistré localement — publication NAS en attente.")
 
             os.makedirs("data", exist_ok=True)
             with open("data/progression_annotation.json", "w", encoding="utf-8") as f:
