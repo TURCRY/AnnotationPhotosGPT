@@ -5145,7 +5145,8 @@ def show_annotation_interface():
             photo_dirty = True
 
 
-            # Progression (séquentiel / libre)
+            # Progression: "index" designe la derniere photo enregistree.
+            # En session interactive, seq_current_index reste l'autorite de navigation.
             prev_index = None
             try:
                 with open("data/progression_annotation.json", "r", encoding="utf-8") as f:
@@ -5181,6 +5182,31 @@ def show_annotation_interface():
 
             st.success("💾 Annotation enregistrée et progression mise à jour.")
             
+            st.session_state[f"annotation_saved_local_{i}"] = True
+
+        if st.session_state.get("edit_mode") == "Séquentiel (sécurisé)" and (is_annotated or st.session_state.get(f"annotation_saved_local_{i}", False)):
+            next_idx = i + 1 if i + 1 < len(photos_df) else None
+            prev_idx = i - 1 if i > 0 else None
+            nav_prev, nav_next = st.columns(2)
+            with nav_prev:
+                if prev_idx is not None and st.button(
+                    "⬅️ Photo précédente",
+                    key=f"seq_prev_after_save_{i}",
+                ):
+                    st.session_state["seq_current_index"] = int(prev_idx)
+                    st.rerun()
+            with nav_next:
+                if next_idx is not None:
+                    if st.button(
+                        "➡️ Photo suivante",
+                        key=f"seq_next_after_save_{i}",
+                    ):
+                        st.session_state["seq_current_index"] = int(next_idx)
+                        st.rerun()
+                else:
+                    st.caption("Dernière photo atteinte.")
+
+
 
 #            # Optionnel en séquentiel : passer automatiquement à la suivante
 #            if st.session_state.get("edit_mode") == "Séquentiel (sécurisé)" and i + 1 < len(photos_df):
