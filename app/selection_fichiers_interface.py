@@ -2,6 +2,7 @@ import os
 import json
 import subprocess
 import shutil
+import wave
 from pathlib import Path
 
 import pandas as pd
@@ -20,7 +21,6 @@ from utils import (
 from affaire_creation_client import create_affaire_server_compatible
 
 from traitement_audio import (
-    traiter_fichier_audio_selectionne,
     purge_audio_temp,
     start_audio_server_if_needed,
     stop_audio_server_if_any,
@@ -167,6 +167,118 @@ def _real_or_empty(p: str) -> str:
     return p_abs
 
 
+def _norm_path(p: str) -> str:
+    if not p:
+        return ""
+    return os.path.normcase(os.path.abspath(str(p).strip().strip('"')))
+
+
+def _same_path(left: str, right: str) -> bool:
+    return bool(left and right and _norm_path(left) == _norm_path(right))
+
+
+def _is_expected_compatible_wav(path_value: str) -> bool:
+    path_abs = _real_or_empty(path_value)
+    if not path_abs or not os.path.isfile(path_abs) or not path_abs.lower().endswith(".wav"):
+        return False
+    try:
+        with wave.open(path_abs, "rb") as wav_file:
+            return (
+                wav_file.getcomptype() == "NONE"
+                and wav_file.getnchannels() == 1
+                and wav_file.getsampwidth() == 2
+                and wav_file.getframerate() == 16000
+            )
+    except Exception:
+        return False
+
+
+def _set_audio_compatible(infos: dict, temp: dict, source_path: str, compat_path: str) -> str:
+    source_abs = _real_or_empty(source_path)
+    compat_abs = os.path.abspath(str(compat_path or "").strip()) if compat_path else ""
+    if not source_abs or not compat_abs:
+        return ""
+
+    temp["fichier_audio_source"] = source_abs
+    temp["fichier_audio"] = compat_abs
+    temp["fichier_audio_compatible"] = compat_abs
+
+    infos["fichier_audio_source"] = source_abs
+    infos["fichier_audio"] = compat_abs
+    infos["fichier_audio_compatible"] = compat_abs
+    infos["audio_compat_source"] = source_abs
+    infos["calibrage_valide"] = False
+    return compat_abs
+
+
+def _rerun_after_audio_persist(reason: str) -> None:
+    if st.session_state.pop("_audio_persist_rerun_seen", False):
+        return
+    st.session_state["_audio_persist_rerun_seen"] = True
+    st.session_state["selection_return_reason"] = reason
+    st.rerun()
+
+
+def _generate_audio_compatible_from_source(source_path: str) -> str:
+    source_abs = _real_or_empty(source_path)
+    if not source_abs or not os.path.isfile(source_abs):
+        return ""
+    if _is_expected_compatible_wav(source_abs):
+        return source_abs
+    if not shutil.which("ffmpeg"):
+        st.error("FFmpeg n'est pas installé ou n'est pas dans le PATH.")
+        return ""
+
+    os.makedirs(os.path.dirname(AUDIO_COMPAT), exist_ok=True)
+    stop_audio_server_if_any()
+    purge_audio_temp()
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", source_abs,
+        "-acodec", "pcm_s16le",
+        "-ac", "1",
+        "-ar", "16000",
+        "-f", "wav",
+        AUDIO_COMPAT,
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120)
+    except subprocess.CalledProcessError as e:
+        st.error("Erreur lors de la génération de l'audio compatible avec FFmpeg.")
+        st.code((e.stderr or "")[:800])
+        return ""
+    except Exception as e:
+        st.error(f"Erreur inattendue pendant la génération audio : {e}")
+        return ""
+
+    compat_abs = os.path.abspath(AUDIO_COMPAT)
+    return compat_abs if os.path.exists(compat_abs) and os.path.getsize(compat_abs) > 0 else ""
+
+
+def _context_json_candidates(directory: str) -> list[str]:
+    candidates = []
+    for name in os.listdir(directory):
+        lower = name.lower()
+        if not lower.endswith(".json"):
+            continue
+        if lower.endswith("__progress.json") or "__progress" in lower:
+            continue
+        candidates.append(name)
+
+    def sort_key(name: str) -> tuple[int, str]:
+        lower = name.lower()
+        if lower == "contexte_general.json":
+            return (0, lower)
+        if lower == "contexte_general_photos.json":
+            return (1, lower)
+        if lower.startswith("contexte_general"):
+            return (2, lower)
+        return (3, lower)
+
+    return sorted(candidates, key=sort_key)
+
+
 def _clone_default_value(value):
     if isinstance(value, list):
         return list(value)
@@ -201,9 +313,12 @@ def _audio_compatible_matches_source(source_path: str, compat_path: str, infos: 
 
     recorded_source = _real_or_empty(infos.get("audio_compat_source", ""))
     if recorded_source:
-        return os.path.abspath(recorded_source) == os.path.abspath(source_abs)
+        return _same_path(recorded_source, source_abs)
 
-    return os.path.abspath(compat_abs) == os.path.abspath(AUDIO_COMPAT)
+    if _same_path(compat_abs, source_abs):
+        return _is_expected_compatible_wav(source_abs)
+
+    return False
 
 
 def _extract_affaire_tokens(path_value: str) -> set[str]:
@@ -211,9 +326,9 @@ def _extract_affaire_tokens(path_value: str) -> set[str]:
     if not path_value:
         return tokens
     path_upper = str(path_value).upper()
-    for match in re.findall(r"(?<![A-Z0-9])(?:\d{4}-)?J\d{1,3}(?![A-Z0-9])", path_upper):
+    for match in re.findall(rf"(?<![A-Z0-9])(?:\d{{4}}-)?{AFFAIRE_SHORT_PATTERN}(?![A-Z0-9])", path_upper):
         tokens.add(match)
-        short = re.search(r"J\d{1,3}$", match)
+        short = re.search(rf"{AFFAIRE_SHORT_PATTERN}$", match)
         if short:
             tokens.add(short.group(0))
     return tokens
@@ -224,7 +339,7 @@ def _expected_affaire_tokens(id_affaire: str) -> set[str]:
     if not current:
         return set()
     tokens = {current}
-    short = re.search(r"J\d{1,3}$", current)
+    short = re.search(rf"{AFFAIRE_SHORT_PATTERN}$", current)
     if short:
         tokens.add(short.group(0))
     return tokens
@@ -501,7 +616,7 @@ def _sanitize_affaire_captation_state(infos: dict, temp: dict, id_affaire: str, 
     for temp_key, info_key in source_pairs:
         temp_value = _real_or_empty(temp.get(temp_key, ""))
         info_value = _real_or_empty(infos.get(info_key, ""))
-        if temp_value and info_value and os.path.abspath(temp_value) != os.path.abspath(info_value):
+        if temp_value and info_value and not _same_path(temp_value, info_value):
             source_changed = True
             reasons.append(f"{info_key} source modifié")
     if source_changed and not couple_changed:
@@ -803,6 +918,9 @@ def _detect_audio_candidates_and_dirs():
 import re
 from datetime import datetime
 
+AFFAIRE_ID_PATTERN = r"\d{4}-[A-Z]\d+"
+AFFAIRE_SHORT_PATTERN = r"[A-Z]\d+"
+
 def normalize_id_affaire(s: str) -> str:
     return (s or "").strip().upper()
 
@@ -810,8 +928,8 @@ def validate_id_affaire(s: str) -> tuple[bool, str, str]:
     s = normalize_id_affaire(s)
     if not s:
         return False, s, "id_affaire est vide."
-    if not re.fullmatch(r"\d{4}-J\d{1,3}", s):
-        return False, s, "Format attendu : YYYY-JNN (ex: 2025-J37)."
+    if not re.fullmatch(AFFAIRE_ID_PATTERN, s):
+        return False, s, "Format attendu : YYYY-LNN, lettre A-Z (ex: 2025-A37 ou 2025-Z108)."
     return True, s, ""
 
 def normalize_id_captation(s: str) -> str:
@@ -916,7 +1034,7 @@ def show_selection_interface():
                 "Audio_source": infos.get(
                     "fichier_audio_source", infos.get("fichier_audio", "")
                 ),
-                "Audio_compatible": infos.get("fichier_audio", ""),
+                "Audio_compatible": infos.get("fichier_audio_compatible", infos.get("fichier_audio", "")),
             },
             indent=2,
             ensure_ascii=False,
@@ -929,7 +1047,7 @@ def show_selection_interface():
     )
 
     audio_source_saved = _real_or_empty(infos.get("fichier_audio_source", ""))
-    audio_compat_saved = str(infos.get("fichier_audio", "") or infos.get("fichier_audio_compatible", "") or "").strip()
+    audio_compat_saved = str(infos.get("fichier_audio_compatible", "") or infos.get("fichier_audio", "") or "").strip()
     audio_compat_ok = _audio_compatible_matches_source(audio_source_saved, audio_compat_saved, infos)
 
     st.markdown("#### État audio du projet")
@@ -944,7 +1062,10 @@ def show_selection_interface():
 
     if audio_source_saved and not audio_compat_ok:
         st.warning("⚠️ Audio source présent, mais audio compatible manquant ou incohérent. Le projet n'est pas prêt pour l'annotation.")
-        st.info("Enregistrez de nouveau les fichiers pour régénérer l'audio compatible, ou réutilisez le compatible existant s'il correspond à la même source.")
+        if _is_expected_compatible_wav(audio_source_saved):
+            st.info("La source est déjà compatible : elle sera validée et persistée automatiquement par l'écran de sélection.")
+        else:
+            st.info("Utilisez le bouton explicite Générer l'audio compatible depuis la source.")
     elif audio_source_saved and audio_compat_ok:
         st.success("✅ Audio source et audio compatible cohérents.")
 
@@ -993,7 +1114,7 @@ def show_selection_interface():
         "Chemin du DOSSIER où se trouvent les photos (.xlsx ou .csv) :",
         value=os.path.dirname(temp.get("fichier_photos_reel", "")) if temp.get("fichier_photos_reel") else "",
         key="photos_dir_input",
-        placeholder=r"C:\Users\...\Photos\J46 zanato 06 11 2025",
+        placeholder=r"C:\Users\...\Photos\A46 zanato 06 11 2025",
     )
 
     photos_dir = photos_dir_input.strip().strip('"')
@@ -1259,35 +1380,69 @@ def show_selection_interface():
             abs_audio = os.path.abspath(chosen)
 
             # --- Lecture de l'ancien fichier source (si existant)
-            old_source = temp.get("fichier_audio_source", "")
+            old_source = (
+                _real_or_empty(temp.get("fichier_audio_source", ""))
+                or _real_or_empty(infos.get("fichier_audio_source", ""))
+            )
+            source_really_changed = bool(old_source and not _same_path(old_source, abs_audio))
 
             temp["fichier_audio_source"] = abs_audio
-            temp["fichier_audio"] = abs_audio
+            infos["fichier_audio_source"] = abs_audio
 
-            # --- Si la source change → l'audio compatible doit être régénéré
-            if old_source and old_source != abs_audio:
+            if source_really_changed:
+                for key, value in DERIVED_INFO_DEFAULTS.items():
+                    infos[key] = _clone_default_value(value)
+                temp["fichier_audio"] = ""
                 temp["fichier_audio_compatible"] = ""
-                st.warning("🔁 Nouveau fichier audio sélectionné : l'audio compatible devra être régénéré.")
-            else:
-                # On garde le fichier compatible existant (utile pour reprise d'annotation)
-                st.info("ℹ️ Fichier audio identique : l'audio compatible sera réutilisé si présent.")
+                st.session_state["_audio_source_reset_notice_pending"] = True
 
-            st.success(f"Fichier audio source enregistré : {abs_audio}")
+            if _is_expected_compatible_wav(abs_audio):
+                compat_abs = _set_audio_compatible(infos, temp, abs_audio, abs_audio)
+                sauvegarder_infos_projet(infos)
+                _rerun_after_audio_persist("audio compatible valide depuis une source deja conforme")
+                st.success(f"Fichier audio source conforme et compatible enregistré : {compat_abs}")
+            else:
+                if source_really_changed and st.session_state.pop("_audio_source_reset_notice_pending", False):
+                    st.warning("Nouveau fichier audio sélectionné : l'audio compatible doit être généré explicitement.")
+                sauvegarder_infos_projet(infos)
+                st.success(f"Fichier audio source enregistré : {abs_audio}")
+                st.info("Ce fichier n'est pas encore au format compatible attendu. Utilisez le bouton de génération ci-dessous.")
+
+    source_for_generation = _real_or_empty(temp.get("fichier_audio_source", "")) or _real_or_empty(infos.get("fichier_audio_source", ""))
+    if source_for_generation and not _is_expected_compatible_wav(source_for_generation):
+        if st.button("Générer l'audio compatible depuis la source"):
+            compat_abs = _generate_audio_compatible_from_source(source_for_generation)
+            if compat_abs:
+                _set_audio_compatible(infos, temp, source_for_generation, compat_abs)
+                sauvegarder_infos_projet(infos)
+                st.success(f"Audio compatible généré et enregistré : {compat_abs}")
+                try:
+                    start_audio_server_if_needed(compat_abs)
+                except Exception as e:
+                    st.warning(f"Audio compatible enregistré, mais serveur audio non lancé : {e}")
+                _rerun_after_audio_persist("audio compatible genere depuis la source")
 
     saved_audio_source = _real_or_empty(infos.get("fichier_audio_source", ""))
     current_audio_source = _real_or_empty(temp.get("fichier_audio_source", "")) or saved_audio_source
-    saved_audio_compat = str(infos.get("fichier_audio", "") or infos.get("fichier_audio_compatible", "") or "").strip()
+    saved_audio_compat = str(infos.get("fichier_audio_compatible", "") or infos.get("fichier_audio", "") or "").strip()
     compat_reusable = _audio_compatible_matches_source(current_audio_source, saved_audio_compat, infos)
 
-    if current_audio_source and compat_reusable:
-        temp["fichier_audio_compatible"] = saved_audio_compat
-        temp["fichier_audio"] = saved_audio_compat
-        st.success("✅ Un audio compatible existant correspond à la source courante ; il pourra être conservé.")
+    if current_audio_source and _is_expected_compatible_wav(current_audio_source):
+        _set_audio_compatible(infos, temp, current_audio_source, current_audio_source)
+        if not compat_reusable:
+            sauvegarder_infos_projet(infos)
+            _rerun_after_audio_persist("audio compatible deduit depuis une source deja conforme")
+        st.success("La source audio est déjà au format compatible attendu ; elle est utilisée comme audio compatible.")
+    elif current_audio_source and compat_reusable:
+        compat_abs = os.path.abspath(saved_audio_compat)
+        temp["fichier_audio_compatible"] = compat_abs
+        temp["fichier_audio"] = compat_abs
+        st.success("Un audio compatible existant correspond à la source courante ; il pourra être conservé.")
     elif current_audio_source:
         temp["fichier_audio_compatible"] = ""
         temp["fichier_audio"] = ""
-        st.warning("⚠️ Audio compatible manquant pour la source courante.")
-        st.caption("L'étape d'enregistrement régénérera `fichier_audio` / `fichier_audio_compatible` à partir de `fichier_audio_source`.")
+        st.warning("Audio compatible manquant pour la source courante.")
+        st.caption("Utilisez la commande de génération audio compatible avant l'enregistrement final.")
 
     # =====================================================================
     # Contexte général (JSON)
@@ -1305,7 +1460,7 @@ def show_selection_interface():
     ctx_dir = ctx_dir_input.strip().strip('"')
     if ctx_dir:
         if os.path.isdir(ctx_dir):
-            candidates = [f for f in os.listdir(ctx_dir) if f.lower().endswith(".json")]
+            candidates = _context_json_candidates(ctx_dir)
             if candidates:
                 ctx_file_selected = st.selectbox(
                     "Choisir le fichier JSON de contexte dans ce dossier :",
@@ -1347,7 +1502,7 @@ def show_selection_interface():
     st.subheader("🆔 Identifiants (affaire / captation)")
 
     id_affaire_input = st.text_input(
-        "id_affaire (ex: 2025-J37)",
+        "id_affaire (ex: 2025-A37 ou 2025-Z108)",
         value=str(infos.get("id_affaire", "") or ""),
         key="id_affaire_input",
     )
@@ -1559,7 +1714,7 @@ def show_selection_interface():
 
         photos_real    = _real_or_empty(t.get("fichier_photos_reel", ""))
         trans_real     = _real_or_empty(t.get("fichier_transcription_reel", ""))
-        audio_src_real = _real_or_empty(t.get("fichier_audio_source", ""))
+        audio_src_real = _real_or_empty(t.get("fichier_audio_source", "")) or _real_or_empty(infos.get("fichier_audio_source", ""))
         ctx_selected = _real_or_empty(t.get("fichier_contexte_general_reel", ""))
 
 
@@ -1630,14 +1785,11 @@ def show_selection_interface():
             st.stop()
 
 
-        # 3) IMPORTANT : empêcher la réutilisation d'un ancien audio_compatible.wav
-        stop_audio_server_if_any()   # évite un serveur qui garde l'ancien fichier
-        purge_audio_temp()           # supprime data/temp/audio_compatible.wav
-
-        audio_compat_abs = ""
-        ok = traiter_fichier_audio_selectionne(audio_src_real)
-        if ok and os.path.exists(AUDIO_COMPAT):
-            audio_compat_abs = os.path.abspath(AUDIO_COMPAT)
+        audio_compat_abs = str(t.get("fichier_audio_compatible", "") or infos.get("fichier_audio_compatible", "") or infos.get("fichier_audio", "") or "").strip()
+        if audio_src_real and _is_expected_compatible_wav(audio_src_real):
+            audio_compat_abs = audio_src_real
+        elif not _audio_compatible_matches_source(audio_src_real, audio_compat_abs, infos):
+            audio_compat_abs = ""
 
         if not audio_compat_abs:
             infos["fichier_audio"] = ""
@@ -1645,19 +1797,29 @@ def show_selection_interface():
             infos["audio_compat_source"] = ""
             infos["calibrage_valide"] = False
             sauvegarder_infos_projet(infos)
-            st.error("❌ Impossible de générer un audio compatible à partir du fichier sélectionné.")
+            st.error("Audio compatible manquant ou incohérent avec la source. Validez une source déjà compatible ou utilisez le bouton de génération explicite.")
             st.stop()
 
-        # (re)démarrage du serveur audio sur le bon WAV
-        start_audio_server_if_needed(audio_compat_abs)
+        audio_compat_abs = os.path.abspath(audio_compat_abs)
+        if not os.path.exists(audio_compat_abs):
+            infos["fichier_audio"] = ""
+            infos["fichier_audio_compatible"] = ""
+            infos["audio_compat_source"] = ""
+            infos["calibrage_valide"] = False
+            sauvegarder_infos_projet(infos)
+            st.error(f"Audio compatible introuvable : {audio_compat_abs}")
+            st.stop()
 
+        try:
+            start_audio_server_if_needed(audio_compat_abs)
+        except Exception as e:
+            st.warning(f"Audio compatible enregistré, mais serveur audio non lancé : {e}")
 
-        # 4) Si on arrive ici, on a un audio compatible valide
-        infos["fichier_audio"] = audio_compat_abs                  # toujours le compatible
-        infos["fichier_audio_compatible"] = audio_compat_abs       # redondant mais explicite
-        infos["audio_compat_source"] = audio_src_real              # trace du WAV source
-        infos["horodatage_audio"] = st.session_state.get("horodatage_audio", "")
-        infos["calibrage_valide"] = False                          # la synchro devra être refaite
+        infos["fichier_audio"] = audio_compat_abs
+        infos["fichier_audio_compatible"] = audio_compat_abs
+        infos["audio_compat_source"] = audio_src_real
+        infos["horodatage_audio"] = st.session_state.get("horodatage_audio", infos.get("horodatage_audio", ""))
+        infos["calibrage_valide"] = False
 
         sauvegarder_infos_projet(infos)
         st.success("✅ Fichiers enregistrés dans infos_projet.json.")
@@ -1666,12 +1828,13 @@ def show_selection_interface():
     # =====================================================================
     # LANCEMENT SERVEUR AUDIO SI COMPATIBLE DISPO
     # =====================================================================
-    if os.path.exists(AUDIO_COMPAT) and not st.session_state.get("audio_server_running", False):
+    audio_server_file = str(infos.get("fichier_audio_compatible", "") or infos.get("fichier_audio", "") or AUDIO_COMPAT)
+    if os.path.exists(audio_server_file) and not st.session_state.get("audio_server_running", False):
         try:
             server_path = os.path.join(os.path.dirname(__file__), "audio_server.py")
             subprocess.Popen(
                 ["python", server_path],
-                env={**os.environ, "AUDIO_FILE_PATH": AUDIO_COMPAT},
+                env={**os.environ, "AUDIO_FILE_PATH": audio_server_file},
             )
             st.session_state["audio_server_running"] = True
             st.info("🔊 Serveur audio lancé avec le fichier compatible.")

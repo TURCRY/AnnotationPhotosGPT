@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import os
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as datetime_time
 from utils import (
     lire_infos_projet, sauvegarder_infos_projet,
     convertir_hms_en_secondes, convertir_secondes_en_hms,
@@ -18,7 +18,7 @@ from path_migration import (
 from streamlit_wavesurfer import wavesurfer
 import requests
 #----------------------------------------------------------------------------
-from traitement_audio import start_audio_server_if_needed
+from traitement_audio import start_audio_server_if_needed, _extraire_horodatage_source
 from pathlib import Path
 from pandas import Timestamp
 import numpy as np
@@ -135,6 +135,90 @@ def _regularize_photos_outputs_and_copy(infos, fichier_photos, df):
 def ss_default(key, value):
     if key not in st.session_state:
         st.session_state[key] = value
+
+
+def _parse_horodatage_audio(infos: dict) -> tuple[str, datetime | None, str]:
+    raw = str(infos.get("horodatage_audio") or "").strip()
+    if not raw:
+        return "absent", None, ""
+    try:
+        return "valide", datetime.strptime(raw, "%Y-%m-%d %H:%M:%S"), ""
+    except ValueError as e:
+        return "format_invalide", None, str(e)
+
+
+def _same_audio_path(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+
+def _detect_horodatage_audio_candidate(infos: dict) -> tuple[datetime | None, str, str]:
+    source_path = str(infos.get("fichier_audio_source") or "").strip()
+    compat_path = str(infos.get("fichier_audio_compatible") or infos.get("fichier_audio") or "").strip()
+
+    candidates: list[tuple[str, str]] = []
+    if source_path:
+        candidates.append((source_path, "date de creation du fichier source audio"))
+    if compat_path and (not source_path or _same_audio_path(source_path, compat_path)):
+        candidates.append((compat_path, "date de creation du fichier audio compatible"))
+
+    seen = set()
+    for path, origin in candidates:
+        norm = os.path.normcase(os.path.abspath(path))
+        if norm in seen or not os.path.exists(path):
+            continue
+        seen.add(norm)
+        value = _extraire_horodatage_source(path)
+        if not value:
+            continue
+        try:
+            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S"), origin, path
+        except ValueError:
+            continue
+
+    return None, "", ""
+
+
+def _render_horodatage_audio_form(infos: dict, state: str, error: str = "") -> None:
+    if state == "absent":
+        st.warning("Horodatage de début de l'audio absent. Renseignez-le pour initialiser la synchronisation Audio / Photos.")
+    elif state == "format_invalide":
+        st.error("Format de horodatage_audio invalide. Format attendu : YYYY-MM-DD HH:MM:SS.")
+        if error:
+            st.caption(error)
+
+    st.markdown("#### Horodatage de début audio")
+    detected_dt, detected_origin, detected_path = _detect_horodatage_audio_candidate(infos)
+    today = datetime.now().date()
+    default_time = datetime_time(0, 0, 0)
+    raw = str(infos.get("horodatage_audio") or "").strip()
+    if state == "valide":
+        parsed = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+        today = parsed.date()
+        default_time = parsed.time().replace(microsecond=0)
+        st.info("Valeur deja enregistree dans infos_projet.json.")
+    elif detected_dt is not None:
+        today = detected_dt.date()
+        default_time = detected_dt.time().replace(microsecond=0)
+        st.info(
+            "Horodatage audio propose automatiquement : "
+            f"{detected_dt.strftime('%Y-%m-%d %H:%M:%S')} ({detected_origin})."
+        )
+        st.caption(f"Fichier utilise : `{detected_path}`")
+
+    audio_date = st.date_input("Date de début de l'audio", value=today, key="horodatage_audio_date")
+    audio_time = st.time_input("Heure de début de l'audio", value=default_time, step=60, key="horodatage_audio_time")
+
+    if st.button("Confirmer / corriger l'horodatage audio", key="save_horodatage_audio"):
+        value = datetime.combine(audio_date, audio_time).replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+        infos["horodatage_audio"] = value
+        infos["calibrage_valide"] = False
+        sauvegarder_infos_projet(infos)
+        st.session_state["horodatage_audio"] = value
+        st.success(f"Horodatage audio enregistré : {value}")
+        st.rerun()
+
 
 def _to_dt(s, default_date=None):
     # accepte datetime Excel, pandas Timestamp ou string
@@ -258,13 +342,12 @@ def show_sync_interface():
 
 
     # --- Horodatage t=0 audio ---
-    try:
-        heure_creation_audio = datetime.strptime(
-            infos["horodatage_audio"], "%Y-%m-%d %H:%M:%S"
-        )
-    except Exception as e:
-        st.error(f"⛔ Erreur horodatage_audio dans infos_projet.json : {e}")
+    horodatage_state, heure_creation_audio, horodatage_error = _parse_horodatage_audio(infos)
+    if horodatage_state != "valide":
+        _render_horodatage_audio_form(infos, horodatage_state, horodatage_error)
         return
+    with st.expander("Corriger l'horodatage audio", expanded=False):
+        _render_horodatage_audio_form(infos, "valide")
 
     # --- Paramètres de départ choisis dans infos_projet.json ---
     photo_depart = int(infos.get("photo_depart", 1))
@@ -283,26 +366,17 @@ def show_sync_interface():
         st.session_state.lecture_audio_position = audio_depart_sec
 
 
-    # Chemin local & URL de l'audio compatible servi par Flask
-    audio_local = os.path.join("data", "temp", "audio_compatible.wav")
+    # Chemin effectif & URL de l'audio compatible servi par Flask
+    audio_path          = str(infos.get("fichier_audio", "") or infos.get("fichier_audio_compatible", "") or "").strip()
+    audio_src_path      = str(infos.get("fichier_audio_source", "") or "").strip()
+    audio_compat_source = str(infos.get("audio_compat_source", "") or "").strip()
     audio_url   = "http://127.0.0.1:5000/audio/audio_compatible.wav"
     # Paramètres de retour arrière (infos_projet.json)
     retour_arriere = float(infos.get("retour_arriere", 10.0))
 
-    if not os.path.exists(audio_local):
-        st.error("Audio compatible introuvable : data/temp/audio_compatible.wav. Passe d'abord par la sélection/conversion.")
-        return
-
-
-    audio_path          = str(infos.get("fichier_audio", "") or "").strip()
-    audio_src_path      = str(infos.get("fichier_audio_source", "") or "").strip()
-    audio_compat_source = str(infos.get("audio_compat_source", "") or "").strip()
-
-    # --- 1) Audio compatible présent ? ---
     if not audio_path or not os.path.exists(audio_path):
-        st.error("❌ Aucun fichier audio compatible valide. "
-                 "Veuillez revenir à l’étape 1 pour le (re)générer.")
-        st.stop()
+        st.error("Audio compatible introuvable. Passez d'abord par la sélection des fichiers.")
+        return
 
     try:
         start_audio_server_if_needed(audio_path)
@@ -321,7 +395,7 @@ def show_sync_interface():
     # Durée (utile si affichage des bornes)
 
     # Durée (utile si affichage des bornes)
-    duree_audio = get_audio_duration(audio_local)
+    duree_audio = get_audio_duration(audio_path)
 
     # Conversion audio_depart "HH:MM:SS" → secondes
     try:

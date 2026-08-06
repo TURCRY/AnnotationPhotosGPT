@@ -3,6 +3,7 @@ import os
 import shutil
 import threading
 import logging
+import wave
 from pathlib import Path
 import pandas as pd
 
@@ -315,30 +316,83 @@ def _set_ui_return_reason(reason: str) -> None:
 def _consume_ui_return_reason() -> str:
     return str(st.session_state.pop("selection_return_reason", "") or "").strip()
 
+def _norm_path(path_value: str) -> str:
+    return os.path.normcase(os.path.abspath(str(path_value or "").strip().strip('"')))
 
-def _project_blockers(infos: dict) -> list[str]:
-    blockers = []
+
+def _same_path(left: str, right: str) -> bool:
+    return bool(left and right and _norm_path(left) == _norm_path(right))
+
+
+def _is_expected_compatible_wav(path_value: str) -> bool:
+    path_abs = str(path_value or "").strip()
+    if not path_abs or not os.path.isfile(path_abs) or not path_abs.lower().endswith(".wav"):
+        return False
+    try:
+        with wave.open(path_abs, "rb") as wav_file:
+            return (
+                wav_file.getcomptype() == "NONE"
+                and wav_file.getnchannels() == 1
+                and wav_file.getsampwidth() == 2
+                and wav_file.getframerate() == 16000
+            )
+    except Exception:
+        return False
+
+
+def _horodatage_audio_status(infos: dict) -> tuple[str, str]:
+    raw = str(infos.get("horodatage_audio") or "").strip()
+    if not raw:
+        return "absent", "Horodatage de debut de l'audio absent. Renseignez-le pour initialiser la synchronisation Audio / Photos."
+    try:
+        datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+        return "valide", ""
+    except ValueError:
+        return "format_invalide", "Format de horodatage_audio invalide. Format attendu : YYYY-MM-DD HH:MM:SS."
+
+
+def _project_status(infos: dict) -> dict:
+    file_blockers = []
 
     photos = str(infos.get("fichier_photos", "") or "").strip()
     if not photos or not os.path.exists(photos):
-        blockers.append("fichier_photos manquant")
+        file_blockers.append("fichier_photos manquant")
 
     transcription = str(infos.get("fichier_transcription", "") or "").strip()
     if not transcription or not os.path.exists(transcription):
-        blockers.append("fichier_transcription manquant")
+        file_blockers.append("fichier_transcription manquant")
 
     audio_source = str(infos.get("fichier_audio_source", "") or "").strip()
-    audio_compat = str(infos.get("fichier_audio", "") or infos.get("fichier_audio_compatible", "") or "").strip()
+    audio_compat = str(infos.get("fichier_audio_compatible", "") or infos.get("fichier_audio", "") or "").strip()
     compat_source = str(infos.get("audio_compat_source", "") or "").strip()
+    audio_blockers = []
 
     if not audio_source or not os.path.exists(audio_source):
-        blockers.append("fichier_audio_source manquant")
+        audio_blockers.append("fichier_audio_source manquant")
     elif not audio_compat or not os.path.exists(audio_compat):
-        blockers.append("audio compatible manquant")
-    elif compat_source and os.path.abspath(compat_source) != os.path.abspath(audio_source):
-        blockers.append("audio compatible incohérent avec la source")
+        audio_blockers.append("audio compatible manquant")
+    elif compat_source and not _same_path(compat_source, audio_source):
+        audio_blockers.append("audio compatible incoherent avec la source")
+    elif _same_path(audio_compat, audio_source) and not _is_expected_compatible_wav(audio_source):
+        audio_blockers.append("audio compatible incoherent avec la source")
 
-    return blockers
+    horodatage_state, horodatage_message = _horodatage_audio_status(infos)
+
+    return {
+        "files_ready": not file_blockers,
+        "audio_ready": not audio_blockers,
+        "calibrage_ready": bool(infos.get("calibrage_valide", False)),
+        "contexte_ready": True,
+        "horodatage_audio_state": horodatage_state,
+        "horodatage_audio_message": horodatage_message,
+        "file_blockers": file_blockers,
+        "audio_blockers": audio_blockers,
+        "blockers": file_blockers + audio_blockers,
+    }
+
+
+def _project_blockers(infos: dict) -> list[str]:
+    return list(_project_status(infos)["blockers"])
 
 def load_csv(path: str, sep=";") -> pd.DataFrame:
     last_err = None
@@ -404,22 +458,35 @@ if not st.session_state.get("_batch_sync_started", False):
     st.session_state["_batch_sync_started"] = True
 return_reason = _consume_ui_return_reason()
 if return_reason:
-    st.info(f"Retour vers sélection fichiers : {return_reason}")
+    st.info(f"Sélection fichiers ouverte : {return_reason}")
 
-blockers = _project_blockers(infos)
+status = _project_status(infos)
+blockers = list(status["blockers"])
 
 if blockers:
-    reason = "état projet incomplet: " + ", ".join(blockers)
+    reason = "etat projet incomplet: " + ", ".join(blockers)
     _set_ui_return_reason(reason)
     st.subheader("📁 Fichiers du projet")
     show_selection_interface()
+    latest_infos = lire_infos_projet()
+    latest_status = _project_status(latest_infos)
+    latest_blockers = list(latest_status["blockers"])
+    if not latest_blockers:
+        st.session_state["selection_return_reason"] = "etat projet fichiers/audio complete"
+        st.rerun()
+    latest_reason = "etat projet incomplet: " + ", ".join(latest_blockers)
     st.divider()
     st.warning("Certains fichiers sont manquants ou invalides.")
-    st.caption(f"Cause détectée : {reason}")
+    st.caption(f"Cause détectée : {latest_reason}")
     st.stop()
 
-if not infos.get("calibrage_valide", False):
-    reason = "calibrage invalide ou absent"
+if not status["calibrage_ready"]:
+    if status["horodatage_audio_state"] == "absent":
+        reason = status["horodatage_audio_message"]
+    elif status["horodatage_audio_state"] == "format_invalide":
+        reason = status["horodatage_audio_message"]
+    else:
+        reason = "calibrage invalide ou absent"
     _set_ui_return_reason(reason)
     st.subheader("📁 Fichiers du projet")
     show_selection_interface()
