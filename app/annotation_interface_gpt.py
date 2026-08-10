@@ -24,6 +24,7 @@ from PIL import Image
 import math
 import re
 from app.local_llm_client import LocalLLMClient
+from context_resolution import resolve_photo_context
 from app.server_locator import DEFAULT_FLASK_ENDPOINTS, resolve_flask_base_url, _vpn_active
 from app.wol_util import wake_on_lan, wait_for_server, is_server_up
 from utils import charger_transcription_flexible
@@ -3373,43 +3374,27 @@ def show_annotation_interface():
     base_dir  = os.path.dirname(photos_csv)
     base_name = os.path.splitext(os.path.basename(photos_csv))[0]
 
-    # Valeurs par défaut depuis infos_projet.json
-    mission = mission_from_infos
-    context_system = infos.get("system", "")
-    context_user   = infos.get("user", "")
-    vlm_system     = infos.get("vlm_system", "")
-    vlm_user       = infos.get("vlm_user", "")
-
-    contexte_path = infos.get("fichier_contexte_general")
-    if contexte_path and os.path.exists(contexte_path):
-        with open(contexte_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        # Override si présent dans le contexte
-        mission        = data.get("mission", mission)
-        context_system = data.get("system", context_system)
-        context_user   = data.get("user", context_user)
-        vlm_system     = data.get("vlm_system", vlm_system)
-        vlm_user       = data.get("vlm_user", vlm_user)
-        ctx_general = {
-            "mission": mission,
-            "system": context_system,
-            "user": context_user,
-            "vlm_system": vlm_system,
-            "vlm_user": vlm_user,
-        }
-
-        # État d’avancement (optionnel)
-        etat_avancement = data.get("etat_avancement", "")
-        if etat_avancement:
-            context_user = (context_user + "\n\nÉtat d’avancement : " + etat_avancement).strip()
-
-
     # ─────────────────────────────────────────────────────────────
     # 🧠 Choix du CSV de transcription effectif
     #   - si on a "...(wav)(photo).csv" ET le jumeau "...(wav).csv" → on utilise ce dernier (Voxtral)
     #   - sinon on utilise le CSV indiqué dans infos_projet.json tel quel
     # ─────────────────────────────────────────────────────────────
+    context_resolution = resolve_photo_context(infos)
+    active_context = context_resolution["context"]
+    mission        = active_context.get("mission", "")
+    context_system = active_context.get("system", "")
+    context_user   = active_context.get("user", "")
+    vlm_system     = active_context.get("vlm_system", "")
+    vlm_user       = active_context.get("vlm_user", "")
+    etat_avancement = active_context.get("etat_avancement", "")
+    if etat_avancement:
+        context_user = (context_user + "\n\nEtat d'avancement : " + etat_avancement).strip()
+    log.info(
+        "[PHOTO_CONTEXT] source=%s path=%s",
+        context_resolution.get("source"),
+        context_resolution.get("source_path") or "(infos_projet)",
+    )
+
     p = Path(transcription_csv_photo)
     csv_effectif = p
 

@@ -12,6 +12,16 @@ from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 import unicodedata
 import argparse
+import sys
+
+PROJECT_ROOT_FOR_IMPORTS = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT_FOR_IMPORTS) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT_FOR_IMPORTS))
+APP_DIR_FOR_IMPORTS = PROJECT_ROOT_FOR_IMPORTS / "app"
+if str(APP_DIR_FOR_IMPORTS) not in sys.path:
+    sys.path.insert(0, str(APP_DIR_FOR_IMPORTS))
+
+from context_resolution import resolve_photo_context
 
 # --- Helpers ----------------------------------------------------------------
 def load_photos(path: Path) -> pd.DataFrame:
@@ -435,14 +445,13 @@ df.loc[has_batch, "source_texte"] = "BATCH"
 df.loc[has_ui,    "source_texte"] = "UI"
 df.loc[has_gtp,   "source_texte"] = "GTP"
 
-contexte = {}
-ctx_path = infos.get("fichier_contexte_general", "contexte_general.json")
-ctx_path = Path(ctx_path)
-if not ctx_path.is_absolute():
-    ctx_path = project_root / ctx_path
-if ctx_path.exists():
-    with open(ctx_path, encoding="utf-8") as f:
-        contexte = json.load(f)
+context_resolution = resolve_photo_context(infos, base_dir=runtime["infos_path"].parent)
+contexte = context_resolution["context"]
+print(
+    "[INFO] contexte actif: "
+    f"{context_resolution.get('source')} "
+    f"{context_resolution.get('source_path') or '(infos_projet)'}"
+)
 
 
 # --- Document Word -----------------------------------------------------------
@@ -463,10 +472,10 @@ doc.add_paragraph("🔎 Informations générales").bold = True
 doc.add_paragraph(f"Annotations : {annotations_path.name if annotations_path else '— (source UI)'}")
 doc.add_paragraph(f"Photos : {Path(photos_path).name}")
 doc.add_paragraph(f"Généré le : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-doc.add_paragraph(f"Utilisateur : {infos.get('user', 'N/A')}")
+doc.add_paragraph(f"Prompt utilisateur : {contexte.get('user') or 'N/A'}")
 doc.add_paragraph(f"Modèle LLM : {infos.get('model', 'N/A')}")
-doc.add_paragraph(f"Mission : {infos.get('mission', 'Non renseignée')}")
-doc.add_paragraph(f"Prompt système : {contexte.get('system', 'N/A')}")
+doc.add_paragraph(f"Mission : {contexte.get('mission') or 'Non renseignée'}")
+doc.add_paragraph(f"Prompt système : {contexte.get('system') or 'N/A'}")
 doc.add_paragraph("")
 
 # Table des clichés (TOC des légendes)
