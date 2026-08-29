@@ -2777,7 +2777,12 @@ def build_payload(prompt_json: dict, kind: str, mission: str, contexte: str, tra
     return {"system": system_txt, "prompt": user_txt}
 
 
-def generer_texte_gpt(role_systeme: str, prompt_user: str) -> str:
+def generer_texte_gpt(
+    role_systeme: str,
+    prompt_user: str,
+    *,
+    dictee_asr_text: str = "",
+) -> str:
     r"""
     Route vers OpenAI ou LLM local selon config/config.json.
     Affiche des messages clairs en cas de non-réponse, avec WOL si nécessaire.
@@ -2876,6 +2881,10 @@ def generer_texte_gpt(role_systeme: str, prompt_user: str) -> str:
                     "expect_json": True,
                     "task": task,   # ✅ ajout
                 }
+                dictee_structured = (dictee_asr_text or "").strip()
+                if dictee_structured:
+                    payload["dictee_asr_text"] = dictee_structured
+                    payload["prefer_dictee"] = True
 
                 for attempt in (1, 2):
                     try:
@@ -3314,10 +3323,6 @@ def show_annotation_interface():
     photos_csv              = infos.get("fichier_photos")
     transcription_csv_photo = infos.get("fichier_transcription")  # CSV choisi dans l’interface
     audio_path              = infos.get("fichier_audio")
-
-    # Mission par défaut : prise dans infos_projet.json (compatibilité anciens projets)
-    mission_from_infos = infos.get("mission", "")
-    mission = mission_from_infos
 
 
     audio_path          = str(infos.get("fichier_audio", "") or "").strip()
@@ -4473,7 +4478,11 @@ def show_annotation_interface():
                             if libelle_source_kind != "extrait_lib":
                                 st.info(f"Libellé généré avec source de secours : {libelle_source_kind}.")
 
-                            raw = generer_texte_gpt(system_lib, prompt_lib)
+                            raw = generer_texte_gpt(
+                                system_lib,
+                                prompt_lib,
+                                dictee_asr_text=dictee,
+                            )
                             runtime_message_handled = False
                             if _is_local_llm_busy_result(raw):
                                 st.warning("LLM local occupe, reessayez dans quelques secondes.")
@@ -4546,7 +4555,11 @@ def show_annotation_interface():
                             if dictee:
                                 prompt_com += "\n\n[DICTÉE MICRO]\n" + dictee
 
-                            raw = generer_texte_gpt(system_com, prompt_com)
+                            raw = generer_texte_gpt(
+                                system_com,
+                                prompt_com,
+                                dictee_asr_text=dictee,
+                            )
                             runtime_message_handled = False
                             if _is_local_llm_busy_result(raw):
                                 st.warning("LLM local occupe, reessayez dans quelques secondes.")
@@ -4630,7 +4643,11 @@ def show_annotation_interface():
                             if dictee:
                                 prompt_lib += "\n\n[DICTÉE MICRO]\n" + dictee
 
-                            raw = generer_texte_gpt(system_lib, prompt_lib)
+                            raw = generer_texte_gpt(
+                                system_lib,
+                                prompt_lib,
+                                dictee_asr_text=dictee,
+                            )
                             if _is_local_llm_busy_result(raw):
                                 st.warning("LLM local occupe, reessayez dans quelques secondes.")
                                 local_request_blocked = True
@@ -4694,7 +4711,11 @@ def show_annotation_interface():
                             if dictee:
                                 prompt_com += "\n\n[DICTÉE MICRO]\n" + dictee
 
-                            raw = generer_texte_gpt(system_com, prompt_com)
+                            raw = generer_texte_gpt(
+                                system_com,
+                                prompt_com,
+                                dictee_asr_text=dictee,
+                            )
                             if _is_local_llm_busy_result(raw):
                                 st.warning("LLM local occupe, reessayez dans quelques secondes.")
                                 local_request_blocked = True
