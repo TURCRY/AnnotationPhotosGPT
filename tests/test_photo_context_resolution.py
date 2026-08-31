@@ -177,5 +177,91 @@ class PhotoContextResolutionTests(unittest.TestCase):
             self.assertEqual("", resolved["context"]["user"])
 
 
+    def test_explicit_context_wins_over_buchelay_infos(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            photos = self._write_json(base / "contexte_general_photos.json", {
+                "mission": "MISSION PONTOISE",
+                "user": "USER PONTOISE",
+                "system": "SYSTEM PONTOISE",
+            })
+            infos = {
+                "mission": "Mission fallback",
+                "user": "Contexte FALLBACK BUCHELAY",
+                "fichier_contexte_general": str(base / "missing_laptop" / "contexte_general_photos.json"),
+            }
+
+            resolved = resolve_photo_context(
+                infos,
+                base_dir=base,
+                explicit_context_path=photos,
+            )
+
+            self.assertEqual("contexte_general_photos", resolved["source"])
+            self.assertEqual(str(photos), resolved["source_path"])
+            self.assertEqual("MISSION PONTOISE", resolved["context"]["mission"])
+            self.assertEqual("USER PONTOISE", resolved["context"]["user"])
+            self.assertNotIn("BUCHELAY", "\n".join(resolved["context"].values()))
+
+    def test_missing_context_allows_historical_fallback_and_attempts_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            infos = {
+                "mission": "MISSION FALLBACK",
+                "user": "USER FALLBACK BUCHELAY",
+            }
+
+            resolved = resolve_photo_context(infos, base_dir=base)
+
+            self.assertEqual("infos_projet", resolved["source"])
+            self.assertEqual("MISSION FALLBACK", resolved["context"]["mission"])
+            self.assertTrue(resolved["attempts"])
+
+    def test_pcfixe_context_wins_when_laptop_path_is_inaccessible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            pcfixe_dir = base / "pcfixe"
+            pcfixe_dir.mkdir()
+            pcfixe_context = self._write_json(pcfixe_dir / "contexte_general_photos.json", {
+                "mission": "MISSION PCFIXE PONTOISE",
+                "user": "USER PCFIXE PONTOISE",
+            })
+            infos = {
+                "fichier_contexte_general": str(base / "laptop_missing" / "contexte_general_photos.json"),
+                "user": "Contexte FALLBACK BUCHELAY",
+                "pcfixe": {
+                    "fichier_contexte_general": str(pcfixe_context),
+                },
+            }
+
+            resolved = resolve_photo_context(infos, base_dir=base)
+
+            self.assertEqual("contexte_general_photos", resolved["source"])
+            self.assertEqual(str(pcfixe_context), resolved["source_path"])
+            self.assertEqual("MISSION PCFIXE PONTOISE", resolved["context"]["mission"])
+
+    def test_invalid_photos_context_records_error_before_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            explicit = base / "contexte_general_photos.json"
+            explicit.write_text("{bad json", encoding="utf-8")
+            self._write_json(base / "contexte_general.json", {
+                "mission": "MISSION GENERAL FALLBACK",
+            })
+
+            resolved = resolve_photo_context(
+                {"user": "Contexte FALLBACK BUCHELAY"},
+                base_dir=base,
+                explicit_context_path=explicit,
+            )
+
+            self.assertEqual("contexte_general", resolved["source"])
+            self.assertEqual("MISSION GENERAL FALLBACK", resolved["context"]["mission"])
+            self.assertTrue(any(
+                attempt["level"] == "contexte_general_photos"
+                and str(attempt["path"]) == str(explicit)
+                and "JSONDecodeError" in attempt["status"]
+                for attempt in resolved["attempts"]
+            ))
 if __name__ == "__main__":
     unittest.main()

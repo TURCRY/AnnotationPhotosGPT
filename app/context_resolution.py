@@ -58,8 +58,17 @@ def _configured_context_paths(infos: dict[str, Any], expected_name: str) -> list
     return candidates
 
 
-def _context_candidates(infos: dict[str, Any], base_dir: Path | None, filename: str) -> list[Path]:
-    candidates = _configured_context_paths(infos, filename)
+def _context_candidates(
+    infos: dict[str, Any],
+    base_dir: Path | None,
+    filename: str,
+    explicit_path: Path | None = None,
+) -> list[Path]:
+    candidates: list[Path] = []
+    if explicit_path is not None and filename.lower() == "contexte_general_photos.json":
+        _append_unique(candidates, explicit_path)
+    for path in _configured_context_paths(infos, filename):
+        _append_unique(candidates, path)
     for directory in _candidate_dirs(infos, base_dir):
         _append_unique(candidates, directory / filename)
     return candidates
@@ -92,10 +101,14 @@ def resolve_photo_context(
     infos: dict[str, Any] | None,
     *,
     base_dir: str | Path | None = None,
+    explicit_context_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Resolve the active photo context using photos JSON, legacy JSON, then infos fields."""
     infos = infos if isinstance(infos, dict) else {}
     base_path = Path(base_dir) if base_dir is not None else None
+    explicit_path = _clean_path(explicit_context_path)
+    if explicit_path is not None and not explicit_path.is_absolute() and base_path is not None:
+        explicit_path = base_path / explicit_path
     attempts: list[dict[str, str]] = []
 
     levels = (
@@ -103,7 +116,7 @@ def resolve_photo_context(
         ("contexte_general", "contexte_general.json"),
     )
     for level, filename in levels:
-        for candidate in _context_candidates(infos, base_path, filename):
+        for candidate in _context_candidates(infos, base_path, filename, explicit_path):
             data, error = _read_json_object(candidate)
             attempts.append({
                 "level": level,
