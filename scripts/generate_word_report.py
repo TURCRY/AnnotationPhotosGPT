@@ -66,6 +66,18 @@ def parse_args(project_root: Path):
         default="",
         help="Override explicite pour le CSV GTP.",
     )
+    parser.add_argument(
+        "--contexte-general-photos-json",
+        dest="contexte_general_photos_json",
+        default="",
+        help="Chemin explicite vers contexte_general_photos.json fourni par le job.",
+    )
+    parser.add_argument(
+        "--fichier-contexte-general",
+        dest="fichier_contexte_general",
+        default="",
+        help="Alias compatible pour le contexte photo/general fourni par le job.",
+    )
     return parser.parse_args()
 
 def _resolve_path_like(value: str, *, base_dir: Path) -> Path:
@@ -191,6 +203,13 @@ def load_runtime_context(project_root: Path, args):
     gtp_value = str(args.gtp or "").strip()
     annotations_path = _resolve_path_like(gtp_value, base_dir=photos_path.parent) if gtp_value else None
 
+    context_value = str(
+        getattr(args, "contexte_general_photos_json", "")
+        or getattr(args, "fichier_contexte_general", "")
+        or ""
+    ).strip()
+    context_path = _resolve_path_like(context_value, base_dir=infos_path.parent) if context_value else None
+
     return {
         "infos_path": infos_path,
         "infos": infos,
@@ -199,6 +218,7 @@ def load_runtime_context(project_root: Path, args):
         "photos_path": photos_path,
         "batch_path": batch_path,
         "annotations_path": annotations_path,
+        "context_path": context_path,
     }
 
 def safe_text(val: object) -> str:
@@ -295,6 +315,31 @@ def add_caption_cliche(doc: Document, libelle: str, style_name: str = "Légende"
     return p
 
 
+def add_general_information_block(
+    doc: Document,
+    *,
+    annotations_path: Path | None,
+    photos_path: Path,
+    infos: dict,
+    contexte: dict,
+    context_resolution: dict,
+) -> None:
+    doc.add_paragraph("🔎 Informations générales").bold = True
+    doc.add_paragraph(f"Annotations : {annotations_path.name if annotations_path else '— (source UI)'}")
+    doc.add_paragraph(f"Photos : {Path(photos_path).name}")
+    doc.add_paragraph(f"Généré le : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    doc.add_paragraph(f"Utilisateur : {contexte.get('user') or 'N/A'}")
+    doc.add_paragraph(f"Modèle LLM : {infos.get('model', 'N/A')}")
+    doc.add_paragraph(f"Mission : {contexte.get('mission') or 'Non renseignée'}")
+    if contexte.get("etat_avancement"):
+        doc.add_paragraph(f"État d'avancement : {contexte.get('etat_avancement')}")
+    doc.add_paragraph(f"Prompt système : {contexte.get('system') or 'N/A'}")
+    if contexte.get("vlm_system"):
+        doc.add_paragraph(f"Prompt VLM système : {contexte.get('vlm_system')}")
+    if contexte.get("vlm_user"):
+        doc.add_paragraph(f"Prompt VLM utilisateur : {contexte.get('vlm_user')}")
+    doc.add_paragraph(f"Source contexte : {context_resolution.get('source_path') or context_resolution.get('source') or 'N/A'}")
+    doc.add_paragraph("")
 
 # --- Entrées ----------------------------------------------------------------
 REPORT_MODE = os.environ.get("REPORT_MODE", "UI").upper().strip()  # UI / GTP
@@ -445,13 +490,27 @@ df.loc[has_batch, "source_texte"] = "BATCH"
 df.loc[has_ui,    "source_texte"] = "UI"
 df.loc[has_gtp,   "source_texte"] = "GTP"
 
-context_resolution = resolve_photo_context(infos, base_dir=runtime["infos_path"].parent)
+context_resolution = resolve_photo_context(
+    infos,
+    base_dir=runtime["infos_path"].parent,
+    explicit_context_path=runtime.get("context_path"),
+)
 contexte = context_resolution["context"]
 print(
     "[INFO] contexte actif: "
     f"{context_resolution.get('source')} "
     f"{context_resolution.get('source_path') or '(infos_projet)'}"
 )
+print(f"CONTEXT_SOURCE_KIND={context_resolution.get('source') or ''}")
+print(f"CONTEXT_SOURCE={context_resolution.get('source_path') or ''}")
+if context_resolution.get("source") == "infos_projet":
+    print("[WARN] contexte_general_photos.json indisponible: fallback infos_projet utilise pour le contexte du rapport photo.")
+for attempt in context_resolution.get("attempts", []):
+    if attempt.get("status") not in ("ok", "absent"):
+        print(
+            "[WARN] tentative contexte: "
+            f"{attempt.get('level')} {attempt.get('path')} -> {attempt.get('status')}"
+        )
 
 
 # --- Document Word -----------------------------------------------------------
@@ -468,16 +527,14 @@ elif "photo_rel_native" in df.columns:
     df = df.sort_values("photo_rel_native", kind="stable")
 
 # En-tête d'informations
-doc.add_paragraph("🔎 Informations générales").bold = True
-doc.add_paragraph(f"Annotations : {annotations_path.name if annotations_path else '— (source UI)'}")
-doc.add_paragraph(f"Photos : {Path(photos_path).name}")
-doc.add_paragraph(f"Généré le : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-doc.add_paragraph(f"Prompt utilisateur : {contexte.get('user') or 'N/A'}")
-doc.add_paragraph(f"Modèle LLM : {infos.get('model', 'N/A')}")
-doc.add_paragraph(f"Mission : {contexte.get('mission') or 'Non renseignée'}")
-doc.add_paragraph(f"Prompt système : {contexte.get('system') or 'N/A'}")
-doc.add_paragraph("")
-
+add_general_information_block(
+    doc,
+    annotations_path=annotations_path,
+    photos_path=photos_path,
+    infos=infos,
+    contexte=contexte,
+    context_resolution=context_resolution,
+)
 # Table des clichés (TOC des légendes)
 MARKER = "[[RAPPORT_PHOTOS]]"
 p0 = find_marker_paragraph(doc, MARKER)
