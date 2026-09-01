@@ -20,12 +20,17 @@ batch_photos_vlm_llm.py (CONSOLIDÉ)
 import argparse
 import json
 import logging
+import os
+import sys
 from pathlib import Path
 from datetime import datetime
 from contextlib import ExitStack
 
 import pandas as pd
 import requests
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
+from context_resolution import resolve_photo_context
 
 VLM_ENDPOINT = "/vision/describe_batch"
 LLM_ENDPOINT = "/annoter"
@@ -192,6 +197,16 @@ def load_contexte_photos(contexte_path: Path) -> tuple[str, str]:
     contexte = str(data.get("user", "") or data.get("contexte", "") or "").strip()
     return mission, contexte
 
+
+def build_batch_context_payloads(infos: dict, transcript_dir: Path) -> dict:
+    resolution = resolve_photo_context(infos, base_dir=transcript_dir)
+    ctx = resolution["context"]
+    return {
+        "resolution": resolution,
+        "mission": str(ctx.get("mission") or ""),
+        "contexte": json.dumps(ctx, ensure_ascii=False, indent=2),
+        "context": ctx,
+    }
 def pick_prompt_gpt_path(transcript_dir: Path) -> Path:
     """
     On utilise STRICTEMENT prompt_gpt.json (singulier),
@@ -375,11 +390,10 @@ def main():
         raise FileNotFoundError(transcript_csv)
 
     # Contexte photos (lié à la transcription)
-    contexte_path = pick_contexte_photos_path(infos, transcript_dir)
-    if not contexte_path.exists():
-        raise FileNotFoundError(contexte_path)
-    mission, contexte = load_contexte_photos(contexte_path)
-
+    context_payload = build_batch_context_payloads(infos, transcript_dir)
+    mission = context_payload["mission"]
+    contexte = context_payload["contexte"]
+    context_resolution = context_payload["resolution"]
     # Prompt snapshot (lié à la transcription)
     # Prompt (STRICTEMENT prompt_gpt.json, déjà copié par run_all_laptop.bat)
     prompt_path = pick_prompt_gpt_path(transcript_dir)
@@ -417,7 +431,7 @@ def main():
     logging.info("Base affaire  : %s", base_affaire)
     logging.info("CSV           : %s", csv_path)
     logging.info("Transcription : %s", transcript_csv)
-    logging.info("Contexte      : %s", contexte_path)
+    logging.info("Contexte      : %s", context_resolution.get("source_path") or context_resolution.get("source") or "")
     logging.info("Prompt gpt    : %s", prompt_path)
 
     df_tr = load_transcript(transcript_csv)
@@ -507,5 +521,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
