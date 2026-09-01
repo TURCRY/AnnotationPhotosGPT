@@ -2,7 +2,7 @@ from docx import Document
 from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
 import pandas as pd
-import os, glob, json
+import os, glob, json, zipfile
 from PIL import Image
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +23,11 @@ if str(APP_DIR_FOR_IMPORTS) not in sys.path:
 
 from context_resolution import resolve_photo_context
 
+REQUIRED_DOCX_ENTRIES = (
+    "[Content_Types].xml",
+    "word/document.xml",
+    "word/_rels/document.xml.rels",
+)
 # --- Helpers ----------------------------------------------------------------
 def load_photos(path: Path) -> pd.DataFrame:
     if path.suffix.lower() == ".xlsx":
@@ -41,6 +46,54 @@ def find_latest_annotations(base_dir: Path) -> Path:
     if not cands:
         raise FileNotFoundError("Aucune annotation *_GTP_*.csv trouvée.")
     return cands[0]
+
+
+def verify_docx_package(path: Path) -> None:
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"DOCX introuvable : {path}")
+    if path.stat().st_size <= 0:
+        raise RuntimeError(f"DOCX vide : {path}")
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = set(zf.namelist())
+            missing = [name for name in REQUIRED_DOCX_ENTRIES if name not in names]
+            if missing:
+                raise RuntimeError(
+                    "DOCX invalide, entrees obligatoires absentes : "
+                    + ", ".join(missing)
+                    + f" ({path})"
+                )
+            bad_entry = zf.testzip()
+            if bad_entry:
+                raise RuntimeError(f"DOCX ZIP invalide, entree corrompue : {bad_entry} ({path})")
+        Document(str(path))
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError(f"DOCX invalide, archive ZIP illisible : {path}") from exc
+
+
+def _unique_docx_tmp_path(final_path: Path) -> Path:
+    base = final_path.with_name(final_path.name + f".tmp_{os.getpid()}")
+    if not base.exists():
+        return base
+    for index in range(1, 1000):
+        candidate = final_path.with_name(final_path.name + f".tmp_{os.getpid()}_{index}")
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"Trop de fichiers temporaires deja presents pour {final_path}")
+
+
+def publish_docx_atomic(doc: Document, final_path: Path) -> Path:
+    final_path = Path(final_path)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _unique_docx_tmp_path(final_path)
+    doc.save(tmp_path)
+    verify_docx_package(tmp_path)
+    os.replace(tmp_path, final_path)
+    if tmp_path.exists():
+        raise RuntimeError(f"Publication DOCX incomplete, temporaire encore present : {tmp_path}")
+    verify_docx_package(final_path)
+    return final_path
 
 def parse_args(project_root: Path):
     parser = argparse.ArgumentParser(
@@ -662,10 +715,6 @@ output_dir = (
 )
 output_dir.mkdir(parents=True, exist_ok=True)
 output_path = output_dir / report_name
-
-
-doc.save(output_path)
+publish_docx_atomic(doc, output_path)
 print(f"📁 Dossier de sortie Word : {output_dir}")
 print(f"✅ Rapport généré : {output_path}")
-
-
