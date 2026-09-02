@@ -20,6 +20,8 @@ from utils import (
     purge_temp_audio,
     get_canonical_affaires_root,
     canonicalize_affaires_path,
+    project_path_exists,
+    same_project_path,
 )
 from path_migration import migrate_photo_dataframe_paths
 from datetime import datetime
@@ -321,7 +323,7 @@ def _norm_path(path_value: str) -> str:
 
 
 def _same_path(left: str, right: str) -> bool:
-    return bool(left and right and _norm_path(left) == _norm_path(right))
+    return same_project_path(left, right)
 
 
 def _is_expected_compatible_wav(path_value: str) -> bool:
@@ -355,11 +357,11 @@ def _project_status(infos: dict) -> dict:
     file_blockers = []
 
     photos = str(infos.get("fichier_photos", "") or "").strip()
-    if not photos or not os.path.exists(photos):
+    if not photos or not project_path_exists(photos):
         file_blockers.append("fichier_photos manquant")
 
     transcription = str(infos.get("fichier_transcription", "") or "").strip()
-    if not transcription or not os.path.exists(transcription):
+    if not transcription or not project_path_exists(transcription):
         file_blockers.append("fichier_transcription manquant")
 
     audio_source = str(infos.get("fichier_audio_source", "") or "").strip()
@@ -367,9 +369,9 @@ def _project_status(infos: dict) -> dict:
     compat_source = str(infos.get("audio_compat_source", "") or "").strip()
     audio_blockers = []
 
-    if not audio_source or not os.path.exists(audio_source):
+    if not audio_source or not project_path_exists(audio_source):
         audio_blockers.append("fichier_audio_source manquant")
-    elif not audio_compat or not os.path.exists(audio_compat):
+    elif not audio_compat or not project_path_exists(audio_compat):
         audio_blockers.append("audio compatible manquant")
     elif compat_source and not _same_path(compat_source, audio_source):
         audio_blockers.append("audio compatible incoherent avec la source")

@@ -104,6 +104,7 @@ class GtpExportSyncTests(unittest.TestCase):
         self.mirror = root / "mirror"
         self.nas = root / "nas"
         self.pending = root / "pending" / "gtp_exports_nas_pending.json"
+        self.manifest = root / "pending" / "gtp_exports_manifest.json"
         for path in (self.work, self.mirror, self.nas, self.pending.parent):
             path.mkdir(parents=True, exist_ok=True)
         self.infos = {
@@ -132,6 +133,7 @@ class GtpExportSyncTests(unittest.TestCase):
         return patch.multiple(
             ag,
             _GTP_EXPORTS_NAS_PENDING_PATH=self.pending,
+            _GTP_EXPORTS_MANIFEST_PATH=self.manifest,
             _canonical_laptop_photos_dir=lambda infos: self.mirror,
             _nas_photos_dir=lambda infos: self.nas,
             _unc_available=lambda path: nas_available,

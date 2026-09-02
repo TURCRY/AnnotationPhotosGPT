@@ -17,6 +17,7 @@ from utils import (
     detect_canonical_snapshot,
     load_canonical_snapshot_infos,
     canonicalize_infos_paths,
+    same_project_path,
 )
 from affaire_creation_client import create_affaire_server_compatible
 
@@ -39,6 +40,8 @@ TEMP_DIR = os.path.join(BASE_DIR, "data", "temp")
 AFFAIRES_ROOT = get_canonical_affaires_root()
 PCFIXE_LOCAL_AFFAIRES_ROOT = r"C:\Affaires"
 AUDIO_EXT = {".wav", ".mp3"}
+PHOTO_CONTEXT_PRIMARY = "contexte_general_photos.json"
+PHOTO_CONTEXT_LEGACY = "contexte_general.json"
 UI_DEFAULTS = {
     "photo_rel_native": "",
     "nom_fichier_image": "",
@@ -174,7 +177,7 @@ def _norm_path(p: str) -> str:
 
 
 def _same_path(left: str, right: str) -> bool:
-    return bool(left and right and _norm_path(left) == _norm_path(right))
+    return same_project_path(left, right)
 
 
 def _is_expected_compatible_wav(path_value: str) -> bool:
@@ -268,15 +271,55 @@ def _context_json_candidates(directory: str) -> list[str]:
 
     def sort_key(name: str) -> tuple[int, str]:
         lower = name.lower()
-        if lower == "contexte_general.json":
+        if lower == PHOTO_CONTEXT_PRIMARY:
             return (0, lower)
-        if lower == "contexte_general_photos.json":
+        if lower == PHOTO_CONTEXT_LEGACY:
             return (1, lower)
         if lower.startswith("contexte_general"):
             return (2, lower)
         return (3, lower)
 
     return sorted(candidates, key=sort_key)
+
+
+def _preferred_context_candidate(current_path: str, current_dir: str, candidates: list[str]) -> str:
+    candidates_by_lower = {name.lower(): name for name in candidates}
+    if PHOTO_CONTEXT_PRIMARY in candidates_by_lower:
+        return candidates_by_lower[PHOTO_CONTEXT_PRIMARY]
+    if PHOTO_CONTEXT_LEGACY in candidates_by_lower:
+        return candidates_by_lower[PHOTO_CONTEXT_LEGACY]
+
+    if current_path and current_dir:
+        try:
+            if os.path.abspath(os.path.dirname(current_path)) == os.path.abspath(current_dir):
+                base_name = os.path.basename(current_path)
+                if base_name in candidates:
+                    return base_name
+        except Exception:
+            return ""
+    return candidates[0] if candidates else ""
+
+
+def _sync_context_selectbox(select_key: str, current_path: str, current_dir: str, candidates: list[str]) -> None:
+    selected = st.session_state.get(select_key)
+    primary_present = any(name.lower() == PHOTO_CONTEXT_PRIMARY for name in candidates)
+    if selected in candidates:
+        if primary_present and str(selected).lower() == PHOTO_CONTEXT_LEGACY:
+            st.session_state[select_key] = _preferred_context_candidate(current_path, current_dir, candidates)
+        return
+
+    preferred = _preferred_context_candidate(current_path, current_dir, candidates)
+    if preferred:
+        st.session_state[select_key] = preferred
+    elif selected not in candidates:
+        st.session_state.pop(select_key, None)
+
+
+def _selected_context_for_save(temp: dict) -> str:
+    return (
+        _real_or_empty((temp or {}).get("fichier_contexte_general_reel", ""))
+        or _real_or_empty((temp or {}).get("fichier_contexte_general_temp", ""))
+    )
 
 
 def _clone_default_value(value):
@@ -1445,13 +1488,13 @@ def show_selection_interface():
         st.caption("Utilisez la commande de génération audio compatible avant l'enregistrement final.")
 
     # =====================================================================
-    # Contexte général (JSON)
+    # Contexte photos (JSON)
     # =====================================================================
     st.divider()
-    st.markdown("### 🧩 Contexte général (contexte_general.json)")
+    st.markdown("### 🧩 Contexte photos (contexte_general_photos.json ; fallback : contexte_general.json)")
 
     ctx_dir_input = st.text_input(
-        "Chemin du DOSSIER où se trouve le fichier contexte_general.json :",
+        "Chemin du DOSSIER où se trouve le contexte photos ou son fallback legacy :",
         value=os.path.dirname(temp.get("fichier_contexte_general_reel", "")) if temp.get("fichier_contexte_general_reel") else "",
         key="ctx_dir_input",
         placeholder=r"C:\Users\...\Dossier_affaire",
@@ -1462,8 +1505,13 @@ def show_selection_interface():
         if os.path.isdir(ctx_dir):
             candidates = _context_json_candidates(ctx_dir)
             if candidates:
+                current_context_real = (
+                    _real_or_empty(temp.get("fichier_contexte_general_reel", ""))
+                    or _real_or_empty(infos.get("fichier_contexte_general", ""))
+                )
+                _sync_context_selectbox("ctx_file_select", current_context_real, ctx_dir, candidates)
                 ctx_file_selected = st.selectbox(
-                    "Choisir le fichier JSON de contexte dans ce dossier :",
+                    "Choisir le fichier JSON de contexte photos :",
                     candidates,
                     key="ctx_file_select",
                 )
@@ -1471,19 +1519,19 @@ def show_selection_interface():
                     real_path = os.path.abspath(os.path.join(ctx_dir, ctx_file_selected))
                     temp["fichier_contexte_general_reel"] = real_path
                     temp["fichier_contexte_general"] = real_path
-                    st.success(f"✅ Contexte général (chemin RÉEL) : {real_path}")
+                    st.success(f"✅ Contexte photos sélectionné : {real_path}")
             else:
                 st.warning("Aucun fichier .json trouvé dans ce dossier.")
         else:
             st.error(f"⛔ Ce chemin de dossier n'existe pas : `{ctx_dir}`")
 
     st.markdown(
-        f"**Chemin RÉEL contexte général courant :** "
+        f"**Chemin RÉEL contexte photos sélectionné/persisté :** "
         f"`{temp.get('fichier_contexte_general_reel', '') or '—'}`"
     )
 
     uploaded_ctx = st.file_uploader(
-        "📂 (Optionnel) Sélectionner le contexte_general.json [copie temporaire]",
+        "📂 (Optionnel) Sélectionner un JSON de contexte photos [copie temporaire]",
         type=["json"],
         key="upload_contexte_general",
     )
@@ -1493,7 +1541,9 @@ def show_selection_interface():
         with open(path, "wb") as f:
             f.write(uploaded_ctx.getbuffer())
         temp["fichier_contexte_general_temp"] = path
-        st.info(f"📂 Copie temporaire contexte général : {path}")
+        temp["fichier_contexte_general_reel"] = os.path.abspath(path)
+        temp["fichier_contexte_general"] = temp["fichier_contexte_general_reel"]
+        st.info(f"📂 Copie temporaire contexte photos sélectionnée : {path}")
 
 
     # -----------------------------------------------------------------
@@ -1715,7 +1765,7 @@ def show_selection_interface():
         photos_real    = _real_or_empty(t.get("fichier_photos_reel", ""))
         trans_real     = _real_or_empty(t.get("fichier_transcription_reel", ""))
         audio_src_real = _real_or_empty(t.get("fichier_audio_source", "")) or _real_or_empty(infos.get("fichier_audio_source", ""))
-        ctx_selected = _real_or_empty(t.get("fichier_contexte_general_reel", ""))
+        ctx_selected = _selected_context_for_save(t)
 
 
         ok_a, id_affaire, err_a = validate_id_affaire(id_affaire_input)

@@ -43,6 +43,7 @@ _DICTEES_PENDING_DIR = _DICTEES_ROOT / "pending"
 _SYNC_PENDING_DIR = _REPO_ROOT / "data" / "sync_pending"
 _PHOTOS_NAS_PENDING_PATH = _SYNC_PENDING_DIR / "photos_nas_pending.json"
 _GTP_EXPORTS_NAS_PENDING_PATH = _SYNC_PENDING_DIR / "gtp_exports_nas_pending.json"
+_GTP_EXPORTS_MANIFEST_PATH = _SYNC_PENDING_DIR / "gtp_exports_manifest.json"
 _PCFIXE_AFFAIRES_SMB_ROOTS = (
     r"\\10.0.1.10\Affaires",
     r"\\192.168.0.155\Affaires",
@@ -577,6 +578,121 @@ def _sha256_file(path: str | Path) -> str:
     return h.hexdigest()
 
 
+def _load_gpt_exports_manifest() -> dict:
+    if not _GTP_EXPORTS_MANIFEST_PATH.exists():
+        return {"entries": {}}
+    try:
+        payload = json.loads(_GTP_EXPORTS_MANIFEST_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("[GTP_EXPORT_SYNC] manifest unreadable: %s", exc)
+        return {"entries": {}}
+    if not isinstance(payload, dict):
+        return {"entries": {}}
+    payload.setdefault("entries", {})
+    if not isinstance(payload["entries"], dict):
+        payload["entries"] = {}
+    return payload
+
+
+def _write_gpt_exports_manifest(payload: dict) -> None:
+    payload = payload if isinstance(payload, dict) else {}
+    payload.setdefault("entries", {})
+    _atomic_write_json_file(_GTP_EXPORTS_MANIFEST_PATH, payload)
+
+
+def _normalise_xlsx_cell_value(value):
+    if value is None:
+        return None
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, float):
+        return {"float": repr(value)}
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    return str(value)
+
+
+def _xlsx_semantic_fingerprint(path: str | Path) -> str:
+    from openpyxl import load_workbook
+
+    payload = []
+    with Path(path).open("rb") as f:
+        wb = load_workbook(f, read_only=True, data_only=False)
+        try:
+            for ws in wb.worksheets:
+                rows = []
+                for row in ws.iter_rows():
+                    rows.append([_normalise_xlsx_cell_value(cell.value) for cell in row])
+                payload.append({
+                    "title": ws.title,
+                    "max_row": ws.max_row,
+                    "max_column": ws.max_column,
+                    "rows": rows,
+                })
+        finally:
+            wb.close()
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _gpt_export_fingerprint(path: str | Path, file_type: str = "") -> dict:
+    p = Path(path)
+    kind = "xlsx_cells" if p.suffix.lower() == ".xlsx" or str(file_type).lower().endswith("xlsx") else "sha256"
+    if kind == "xlsx_cells":
+        try:
+            fingerprint = _xlsx_semantic_fingerprint(p)
+        except Exception as exc:
+            log.warning("[GTP_EXPORT_SYNC] xlsx semantic fingerprint failed for %s: %s", p, exc)
+            kind = "sha256"
+            fingerprint = _sha256_file(p)
+    else:
+        fingerprint = _sha256_file(p)
+    stat = p.stat()
+    return {
+        "kind": kind,
+        "fingerprint": fingerprint,
+        "sha256": _sha256_file(p),
+        "size": stat.st_size,
+    }
+
+
+def _gpt_manifest_key(nas_path: str | Path) -> str:
+    return _gpt_pending_key(nas_path)
+
+
+def _get_gpt_export_baseline(nas_path: str | Path) -> dict | None:
+    entries = _load_gpt_exports_manifest().get("entries", {})
+    entry = entries.get(_gpt_manifest_key(nas_path))
+    return entry if isinstance(entry, dict) else None
+
+
+def _record_gpt_export_baseline(
+    *,
+    local_path: Path,
+    nas_path: Path,
+    file_type: str,
+    fingerprint: dict,
+    operation_id: str = "",
+) -> None:
+    payload = _load_gpt_exports_manifest()
+    entries = payload.setdefault("entries", {})
+    entries[_gpt_manifest_key(nas_path)] = {
+        "operation_id": _ui_text(operation_id),
+        "type": file_type,
+        "file_type": file_type,
+        "local_path": str(local_path),
+        "nas_path": str(nas_path),
+        "fingerprint_kind": fingerprint.get("kind", ""),
+        "fingerprint": fingerprint.get("fingerprint", ""),
+        "sha256": fingerprint.get("sha256", ""),
+        "size": fingerprint.get("size", ""),
+        "published_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _write_gpt_exports_manifest(payload)
+
+
 def _photo_rel_at(photos_df: pd.DataFrame, idx: int) -> str:
     try:
         if "photo_rel_native" in photos_df.columns:
@@ -963,27 +1079,76 @@ def _conflict_backup_existing_nas(path: Path) -> str:
     return str(backup)
 
 
-def _copy_file_atomic_verified(src: Path, dst: Path) -> dict:
+def _copy_file_atomic_verified(src: Path, dst: Path, file_type: str = "", operation_id: str = "") -> dict:
     src = Path(src)
     dst = Path(dst)
     if not src.is_file():
         raise FileNotFoundError(f"Fichier source introuvable : {src}")
     dst.parent.mkdir(parents=True, exist_ok=True)
-    src_hash = _sha256_file(src)
-    src_size = src.stat().st_size
+    src_fingerprint = _gpt_export_fingerprint(src, file_type)
+    src_hash = src_fingerprint["sha256"]
+    src_size = src_fingerprint["size"]
     if dst.exists():
-        dst_hash = _sha256_file(dst)
-        if dst_hash == src_hash:
+        dst_fingerprint = _gpt_export_fingerprint(dst, file_type)
+        if dst_fingerprint["fingerprint"] == src_fingerprint["fingerprint"]:
+            _record_gpt_export_baseline(
+                local_path=src,
+                nas_path=dst,
+                file_type=file_type,
+                fingerprint=dst_fingerprint,
+                operation_id=operation_id,
+            )
             return {
                 "ok": True,
                 "already": True,
-                "sha256": src_hash,
-                "size": src_size,
+                "sha256": dst_fingerprint["sha256"],
+                "size": dst_fingerprint["size"],
+                "fingerprint": dst_fingerprint["fingerprint"],
+                "fingerprint_kind": dst_fingerprint["kind"],
                 "path": str(dst),
             }
+
+        baseline = _get_gpt_export_baseline(dst)
+        baseline_fp = _ui_text((baseline or {}).get("fingerprint"))
+        baseline_kind = _ui_text((baseline or {}).get("fingerprint_kind"))
+        if baseline_fp and baseline_kind == dst_fingerprint["kind"] and baseline_fp == dst_fingerprint["fingerprint"]:
+            tmp = _atomic_tmp_path(dst)
+            try:
+                shutil.copy2(str(src), str(tmp))
+                _fsync_path(tmp)
+                if tmp.stat().st_size != src_size:
+                    raise RuntimeError(f"Taille differente avant publication NAS : {dst}")
+                if _gpt_export_fingerprint(tmp, file_type)["fingerprint"] != src_fingerprint["fingerprint"]:
+                    raise RuntimeError(f"Fingerprint different avant publication NAS : {dst}")
+                os.replace(str(tmp), str(dst))
+            finally:
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
+
+            final_fingerprint = _gpt_export_fingerprint(dst, file_type)
+            if final_fingerprint["fingerprint"] != src_fingerprint["fingerprint"]:
+                raise RuntimeError(f"Fingerprint different apres publication NAS : {dst}")
+            _record_gpt_export_baseline(
+                local_path=src,
+                nas_path=dst,
+                file_type=file_type,
+                fingerprint=final_fingerprint,
+                operation_id=operation_id,
+            )
+            return {
+                "ok": True,
+                "already": False,
+                "updated_from_baseline": True,
+                "sha256": final_fingerprint["sha256"],
+                "size": final_fingerprint["size"],
+                "fingerprint": final_fingerprint["fingerprint"],
+                "fingerprint_kind": final_fingerprint["kind"],
+                "path": str(dst),
+            }
+
         backup = _conflict_backup_existing_nas(dst)
         raise FileExistsError(
-            f"Conflit NAS : {dst} existe avec un hash different. Sauvegarde creee : {backup}"
+            f"Conflit NAS : {dst} existe avec un contenu different de la derniere publication connue. Sauvegarde creee : {backup}"
         )
     tmp = _atomic_tmp_path(dst)
     try:
@@ -991,16 +1156,31 @@ def _copy_file_atomic_verified(src: Path, dst: Path) -> dict:
         _fsync_path(tmp)
         if tmp.stat().st_size != src_size:
             raise RuntimeError(f"Taille differente avant publication NAS : {dst}")
-        if _sha256_file(tmp) != src_hash:
-            raise RuntimeError(f"Hash different avant publication NAS : {dst}")
+        if _gpt_export_fingerprint(tmp, file_type)["fingerprint"] != src_fingerprint["fingerprint"]:
+            raise RuntimeError(f"Fingerprint different avant publication NAS : {dst}")
         os.replace(str(tmp), str(dst))
     finally:
         if tmp.exists():
             tmp.unlink(missing_ok=True)
-    final_hash = _sha256_file(dst)
-    if final_hash != src_hash:
-        raise RuntimeError(f"Hash different apres publication NAS : {dst}")
-    return {"ok": True, "already": False, "sha256": final_hash, "size": src_size, "path": str(dst)}
+    final_fingerprint = _gpt_export_fingerprint(dst, file_type)
+    if final_fingerprint["fingerprint"] != src_fingerprint["fingerprint"]:
+        raise RuntimeError(f"Fingerprint different apres publication NAS : {dst}")
+    _record_gpt_export_baseline(
+        local_path=src,
+        nas_path=dst,
+        file_type=file_type,
+        fingerprint=final_fingerprint,
+        operation_id=operation_id,
+    )
+    return {
+        "ok": True,
+        "already": False,
+        "sha256": final_fingerprint["sha256"],
+        "size": src_size,
+        "fingerprint": final_fingerprint["fingerprint"],
+        "fingerprint_kind": final_fingerprint["kind"],
+        "path": str(dst),
+    }
 
 
 def _retry_pending_gpt_exports(infos: dict) -> dict:
@@ -1013,20 +1193,20 @@ def _retry_pending_gpt_exports(infos: dict) -> dict:
     for key, entry in list(entries.items()):
         local_path = Path(_ui_text(entry.get("local_path")))
         nas_path = Path(_ui_text(entry.get("nas_path")))
-        expected_hash = _ui_text(entry.get("local_sha256") or entry.get("sha256_local"))
         if not local_path.is_file():
             entry["last_error"] = f"Fichier local introuvable : {local_path}"
             entry["last_attempt_at"] = datetime.now().isoformat(timespec="seconds")
             result["pending"] += 1
             continue
-        if nas_path.exists() and _sha256_file(nas_path) == expected_hash:
-            entries.pop(key, None)
-            result["resolved"] += 1
-            continue
         try:
             if not _unc_available(nas_path):
                 raise ConnectionError(f"NAS indisponible ou trop lent ({_UNC_PROBE_TIMEOUT_S:.1f}s): {_unc_host(nas_path)}")
-            _copy_file_atomic_verified(local_path, nas_path)
+            _copy_file_atomic_verified(
+                local_path,
+                nas_path,
+                file_type=_ui_text(entry.get("file_type") or entry.get("type")),
+                operation_id=_ui_text(entry.get("operation_id")),
+            )
             entries.pop(key, None)
             result["resolved"] += 1
         except FileExistsError as exc:
@@ -1085,7 +1265,12 @@ def _publish_validated_annotation_file(
     try:
         if not _unc_available(nas_path):
             raise ConnectionError(f"NAS indisponible ou trop lent ({_UNC_PROBE_TIMEOUT_S:.1f}s): {_unc_host(nas_path)}")
-        copy_result = _copy_file_atomic_verified(local_path, nas_path)
+        copy_result = _copy_file_atomic_verified(
+            local_path,
+            nas_path,
+            file_type=file_type,
+            operation_id=operation_id,
+        )
         result.update({
             "nas_saved": True,
             "nas_hash": copy_result.get("sha256", ""),
@@ -5079,8 +5264,8 @@ def show_annotation_interface():
                 texte_com_to_save = ""
             else:
                 # Synchro : calcul des bornes audio + timecode
-                cur_av = float(st.session_state.get("audio_av_input", projet["audio_av"]))
-                cur_ap = float(st.session_state.get("audio_ap_input", projet["audio_ap"]))
+                cur_av = float(st.session_state.get("audio_av_input", audio_av))
+                cur_ap = float(st.session_state.get("audio_ap_input", audio_ap))
                 start  = max(0.0, t_ref - cur_av)
                 end    = t_ref + cur_ap
 

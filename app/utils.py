@@ -124,6 +124,38 @@ def pcfixe_affaires_path(path_value: str) -> str:
     return PCFIXE_LOCAL_AFFAIRES_ROOT
 
 
+def comparable_affaires_path(path_value: str) -> str:
+    """Normalise seulement les racines Affaires equivalentes pour comparer deux chemins."""
+    raw = str(path_value or "").strip().strip('"')
+    if not raw:
+        return ""
+    canonical = canonicalize_affaires_path(raw)
+    return os.path.normcase(os.path.abspath(canonical))
+
+
+def same_project_path(left: str, right: str) -> bool:
+    return bool(left and right and comparable_affaires_path(left) == comparable_affaires_path(right))
+
+
+def project_path_exists(path_value: str) -> bool:
+    """Teste existence avec miroirs C:\\Affaires et UNC canonique."""
+    raw = str(path_value or "").strip().strip('"')
+    if not raw:
+        return False
+    if os.path.exists(raw):
+        return True
+
+    candidates = []
+    canonical = canonicalize_affaires_path(raw)
+    if canonical and canonical != raw:
+        candidates.append(canonical)
+    pcfixe = pcfixe_affaires_path(raw)
+    if pcfixe and pcfixe != raw:
+        candidates.append(pcfixe)
+
+    return any(candidate and os.path.exists(candidate) for candidate in candidates)
+
+
 def detect_canonical_snapshot(id_affaire: str, id_captation: str) -> dict:
     paths = build_canonical_snapshot_paths(id_affaire, id_captation)
     photos_dir = paths["photos_dir"]

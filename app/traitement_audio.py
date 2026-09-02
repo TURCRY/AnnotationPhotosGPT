@@ -21,6 +21,9 @@ except Exception:
 
 # Fichier audio technique utilisé par le serveur
 AUDIO_COMPAT = os.path.join("data", "temp", "audio_compatible.wav")
+AUDIO_SERVER_HOST = "127.0.0.1"
+AUDIO_SERVER_PORT = 5000
+AUDIO_SERVER_BASE_URL = f"http://{AUDIO_SERVER_HOST}:{AUDIO_SERVER_PORT}"
 
 
 # -------------------------------------------------------
@@ -187,40 +190,252 @@ def _port_open(host="127.0.0.1", port=5000, timeout=0.3):
 # Serveur audio
 # -------------------------------------------------------
 
+def _canonical_audio_path(path: str) -> str:
+    return os.path.realpath(os.path.abspath(str(path)))
+
+
+def audio_file_identity(path: str) -> dict:
+    p = _canonical_audio_path(path)
+    stat = os.stat(p)
+    return {
+        "source_path": p,
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def audio_identity_fingerprint(identity_or_path) -> str:
+    identity = (
+        audio_file_identity(identity_or_path)
+        if isinstance(identity_or_path, (str, os.PathLike))
+        else identity_or_path
+    )
+    raw = (
+        f"{os.path.normcase(_canonical_audio_path(identity.get('source_path', '')))}|"
+        f"{int(identity.get('size', -1))}|"
+        f"{int(identity.get('mtime_ns', -1))}"
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def audio_url_for_identity(identity_or_path) -> str:
+    fingerprint = audio_identity_fingerprint(identity_or_path)
+    return f"{AUDIO_SERVER_BASE_URL}/audio/audio_compatible.wav?v={fingerprint}"
+
+
+def audio_component_key_for_identity(identity_or_path) -> str:
+    return f"audio-sync-{audio_identity_fingerprint(identity_or_path)}"
+
+
+def _identity_matches(served: dict | None, expected: dict) -> bool:
+    if not served:
+        return False
+    try:
+        served_path = served.get("source_path") or served.get("audio_path")
+        served_size = served.get("size", served.get("size_bytes"))
+        served_mtime = served.get("mtime_ns")
+        return (
+            os.path.normcase(_canonical_audio_path(served_path))
+            == os.path.normcase(_canonical_audio_path(expected["source_path"]))
+            and int(served_size) == int(expected["size"])
+            and int(served_mtime) == int(expected["mtime_ns"])
+        )
+    except Exception:
+        return False
+
 
 
 def _get_server_audio_path():
     try:
-        r = requests.get("http://127.0.0.1:5000/ping", timeout=0.5)
+        r = requests.get(f"{AUDIO_SERVER_BASE_URL}/ping", timeout=0.5)
         if r.ok:
             return (r.json() or {}).get("audio_path")
     except Exception:
         return None
     return None
 
+def _get_server_audio_info():
+    try:
+        r = requests.get(f"{AUDIO_SERVER_BASE_URL}/audio/info", timeout=0.8)
+        if r.ok:
+            return r.json() or {}
+    except Exception:
+        return None
+    return None
+
+
+def _listener_pids_on_port(port: int = AUDIO_SERVER_PORT) -> set[int]:
+    pids: set[int] = set()
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["netstat", "-ano", "-p", "tcp"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                check=False,
+            )
+            for line in (result.stdout or "").splitlines():
+                parts = line.split()
+                if len(parts) < 5 or parts[0].upper() != "TCP":
+                    continue
+                local_addr, state, pid_text = parts[1], parts[3].upper(), parts[4]
+                if state != "LISTENING":
+                    continue
+                if local_addr.rsplit(":", 1)[-1] == str(port):
+                    try:
+                        pids.add(int(pid_text))
+                    except ValueError:
+                        pass
+        except Exception:
+            return set()
+        return pids
+
+    for cmd in (["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"], ["fuser", f"{port}/tcp"]):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
+        except Exception:
+            continue
+        for token in (result.stdout or "").replace("\n", " ").split():
+            try:
+                pids.add(int(token))
+            except ValueError:
+                pass
+        if pids:
+            break
+    return pids
+
+
+def _process_command_line(pid: int) -> str:
+    if os.name == "nt":
+        commands = [
+            ["wmic", "process", "where", f"ProcessId={int(pid)}", "get", "CommandLine", "/value"],
+            [
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                "-NoProfile",
+                "-Command",
+                f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine",
+            ],
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine",
+            ],
+        ]
+    else:
+        commands = [["ps", "-p", str(int(pid)), "-o", "command="]]
+
+    for cmd in commands:
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            continue
+        output = (result.stdout or "").strip()
+        if not output:
+            continue
+        if "CommandLine=" in output:
+            output = output.split("CommandLine=", 1)[1].strip()
+        return output
+    return ""
+
+
+def _is_our_audio_server_process(pid: int) -> bool:
+    cmdline = _process_command_line(pid)
+    if not cmdline:
+        return False
+    cmd_norm = cmdline.replace("/", "\\").lower()
+    script = os.path.realpath(os.path.join(os.path.dirname(__file__), "audio_server.py"))
+    script_norm = script.replace("/", "\\").lower()
+    return "audio_server.py" in cmd_norm and (
+        script_norm in cmd_norm or "\\annotationphotosgpt\\" in cmd_norm
+    )
+
+
+def _terminate_process_tree(pid: int) -> None:
+    if int(pid) == os.getpid():
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    else:
+        os.kill(int(pid), signal.SIGTERM)
+
+
+def _session_state_get(key):
+    try:
+        return st.session_state.get(key)
+    except Exception:
+        return None
+
+
+def _session_state_set(key, value):
+    try:
+        st.session_state[key] = value
+    except Exception:
+        pass
+
+
+def _stop_stale_audio_servers_on_port(port: int = AUDIO_SERVER_PORT) -> list[int]:
+    stopped: list[int] = []
+    for pid in sorted(_listener_pids_on_port(port)):
+        if _is_our_audio_server_process(pid):
+            _terminate_process_tree(pid)
+            stopped.append(pid)
+    return stopped
+
+
 def start_audio_server_if_needed(audio_path: str):
-    wanted = os.path.abspath(audio_path)
+    wanted = _canonical_audio_path(audio_path)
+    if not os.path.exists(wanted):
+        raise FileNotFoundError(f"Fichier audio introuvable : {wanted}")
 
-    if _port_open("127.0.0.1", 5000):
-        served = _get_server_audio_path()
-        # si le serveur répond et sert déjà le bon fichier → rien à faire
-        if served and os.path.abspath(served) == wanted:
-            return
+    expected = audio_file_identity(wanted)
 
-        # sinon → tenter d’arrêter proprement le process qu’on a mémorisé
-        proc = st.session_state.get("_audio_srv")
+    if _port_open(AUDIO_SERVER_HOST, AUDIO_SERVER_PORT):
+        served = _get_server_audio_info()
+        if _identity_matches(served, expected):
+            return expected
+
+        proc = _session_state_get("_audio_srv")
         if proc is not None:
             try:
                 proc.terminate()
             except Exception:
                 pass
-            st.session_state["_audio_srv"] = None
+            _session_state_set("_audio_srv", None)
 
-        # attendre la libération du port
+        _stop_stale_audio_servers_on_port(AUDIO_SERVER_PORT)
+
         for _ in range(30):
-            if not _port_open("127.0.0.1", 5000):
+            if not _port_open(AUDIO_SERVER_HOST, AUDIO_SERVER_PORT):
                 break
             time.sleep(0.1)
+
+        if _port_open(AUDIO_SERVER_HOST, AUDIO_SERVER_PORT):
+            served_after_stop = _get_server_audio_info()
+            if _identity_matches(served_after_stop, expected):
+                return expected
+            raise RuntimeError(
+                "Le port audio 127.0.0.1:5000 est occupe par un serveur qui ne "
+                "sert pas le fichier audio demande, et il n'a pas pu etre remplace "
+                "avec les garde-fous actuels."
+            )
 
     env = os.environ.copy()
     env["AUDIO_FILE_PATH"] = wanted
@@ -237,26 +452,29 @@ def start_audio_server_if_needed(audio_path: str):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    st.session_state["_audio_srv"] = proc
+    _session_state_set("_audio_srv", proc)
 
     for _ in range(30):
         if proc.poll() is not None:
-            st.session_state["_audio_srv"] = None
+            _session_state_set("_audio_srv", None)
             raise RuntimeError(
                 "Le serveur audio local s'est arrêté immédiatement après son lancement."
             )
-        if _port_open("127.0.0.1", 5000):
-            # option : vérifier que le serveur sert bien le bon fichier
-            served = _get_server_audio_path()
-            if served and os.path.abspath(served) == wanted:
-                return
+        if _port_open(AUDIO_SERVER_HOST, AUDIO_SERVER_PORT):
+            served = _get_server_audio_info()
+            if _identity_matches(served, expected):
+                return expected
         time.sleep(0.1)
 
-    if not _port_open("127.0.0.1", 5000):
-        st.session_state["_audio_srv"] = None
-        raise RuntimeError(
-            "Impossible de démarrer le serveur audio local sur 127.0.0.1:5000."
-        )
+    _session_state_set("_audio_srv", None)
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    raise RuntimeError(
+        "Impossible de demarrer un serveur audio local coherent avec le fichier demande "
+        "sur 127.0.0.1:5000."
+    )
 
 
 def stop_audio_server_if_any():

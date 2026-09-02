@@ -18,7 +18,13 @@ from path_migration import (
 from streamlit_wavesurfer import wavesurfer
 import requests
 #----------------------------------------------------------------------------
-from traitement_audio import start_audio_server_if_needed, _extraire_horodatage_source
+from traitement_audio import (
+    start_audio_server_if_needed,
+    _extraire_horodatage_source,
+    audio_file_identity,
+    audio_component_key_for_identity,
+    audio_url_for_identity,
+)
 from pathlib import Path
 from pandas import Timestamp
 import numpy as np
@@ -370,7 +376,6 @@ def show_sync_interface():
     audio_path          = str(infos.get("fichier_audio", "") or infos.get("fichier_audio_compatible", "") or "").strip()
     audio_src_path      = str(infos.get("fichier_audio_source", "") or "").strip()
     audio_compat_source = str(infos.get("audio_compat_source", "") or "").strip()
-    audio_url   = "http://127.0.0.1:5000/audio/audio_compatible.wav"
     # Paramètres de retour arrière (infos_projet.json)
     retour_arriere = float(infos.get("retour_arriere", 10.0))
 
@@ -378,8 +383,14 @@ def show_sync_interface():
         st.error("Audio compatible introuvable. Passez d'abord par la sélection des fichiers.")
         return
 
+    audio_identity = audio_file_identity(audio_path)
+    audio_url = audio_url_for_identity(audio_identity)
+
     try:
-        start_audio_server_if_needed(audio_path)
+        served_identity = start_audio_server_if_needed(audio_path)
+        if served_identity:
+            audio_identity = served_identity
+            audio_url = audio_url_for_identity(audio_identity)
     except Exception as e:
         st.error(f"❌ Serveur audio local indisponible : {e}")
         st.stop()
@@ -763,7 +774,7 @@ def show_sync_interface():
             if ok:
                 st.success("✅ Serveur audio : accessible")
                 try:
-                    info = requests.get("http://127.0.0.1:5000/info", timeout=3).json()
+                    info = requests.get("http://127.0.0.1:5000/audio/info", timeout=3).json()
                     if info.get("size_bytes"):
                         st.caption(f"Fichier : {info.get('filename')} • ~{info['size_bytes']/1_000_000:.1f} Mo")
                 except Exception:
@@ -811,7 +822,7 @@ def show_sync_interface():
             audio_url=audio_url,           # variable déjà définie au début
             height=140,
             start_sec=start_sec,           # reprend la lecture ici
-            key="audio-sync",
+            key=audio_component_key_for_identity(audio_identity),
         )
         
         # ---------- Retour JS & validation opérateur ----------

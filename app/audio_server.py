@@ -24,6 +24,20 @@ CHUNK_SIZE = 1024 * 1024  # 1 MB
 print("### AUDIO SERVER VERSION: audio_clip ACTIVE ###", flush=True)
 
 
+def _canonical_audio_path(path):
+    return os.path.realpath(os.path.abspath(str(path)))
+
+
+def _audio_identity(path):
+    p = Path(path)
+    stat = p.stat()
+    return {
+        "source_path": _canonical_audio_path(p),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
 def _stream_file(path, start, end):
     with open(path, "rb") as f:
         f.seek(start)
@@ -84,6 +98,27 @@ def ping():
         "size": p.stat().st_size if p.exists() else None,
     })
 
+@app.get("/audio/info")
+def audio_info():
+    p = Path(AUDIO_FILE_PATH)
+    if not p.exists():
+        return jsonify({
+            "ok": False,
+            "error": "audio file not found",
+            "source_path": _canonical_audio_path(p),
+        }), 404
+
+    identity = _audio_identity(p)
+    return jsonify({
+        "ok": True,
+        "filename": p.name,
+        "audio_path": identity["source_path"],
+        "source_path": identity["source_path"],
+        "size": identity["size"],
+        "size_bytes": identity["size"],
+        "mtime_ns": identity["mtime_ns"],
+    })
+
 @app.get("/info")
 def info():
     p = Path(AUDIO_FILE_PATH)
@@ -97,7 +132,7 @@ def info():
     return jsonify({
         "ok": True,
         "filename": p.name,
-        "audio_path": str(p),
+        "audio_path": _canonical_audio_path(p),
         "size_bytes": p.stat().st_size,
     })
 
