@@ -20,8 +20,7 @@ ASSIGNMENTS_FILENAME = core.ASSIGNMENTS_FILENAME
 
 FILTER_OPTIONS = ("Toutes", "Non affectées", "Affectées", "Exclues", "Sujet sélectionné")
 
-GALLERY_COLUMNS = 4
-THUMB_WIDTH = 160
+GALLERY_COLUMNS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +230,7 @@ def render_photo_subject_section(
     st.markdown("#### 4.5 Galerie")
     for start in range(0, len(visible), GALLERY_COLUMNS):
         chunk = visible[start : start + GALLERY_COLUMNS]
-        columns = st.columns(GALLERY_COLUMNS)
+        columns = st.columns(GALLERY_COLUMNS, gap="small")
         for column, photo in zip(columns, chunk):
             with column:
                 _render_photo_cell(photo, photos_dir, index, state_key)
@@ -306,7 +305,7 @@ def _render_photo_cell(
     thumb, native = _resolve_photo_paths(photo, photos_dir)
     if thumb is not None:
         try:
-            st.image(str(thumb), width=THUMB_WIDTH)
+            st.image(str(thumb), use_container_width=True)
         except Exception as exc:
             st.caption(f"Miniature illisible : {exc}")
     else:
