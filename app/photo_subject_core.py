@@ -619,6 +619,57 @@ def select_range(
 
 
 # ---------------------------------------------------------------------------
+# Selection temporaire UI
+# ---------------------------------------------------------------------------
+
+
+def normalize_photo_selection(values: Iterable[str] | None) -> set[str]:
+    """Retourne une selection UI explicite, independante des affectations."""
+    selected: set[str] = set()
+    for value in values or []:
+        rel = str(value).strip()
+        if rel:
+            selected.add(rel)
+    return selected
+
+
+def replace_photo_selection(values: Iterable[str] | None) -> set[str]:
+    """Remplace integralement la selection temporaire courante."""
+    return normalize_photo_selection(values)
+
+
+def update_photo_selection(
+    selection: Iterable[str] | None,
+    photo_rel_native: str,
+    checked: bool,
+) -> set[str]:
+    """Applique le cochage/decochage d une photo a la selection UI."""
+    selected = normalize_photo_selection(selection)
+    rel = str(photo_rel_native or "").strip()
+    if not rel:
+        return selected
+    if checked:
+        selected.add(rel)
+    else:
+        selected.discard(rel)
+    return selected
+
+
+def clear_photo_selection() -> set[str]:
+    """Vide la selection temporaire sans modifier l etat metier."""
+    return set()
+
+
+def snapshot_photo_selection(
+    photos: Sequence[PhotoRef],
+    selection: Iterable[str] | None,
+) -> list[str]:
+    """Fige la selection UI dans l ordre canonique des photos."""
+    selected = normalize_photo_selection(selection)
+    return [p.photo_rel_native for p in photos if p.photo_rel_native in selected]
+
+
+# ---------------------------------------------------------------------------
 # Controles d integrite
 # ---------------------------------------------------------------------------
 

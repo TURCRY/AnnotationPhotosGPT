@@ -569,6 +569,98 @@ class SummaryAndFilterTests(unittest.TestCase):
         self.assertEqual(len(core.filter_photos(self.photos, self.index, "Toutes")), 6)
 
 
+class TemporarySelectionStateTests(unittest.TestCase):
+    """Selection UI temporaire separee de l etat metier persiste."""
+
+    def setUp(self):
+        self.photos = [
+            core.PhotoRef(index=i, photo_rel_native=f"P107{i + 67:04d}.JPG", display_name=f"P107{i + 67:04d}.JPG")
+            for i in range(1, 101)
+        ]
+        self.subject_2 = core.Subject(numero=2, titre="Sujet deux")
+        self.subject_6 = core.Subject(numero=6, titre="Sujet six")
+
+    def _rels(self, first_index, last_index):
+        return [p.photo_rel_native for p in self.photos[first_index - 1:last_index]]
+
+    def test_reassignment_uses_only_temporary_selection_snapshot(self):
+        document = core.AssignmentsDocument()
+
+        selection = core.replace_photo_selection(self._rels(7, 49))
+        selected_now = core.snapshot_photo_selection(self.photos, selection)
+        core.assign_photos(document, selected_now, self.subject_6)
+        selection = core.clear_photo_selection()
+
+        index = core.build_assignment_index(document)
+        summary = core.build_summary(self.photos, index, [self.subject_2, self.subject_6])
+        self.assertEqual(summary["per_subject"][6], 43)
+
+        selection = core.replace_photo_selection(self._rels(60, 80))
+        selected_now = core.snapshot_photo_selection(self.photos, selection)
+        core.assign_photos(document, selected_now, self.subject_2)
+        selection = core.clear_photo_selection()
+
+        index = core.build_assignment_index(document)
+        summary = core.build_summary(self.photos, index, [self.subject_2, self.subject_6])
+        self.assertEqual(summary["per_subject"][6], 43)
+        self.assertEqual(summary["per_subject"][2], 21)
+        self.assertEqual(core.snapshot_photo_selection(self.photos, selection), [])
+
+        for rel in self._rels(7, 49):
+            self.assertEqual(index[rel].subject_numero, 6)
+        self.assertEqual(index["P1070075.JPG"].subject_numero, 6)
+
+    def test_affectee_status_does_not_initialize_selection(self):
+        document = core.AssignmentsDocument()
+        core.assign_photos(document, ["P1070075.JPG"], self.subject_6)
+        index = core.build_assignment_index(document)
+
+        self.assertEqual(core.get_status(index, "P1070075.JPG"), core.STATUS_AFFECTEE)
+        self.assertEqual(core.snapshot_photo_selection(self.photos, core.clear_photo_selection()), [])
+
+    def test_subject_and_filter_changes_do_not_change_selection(self):
+        selection = core.replace_photo_selection(["P1070075.JPG"])
+        index = {}
+
+        core.filter_photos(self.photos, index, "Toutes", subject_numero=2)
+        self.assertEqual(core.snapshot_photo_selection(self.photos, selection), ["P1070075.JPG"])
+
+        core.filter_photos(self.photos, index, "Non affectées", subject_numero=6)
+        self.assertEqual(core.snapshot_photo_selection(self.photos, selection), ["P1070075.JPG"])
+
+    def test_range_replaces_selection_and_individual_uncheck_updates_it(self):
+        selection = core.replace_photo_selection(self._rels(7, 49))
+        self.assertEqual(len(core.snapshot_photo_selection(self.photos, selection)), 43)
+
+        selection = core.replace_photo_selection(self._rels(60, 80))
+        self.assertEqual(len(core.snapshot_photo_selection(self.photos, selection)), 21)
+        self.assertNotIn("P1070075.JPG", selection)
+
+        selection = core.update_photo_selection(selection, "P1070127.JPG", False)
+        self.assertEqual(len(core.snapshot_photo_selection(self.photos, selection)), 20)
+        self.assertNotIn("P1070127.JPG", selection)
+
+        selection = core.update_photo_selection(selection, "P1070075.JPG", True)
+        self.assertIn("P1070075.JPG", selection)
+
+    def test_selection_cleared_after_exclude_and_reset_status_is_preserved(self):
+        document = core.AssignmentsDocument()
+        selection = core.replace_photo_selection(["P1070075.JPG"])
+
+        core.exclude_photos(document, core.snapshot_photo_selection(self.photos, selection))
+        selection = core.clear_photo_selection()
+        index = core.build_assignment_index(document)
+        self.assertEqual(core.get_status(index, "P1070075.JPG"), core.STATUS_EXCLUE)
+        self.assertEqual(core.snapshot_photo_selection(self.photos, selection), [])
+
+        selection = core.replace_photo_selection(["P1070075.JPG"])
+        core.reset_photos(document, core.snapshot_photo_selection(self.photos, selection))
+        selection = core.clear_photo_selection()
+        index = core.build_assignment_index(document)
+        self.assertEqual(core.get_status(index, "P1070075.JPG"), core.STATUS_NON_AFFECTEE)
+        self.assertEqual(core.snapshot_photo_selection(self.photos, selection), [])
+
+
 class PrerequisiteTests(unittest.TestCase):
     """Controle des prerequis."""
 
