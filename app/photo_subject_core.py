@@ -20,6 +20,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+try:  # package import (LLM_Assistant/app.py) et import direct
+    from . import photo_time_helper as _time_helper
+except ImportError:  # pragma: no cover
+    import photo_time_helper as _time_helper  # type: ignore[no-redef]
+
 SCHEMA_VERSION = 1
 ASSIGNMENTS_FILENAME = "photo_subject_assignments.json"
 
@@ -77,6 +82,8 @@ class PhotoRef:
     display_name: str
     thumb_path: Path | None = None
     native_path: Path | None = None
+    # Datetime canonique de prise de vue (source : photos.csv), jamais recalculee.
+    photo_datetime: datetime | None = None
 
 
 @dataclass
@@ -338,6 +345,142 @@ def read_photos_batch(path: str | Path) -> tuple[list[PhotoRef], list[str]]:
             )
         )
     return photos, []
+
+
+# ---------------------------------------------------------------------------
+# Horodatage photo + origine audio (galerie)
+# ---------------------------------------------------------------------------
+
+
+def _normalize_photo_key(value: Any) -> str:
+    """Cle de jointure photo : chemin natif normalise (slashes, casse)."""
+    text = str(value or "").strip().replace("\\", "/")
+    while "//" in text:
+        text = text.replace("//", "/")
+    return text.strip("/").lower()
+
+
+def read_photo_times(
+    path: str | Path,
+    *,
+    infos: dict[str, Any] | None = None,
+) -> tuple[dict[str, datetime], datetime | None, list[str]]:
+    """Lit les horodatages canoniques depuis ``photos.csv``.
+
+    Retourne ``(table, debut_audio_reconstruit, erreurs)`` ou la table est
+    indexee par cle de photo normalisee. Aucune lecture EXIF : on utilise
+    uniquement la donnee canonique deja ecrite par le pipeline
+    (``horodatage_photo``, sinon ``horodatage_secondes``).
+
+    ``debut_audio_reconstruit`` n'est renseigne que si ``photos.csv`` porte
+    ``horodatage_secondes`` + ``decalage_moyen`` (cf.
+    ``photo_time_helper.resolve_audio_start_from_photos_csv``).
+    """
+    path = Path(path)
+    if not path.is_file():
+        return {}, None, [f"photos.csv introuvable : {path}"]
+
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter=";")
+            fieldnames = reader.fieldnames or []
+            rows = list(reader)
+    except Exception as exc:
+        return {}, None, [f"photos.csv illisible : {exc}"]
+
+    has_dt = any(column in fieldnames for column in _time_helper.PHOTO_DATETIME_COLUMNS)
+    has_seconds = any(column in fieldnames for column in _time_helper.PHOTO_SECONDS_COLUMNS)
+    if not has_dt and not has_seconds:
+        return {}, None, [
+            "photos.csv : aucune colonne d'horodatage exploitable "
+            f"(colonnes lues : {', '.join(fieldnames)})."
+        ]
+
+    # Reference de repli pour les colonnes en secondes : premiere datetime lue.
+    reference: datetime | None = None
+    if not has_dt:
+        for row in rows:
+            for column in _time_helper.PHOTO_DATETIME_COLUMNS:
+                candidate = _time_helper.parse_photo_datetime(row.get(column))
+                if candidate is not None:
+                    reference = candidate
+                    break
+            if reference is not None:
+                break
+
+    table: dict[str, datetime] = {}
+    for row in rows:
+        moment = _time_helper.parse_photo_datetime_from_row(row, default_date=reference)
+        if moment is None:
+            continue
+        key = _normalize_photo_key(
+            row.get("photo_rel_native") or row.get("photo_rel_reduite") or ""
+        )
+        if not key:
+            continue
+        table.setdefault(key, moment)
+
+    audio_start, _origin = _time_helper.resolve_audio_start_from_photos_csv(rows, infos)
+    return table, audio_start, []
+
+
+def _read_photos_csv_rows(path: str | Path) -> list[dict[str, Any]]:
+    """Lignes brutes de photos.csv (tolere l'absence du fichier)."""
+    path = Path(path)
+    if not path.is_file():
+        return []
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            return list(csv.DictReader(handle, delimiter=";"))
+    except Exception:
+        return []
+
+
+def resolve_audio_start_from_paths(
+    infos_path: str | Path | None,
+    photos_csv_path: str | Path | None,
+) -> tuple[datetime | None, str]:
+    """Origine audio = infos_projet.json (t0_global > horodatage_audio),
+    puis photos.csv (decalage_moyen), puis metadonnee du WAV source.
+
+    Le WAV source est teste en dernier : son horodatage systeme peut n'etre
+    qu'une date de copie, alors que decalage_moyen est valide par le calibrage.
+    """
+    infos = _time_helper.load_infos_projet(infos_path)
+    rows = _read_photos_csv_rows(photos_csv_path) if photos_csv_path else []
+
+    # 1/2 : valeurs canoniques de infos_projet.json
+    for key in _time_helper.AUDIO_ORIGIN_KEYS:
+        parsed = _time_helper.parse_audio_datetime(infos.get(key))
+        if parsed is not None:
+            return parsed, f"infos_projet.json:{key}"
+
+    # 3 : reconstruction depuis photos.csv
+    from_csv, origin = _time_helper.resolve_audio_start_from_photos_csv(rows, infos)
+    if from_csv is not None:
+        return from_csv, origin
+
+    # 4 : metadonnee du WAV source reel (garde-fou 24 h)
+    return _time_helper.resolve_audio_start(infos)
+
+
+def apply_photo_times(
+    photos: list[PhotoRef],
+    table: dict[str, datetime],
+) -> int:
+    """Complete ``photo.photo_datetime`` depuis la table. Retourne le nb completes."""
+    if not table:
+        return 0
+    count = 0
+    for photo in photos:
+        key = _normalize_photo_key(photo.photo_rel_native)
+        moment = table.get(key)
+        if moment is None:
+            moment = table.get(_normalize_photo_key(photo.display_name))
+        if moment is not None:
+            photo.photo_datetime = moment
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------

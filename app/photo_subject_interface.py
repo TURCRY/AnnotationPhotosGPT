@@ -7,14 +7,17 @@ Ce module ne fait aucun appel LLM, ne cree aucun job et n ecrit que
 
 from __future__ import annotations
 
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 import streamlit as st
 
 try:
     from . import photo_subject_core as core
+    from . import photo_time_helper as time_helper
 except ImportError:  # chargement direct par chemin (tests, app.py)
     import photo_subject_core as core  # type: ignore[no-redef]
+    import photo_time_helper as time_helper  # type: ignore[no-redef]
 
 ASSIGNMENTS_FILENAME = core.ASSIGNMENTS_FILENAME
 
@@ -86,6 +89,57 @@ def _cached_read_global_final_numeros(path_text: str, token: tuple[str, int | No
 def _cached_read_photos_batch(path_text: str, token: tuple[str, int | None, int | None]):
     del token
     return core.read_photos_batch(Path(path_text))
+
+
+@st.cache_data(show_spinner=False)
+def _cached_read_photo_times(path_text: str, token: tuple[str, int | None, int | None]):
+    del token
+    return core.read_photo_times(Path(path_text))
+
+
+@st.cache_data(show_spinner=False)
+def _cached_resolve_audio_start(
+    infos_text: str,
+    infos_token: tuple[str, int | None, int | None],
+    photos_csv_text: str,
+    photos_csv_token: tuple[str, int | None, int | None],
+):
+    del infos_token, photos_csv_token
+    return core.resolve_audio_start_from_paths(Path(infos_text), Path(photos_csv_text))
+
+
+def _find_photos_csv(photos_batch_path: Path) -> Path:
+    """photos.csv canonique : jumeau de photos_batch.csv (meme dossier)."""
+    return Path(photos_batch_path).with_name("photos.csv")
+
+
+def _find_infos_projet(photos_batch_path: Path) -> Path | None:
+    """infos_projet.json de la captation (dossier transcription jumeau).
+
+    Arborescence canonique :
+        <root>/<affaire>/AE_Expert_captations/<captation>/photos/photos_batch.csv
+        <root>/<affaire>/AF_Expert_ASR/transcriptions/<captation>/infos_projet.json
+    """
+    batch = Path(photos_batch_path)
+    candidates: list[Path] = []
+    parts = batch.parts
+    if "AE_Expert_captations" in parts:
+        index = parts.index("AE_Expert_captations")
+        head = Path(*parts[:index])
+        captation = parts[index + 1] if len(parts) > index + 1 else ""
+        if captation:
+            candidates.append(
+                head / "AF_Expert_ASR" / "transcriptions" / captation / "infos_projet.json"
+            )
+    candidates.append(batch.parent / "infos_projet.json")
+    candidates.append(batch.parent.parent / "infos_projet.json")
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
 
 
 @st.cache_data(show_spinner=False)
@@ -231,6 +285,27 @@ def render_photo_subject_section(
         str(sujets_path), _file_cache_token(sujets_path), tuple(sorted(cr_numeros))
     )
 
+    # --- 1.bis Origine audio + horodatages photo -------------------------
+    photos_csv_path = _find_photos_csv(photos_batch_path)
+    infos_projet_path = _find_infos_projet(photos_batch_path)
+
+    photo_times: dict = {}
+    photo_time_errors: list[str] = []
+    if photos_csv_path.is_file():
+        photo_times, _csv_start, photo_time_errors = _cached_read_photo_times(
+            str(photos_csv_path), _file_cache_token(photos_csv_path)
+        )
+    core.apply_photo_times(photos, photo_times)
+
+    audio_start, audio_origin = (None, "")
+    if infos_projet_path is not None:
+        audio_start, audio_origin = _cached_resolve_audio_start(
+            str(infos_projet_path),
+            _file_cache_token(infos_projet_path),
+            str(photos_csv_path),
+            _file_cache_token(photos_csv_path),
+        )
+
     checks = core.check_prerequisites(
         sujets_path=sujets_path,
         photos_batch_path=photos_batch_path,
@@ -263,6 +338,26 @@ def render_photo_subject_section(
             "L'affectation reste possible tant que Sujets.xlsx et photos_batch.csv "
             "sont exploitables."
         )
+
+    if photo_time_errors:
+        st.caption(
+            "Horodatage photo indisponible : "
+            + " ".join(photo_time_errors)
+            + " — l'heure et l'offset audio ne seront pas affichés."
+        )
+    if audio_start is None:
+        st.caption(
+            "Origine audio inconnue "
+            "("
+            + (
+                "infos_projet.json introuvable"
+                if infos_projet_path is None
+                else "t0_global / horodatage_audio absents"
+            )
+            + ") — offset audio affiché « audio ? »."
+        )
+    else:
+        st.caption(f"Origine audio : `{audio_origin}` — début {audio_start:%Y-%m-%d %H:%M:%S}.")
 
     if not subjects:
         st.error("Aucun sujet exploitable : impossible d'afficher la galerie.")
@@ -391,7 +486,7 @@ def render_photo_subject_section(
         columns = st.columns(GALLERY_COLUMNS, gap="small")
         for column, photo in zip(columns, chunk):
             with column:
-                _render_photo_cell(photo, photos_dir, index, state_key)
+                _render_photo_cell(photo, photos_dir, index, state_key, audio_start)
 
     # --- 10. Operations bas de galerie -------------------------------------
     _render_photo_operations(
@@ -486,6 +581,7 @@ def _render_photo_cell(
     photos_dir: Path,
     index: dict[str, core.Assignment],
     state_key: str,
+    audio_start: datetime | None = None,
 ) -> None:
     """Rend une vignette : index, nom, etat courant, case de selection."""
     thumb_text, native_text = _cached_resolve_photo_paths(
@@ -517,7 +613,14 @@ def _render_photo_cell(
     else:
         state_text = "Non affectée"
 
-    st.caption(f"**{photo.index:03d}** · {photo.display_name}")
+    try:
+        badge = time_helper.format_gallery_time_badge(photo.photo_datetime, audio_start)
+    except Exception:
+        badge = ""
+    if badge:
+        st.caption(f"**{photo.index:03d}** · {photo.display_name}    {badge}")
+    else:
+        st.caption(f"**{photo.index:03d}** · {photo.display_name}")
     st.caption(state_text)
     checked = st.checkbox(
         "Sélectionner",
