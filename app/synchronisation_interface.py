@@ -143,6 +143,120 @@ def ss_default(key, value):
         st.session_state[key] = value
 
 
+def _validate_calibration_restart_values(photo_value, audio_value, photo_count: int) -> tuple[int, str, float]:
+    try:
+        photo_depart = int(photo_value)
+    except (TypeError, ValueError):
+        raise ValueError("Photo de départ invalide : un entier est attendu.")
+    if photo_depart < 1 or photo_depart > int(photo_count):
+        raise ValueError(f"Photo de départ invalide : choisissez une valeur entre 1 et {photo_count}.")
+
+    audio_depart = str(audio_value or "").strip()
+    match = re.fullmatch(r"(\d{2}):(\d{2}):(\d{2})", audio_depart)
+    if not match:
+        raise ValueError("Départ audio invalide : format HH:MM:SS attendu.")
+    hours, minutes, seconds = map(int, match.groups())
+    if hours > 23 or minutes > 59 or seconds > 59:
+        raise ValueError("Départ audio invalide : format HH:MM:SS attendu.")
+    audio_depart_normalise = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    audio_depart_sec = convertir_hms_en_secondes(audio_depart_normalise)
+    return photo_depart, audio_depart_normalise, audio_depart_sec
+
+
+def _open_calibration_restart(infos: dict) -> None:
+    st.session_state["calibration_restart_open"] = True
+    st.session_state["calibration_restart_photo"] = int(infos.get("photo_depart", 1) or 1)
+    st.session_state["calibration_restart_audio"] = str(
+        infos.get("audio_depart", "00:00:00") or "00:00:00"
+    )
+
+
+def _close_calibration_restart() -> None:
+    st.session_state["calibration_restart_open"] = False
+    st.session_state.pop("calibration_restart_photo", None)
+    st.session_state.pop("calibration_restart_audio", None)
+
+
+def _reset_calibration(
+    infos: dict,
+    photos_df: pd.DataFrame,
+    fichier_photos: str,
+    heure_creation_audio: datetime,
+    base_dir: str,
+    base_name: str,
+    photo_depart: int,
+    audio_depart_str: str,
+    audio_depart_sec: float,
+) -> pd.DataFrame:
+    infos["photo_depart"] = photo_depart
+    infos["audio_depart"] = audio_depart_str
+    sauvegarder_infos_projet(infos)
+
+    numeric_columns = [
+        "horodatage_secondes",
+        "synchro_audio",
+        "t_audio",
+        "decalage_individuel",
+        "decalage_moyen",
+    ]
+    for column in numeric_columns:
+        if column not in photos_df.columns:
+            photos_df[column] = pd.NA
+        photos_df[column] = pd.to_numeric(
+            photos_df[column].astype(str).str.replace(",", "."),
+            errors="coerce",
+        )
+
+    for column in ["synchro_audio", "t_audio", "decalage_individuel", "decalage_moyen"]:
+        photos_df[column] = pd.NA
+
+    if "horodatage_photo" in photos_df.columns:
+        def _to_secs_since_audio0_local(value):
+            photo_datetime = _to_dt(value, default_date=heure_creation_audio)
+            return (photo_datetime - heure_creation_audio).total_seconds() if photo_datetime else pd.NA
+
+        photos_df["horodatage_secondes"] = photos_df["horodatage_photo"].apply(
+            _to_secs_since_audio0_local
+        )
+
+    for column in numeric_columns:
+        photos_df[column] = pd.to_numeric(photos_df[column], errors="coerce")
+
+    _save_photos(photos_df, fichier_photos)
+    _regularize_photos_outputs_and_copy(infos, fichier_photos, photos_df)
+
+    infos["calibrage_valide"] = False
+    sauvegarder_infos_projet(infos)
+
+    if base_dir and base_name:
+        for extension in (".csv", ".xlsx"):
+            pattern = os.path.join(base_dir, f"{base_name}_GTP_*{extension}")
+            for path in glob.glob(pattern):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    progression_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "data", "progression_annotation.json")
+    )
+    if os.path.exists(progression_path):
+        try:
+            os.remove(progression_path)
+        except OSError:
+            pass
+
+    photo_start_index = photo_depart - 1
+    st.session_state.points_sync = []
+    st.session_state.indices_sync = []
+    st.session_state.photo_start_index = photo_start_index
+    st.session_state.lecture_audio_position = audio_depart_sec
+    st.session_state.photo_index = photo_start_index
+    st.session_state.photo_index_actuel = photo_start_index
+    st.session_state.timestamp_captured = None
+    return photos_df
+
+
 def _parse_horodatage_audio(infos: dict) -> tuple[str, datetime | None, str]:
     raw = str(infos.get("horodatage_audio") or "").strip()
     if not raw:
@@ -498,94 +612,70 @@ def show_sync_interface():
     col1, col2 = st.columns([1, 1])
     with col1:
         # ------------------------------------------------------------
-        if st.button("🗑️ Recommencer la calibration"):
-            photos_df = _load_photos(fichier_photos)
-            NUM_COLS = [
-                "horodatage_secondes",
-                "synchro_audio",
-                "t_audio",
-                "decalage_individuel",
-                "decalage_moyen",
-            ]
+        if st.button("🗑️ Recommencer la calibration", key="open_calibration_restart"):
+            _open_calibration_restart(infos)
 
-            for col in NUM_COLS:
-                if col not in photos_df.columns:
-                    photos_df[col] = pd.NA
-                photos_df[col] = pd.to_numeric(
-                    photos_df[col].astype(str).str.replace(",", "."),
-                    errors="coerce",
+        reset_message = st.session_state.pop("calibration_restart_success", "")
+        if reset_message:
+            st.success(reset_message)
+
+        if st.session_state.get("calibration_restart_open", False):
+            st.markdown("#### Confirmer la reprise de calibration")
+            new_photo_depart = st.number_input(
+                "Photo de départ",
+                min_value=1,
+                max_value=len(photos_df),
+                step=1,
+                key="calibration_restart_photo",
+            )
+            new_audio_depart = st.text_input(
+                "Départ audio",
+                key="calibration_restart_audio",
+                help="Format HH:MM:SS",
+            )
+            confirm_col, cancel_col = st.columns([2, 1])
+            with confirm_col:
+                confirm_restart = st.button(
+                    "Confirmer et recommencer la calibration",
+                    key="confirm_calibration_restart",
                 )
+            with cancel_col:
+                cancel_restart = st.button("Annuler", key="cancel_calibration_restart")
 
-            # Efface les champs de sync
-            for col in ["synchro_audio", "t_audio", "decalage_individuel", "decalage_moyen"]:
-                if col in photos_df.columns:
-                    photos_df[col] = pd.NA
+            if cancel_restart:
+                _close_calibration_restart()
+                st.rerun()
 
-            # Recalcule horodatage_secondes depuis t0 audio
-            if "horodatage_photo" in photos_df.columns:
-                def _to_secs_since_audio0_local(s):
-                    dt = _to_dt(s, default_date=heure_creation_audio)
-                    return (dt - heure_creation_audio).total_seconds() if dt else pd.NA
-
-                photos_df["horodatage_secondes"] = photos_df["horodatage_photo"].apply(_to_secs_since_audio0_local)
-
-        
-            for col in NUM_COLS:
-                if col in photos_df.columns:
-                    photos_df[col] = pd.to_numeric(photos_df[col], errors="coerce")
-
-            _save_photos(photos_df, fichier_photos)
-            _regularize_photos_outputs_and_copy(infos, fichier_photos, photos_df)
-
-            # ⚠️ NE PLUS TOUCHER à photo_depart / audio_depart
-            # On ne fait que marquer le calibrage comme invalide
-            infos["calibrage_valide"] = False
-            sauvegarder_infos_projet(infos)
-
-
-            # 🔁 Purge systématique des fichiers d’annotation pour ce projet
-            if base_dir and base_name:
-                for ext in (".csv", ".xlsx"):
-                    pattern = os.path.join(base_dir, f"{base_name}_GTP_*{ext}")
-                    for f in glob.glob(pattern):
-                        try:
-                            os.remove(f)
-                        except OSError:
-                            pass
-
-            prog_path = os.path.abspath(
-                os.path.join(os.path.dirname(__file__), "..", "data", "progression_annotation.json")
-            )
-            if os.path.exists(prog_path):
+            if confirm_restart:
                 try:
-                    os.remove(prog_path)
-                except OSError:
-                    pass
-
-
-            # Repartir aux paramètres demandés dans infos_projet.json
-            photo_depart = int(infos.get("photo_depart", 1))
-            photo_start_index = max(0, photo_depart - 1)
-
-            audio_depart_str = str(infos.get("audio_depart", "00:00:00") or "00:00:00")
-            try:
-                audio_depart_sec = convertir_hms_en_secondes(audio_depart_str)
-            except Exception:
-                audio_depart_sec = 0.0
-
-            # Reset de l'état de synchro
-            st.session_state.points_sync = []
-            st.session_state.indices_sync = []
-            st.session_state.lecture_audio_position = audio_depart_sec
-            st.session_state.photo_index = photo_start_index
-            st.session_state.photo_index_actuel = photo_start_index
-            st.session_state.timestamp_captured = None
-
-            st.success(
-                f"Calibration réinitialisée. Reprise à la photo {photo_depart} "
-                f"et à t = {audio_depart_str}."
-            )
-            st.rerun()
+                    new_photo_depart, new_audio_depart, new_audio_depart_sec = (
+                        _validate_calibration_restart_values(
+                            new_photo_depart,
+                            new_audio_depart,
+                            len(photos_df),
+                        )
+                    )
+                except ValueError as error:
+                    st.error(str(error))
+                else:
+                    # Fermer avant les écritures : le rerun ne peut pas rejouer la confirmation.
+                    _close_calibration_restart()
+                    photos_df = _reset_calibration(
+                        infos,
+                        photos_df,
+                        fichier_photos,
+                        heure_creation_audio,
+                        base_dir,
+                        base_name,
+                        new_photo_depart,
+                        new_audio_depart,
+                        new_audio_depart_sec,
+                    )
+                    st.session_state["calibration_restart_success"] = (
+                        f"Calibration réinitialisée. Reprise à la photo {new_photo_depart} "
+                        f"et à t = {new_audio_depart}."
+                    )
+                    st.rerun()
 
 
     with col2:

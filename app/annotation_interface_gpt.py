@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta, date
 import glob
 from utils import (
+    build_pcfixe_snapshot_paths,
+    canonicalize_affaires_path,
     lire_infos_projet,
     sauvegarder_infos_projet,
     convertir_horodatage_en_secondes,
@@ -25,6 +27,12 @@ import math
 import re
 from app.local_llm_client import LocalLLMClient
 from context_resolution import resolve_photo_context
+from pcfixe_sync import (
+    copy_file_atomic as _shared_copy_file_atomic,
+    first_available_pcfixe_smb_root as _shared_first_available_pcfixe_smb_root,
+    server_affaires_path_to_smb as _shared_server_affaires_path_to_smb,
+    sha256_file as _shared_sha256_file,
+)
 from app.server_locator import DEFAULT_FLASK_ENDPOINTS, resolve_flask_base_url, _vpn_active
 from app.wol_util import wake_on_lan, wait_for_server, is_server_up
 from utils import charger_transcription_flexible
@@ -36,6 +44,7 @@ import logging
 import socket
 
 log = logging.getLogger("dictée_asr")
+VLM_DESCRIBE_TIMEOUT_S = 360
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG_DIR = _REPO_ROOT / "config"
 _DICTEES_ROOT = _REPO_ROOT / "data" / "dictees"
@@ -409,40 +418,6 @@ def _load_dictation_spooler_config(infos: dict | None = None) -> dict:
     return cfg
 
 
-def _pcfixe_smb_roots_from_infos(pcfixe: dict) -> list[str]:
-    def _dedupe(values: list[str]) -> list[str]:
-        roots: list[str] = []
-        for value in values:
-            root = str(value or "").strip().rstrip("\\/")
-            if root and root.lower() not in {r.lower() for r in roots}:
-                roots.append(root)
-        return roots
-
-    def _is_vpn_root(value: str) -> bool:
-        root = str(value or "").strip().lower()
-        return root.startswith(r"\\10.0.1.")
-
-    def _is_lan_root(value: str) -> bool:
-        root = str(value or "").strip().lower()
-        return root.startswith(r"\\192.168.0.")
-
-    configured = str((pcfixe or {}).get("root_affaires") or "").strip().rstrip("\\/")
-    if configured.lower() == _NAS_AFFAIRES_SMB_ROOT.lower():
-        configured = ""
-
-    if _vpn_active():
-        roots = [r"\\10.0.1.10\Affaires"]
-        if configured and _is_vpn_root(configured):
-            roots.append(configured)
-        return _dedupe(roots[:2])
-
-    roots = []
-    if configured and _is_lan_root(configured):
-        roots.append(configured)
-    roots.extend([r"\\192.168.0.155\Affaires", r"\\192.168.0.120\Affaires"])
-    return _dedupe(roots)[:2]
-
-
 def _server_affaires_path(*parts: str) -> str:
     suffix = "\\".join(str(p).strip("\\/") for p in parts if str(p or "").strip("\\/"))
     return _PCFIXE_LOCAL_AFFAIRES_ROOT + ("\\" + suffix if suffix else "")
@@ -464,18 +439,32 @@ def _canonical_laptop_photos_dir(infos: dict) -> Path:
 
 def _nas_photos_csv_path(infos: dict) -> Path | None:
     pcfixe = (infos or {}).get("pcfixe") or {}
-    if not isinstance(pcfixe, dict):
-        return None
-    raw = _ui_text(pcfixe.get("fichier_photos"))
-    return Path(raw) if raw else None
+    raw = _ui_text(pcfixe.get("fichier_photos")) if isinstance(pcfixe, dict) else ""
+    if not raw:
+        id_affaire = _ui_text((infos or {}).get("id_affaire") or (infos or {}).get("project_id"))
+        id_captation = _ui_text((infos or {}).get("id_captation") or (infos or {}).get("captation_id"))
+        if not id_affaire or not id_captation:
+            raise RuntimeError(
+                "Chemin NAS photos impossible a reconstruire : "
+                "id_affaire/id_captation absents et infos.pcfixe.fichier_photos absent."
+            )
+        raw = str(build_pcfixe_snapshot_paths(id_affaire, id_captation)["photos_csv"])
+    return Path(canonicalize_affaires_path(raw))
 
 
 def _nas_photos_batch_path(infos: dict) -> Path | None:
     pcfixe = (infos or {}).get("pcfixe") or {}
-    if not isinstance(pcfixe, dict):
-        return None
-    raw = _ui_text(pcfixe.get("fichier_photos_batch"))
-    return Path(raw) if raw else None
+    raw = _ui_text(pcfixe.get("fichier_photos_batch")) if isinstance(pcfixe, dict) else ""
+    if not raw:
+        id_affaire = _ui_text((infos or {}).get("id_affaire") or (infos or {}).get("project_id"))
+        id_captation = _ui_text((infos or {}).get("id_captation") or (infos or {}).get("captation_id"))
+        if not id_affaire or not id_captation:
+            raise RuntimeError(
+                "Chemin NAS photos_batch impossible a reconstruire : "
+                "id_affaire/id_captation absents et infos.pcfixe.fichier_photos_batch absent."
+            )
+        raw = str(build_pcfixe_snapshot_paths(id_affaire, id_captation)["photos_batch_csv"])
+    return Path(canonicalize_affaires_path(raw))
 
 
 def _nas_photos_dir(infos: dict) -> Path | None:
@@ -543,18 +532,7 @@ def _atomic_write_dataframe_xlsx(df: pd.DataFrame, path: str | Path) -> Path:
 
 
 def _copy_file_atomic(src: str | Path, dst: str | Path) -> Path:
-    src_path = Path(src)
-    dst_path = Path(dst)
-    dst_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _atomic_tmp_path(dst_path)
-    try:
-        shutil.copy2(str(src_path), str(tmp))
-        _fsync_path(tmp)
-        os.replace(str(tmp), str(dst_path))
-    finally:
-        if tmp.exists():
-            tmp.unlink(missing_ok=True)
-    return dst_path
+    return _shared_copy_file_atomic(src, dst)
 
 
 def _atomic_write_json_file(path: str | Path, payload: dict) -> Path:
@@ -571,11 +549,7 @@ def _atomic_write_json_file(path: str | Path, payload: dict) -> Path:
 
 
 def _sha256_file(path: str | Path) -> str:
-    h = hashlib.sha256()
-    with Path(path).open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    return _shared_sha256_file(path)
 
 
 def _load_gpt_exports_manifest() -> dict:
@@ -1316,11 +1290,6 @@ def _write_and_publish_validated_annotations(
     canonical_dir = _canonical_laptop_photos_dir(infos)
     local_csv = canonical_dir / filename_csv
     local_xlsx = canonical_dir / filename_xlsx
-    nas_dir = _nas_photos_dir(infos)
-    if nas_dir is None:
-        raise RuntimeError("Chemin NAS photos introuvable dans infos.pcfixe.fichier_photos")
-    nas_csv = nas_dir / filename_csv
-    nas_xlsx = nas_dir / filename_xlsx
 
     local_csv = _atomic_write_dataframe_csv(annotations_df, local_csv)
     local_xlsx = _atomic_write_dataframe_xlsx(annotations_df, local_xlsx)
@@ -1333,6 +1302,12 @@ def _write_and_publish_validated_annotations(
     if str(work_xlsx.resolve()).casefold() != str(local_xlsx.resolve()).casefold():
         _copy_file_atomic(local_xlsx, work_xlsx)
         work_results.append(str(work_xlsx))
+
+    nas_dir = _nas_photos_dir(infos)
+    if nas_dir is None:
+        raise RuntimeError("Chemin NAS photos introuvable dans infos.pcfixe.fichier_photos")
+    nas_csv = nas_dir / filename_csv
+    nas_xlsx = nas_dir / filename_xlsx
 
     csv_result = _publish_validated_annotation_file(
         infos=infos,
@@ -1677,29 +1652,15 @@ def _sync_photos_batch_from_canonical(infos: dict) -> None:
         st.warning(f"Synchronisation locale photos_batch.csv impossible : {exc}")
 
 
-def _server_affaires_suffix(path_value: str) -> str:
-    raw = str(path_value or "").strip().replace("/", "\\")
-    prefix = _PCFIXE_LOCAL_AFFAIRES_ROOT.lower()
-    if raw.lower() == prefix:
-        return ""
-    if raw.lower().startswith(prefix + "\\"):
-        return raw[len(_PCFIXE_LOCAL_AFFAIRES_ROOT) :].strip("\\")
-    raise RuntimeError(f"Chemin hors C:\\Affaires: {path_value}")
-
-
 def _smb_path_for_server_path(smb_root: str, server_path: str) -> Path:
-    suffix = _server_affaires_suffix(server_path)
-    return Path(str(smb_root).rstrip("\\/")) / Path(suffix)
+    return _shared_server_affaires_path_to_smb(smb_root, server_path)
 
 
 def _first_available_pcfixe_smb_root(pcfixe: dict) -> str:
-    for root in _pcfixe_smb_roots_from_infos(pcfixe):
-        try:
-            if Path(root).exists():
-                return root
-        except Exception:
-            continue
-    return ""
+    return _shared_first_available_pcfixe_smb_root(
+        pcfixe,
+        vpn_active=_vpn_active(),
+    )
 
 
 def _expected_csv_read_candidates(record: dict) -> list[Path]:
@@ -3295,8 +3256,19 @@ def call_vlm_single(image_path: str, context: str = "", prompt: str = "", model_
     with open(image_path, "rb") as f:
         files = {"file": (Path(image_path).name, f, mime)}
         try:
-            r = requests.post(url, files=files, data=data, headers=headers, timeout=180)
+            r = requests.post(
+                url,
+                files=files,
+                data=data,
+                headers=headers,
+                timeout=VLM_DESCRIBE_TIMEOUT_S,
+            )
             r.raise_for_status()
+        except requests.ReadTimeout as e:
+            raise RuntimeError(
+                "VLM /vision/describe : délai de lecture dépassé "
+                f"après {VLM_DESCRIBE_TIMEOUT_S} s."
+            ) from e
         except requests.HTTPError as e:
             response = getattr(e, "response", None)
             if response is not None:

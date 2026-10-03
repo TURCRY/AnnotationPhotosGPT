@@ -167,6 +167,57 @@ class GtpExportSyncTests(unittest.TestCase):
         self.assertEqual(ag._sha256_file(csv_local), ag._sha256_file(self.nas / csv_local.name))
         self.assertEqual(ag._sha256_file(xlsx_local), ag._sha256_file(self.nas / xlsx_local.name))
 
+    def test_nas_photos_path_uses_declared_pcfixe_path(self):
+        infos = {
+            "pcfixe": {
+                "fichier_photos": r"C:\Affaires\2026-J54\AE_Expert_captations\accedit-2026-04-16\photos\photos.csv",
+                "fichier_photos_batch": r"C:\Affaires\2026-J54\AE_Expert_captations\accedit-2026-04-16\photos\photos_batch.csv",
+            }
+        }
+        self.assertEqual(
+            str(ag._nas_photos_csv_path(infos)),
+            r"\\192.168.1.20\Affaires\2026-J54\AE_Expert_captations\accedit-2026-04-16\photos\photos.csv",
+        )
+        self.assertEqual(
+            str(ag._nas_photos_batch_path(infos)),
+            r"\\192.168.1.20\Affaires\2026-J54\AE_Expert_captations\accedit-2026-04-16\photos\photos_batch.csv",
+        )
+
+    def test_nas_photos_paths_are_rebuilt_when_pcfixe_fields_are_absent(self):
+        infos = {
+            "id_affaire": "2024-J33",
+            "id_captation": "accedit-2024-04-30",
+            "pcfixe": {"root_affaires": r"\\192.168.1.20\Affaires"},
+        }
+        self.assertEqual(
+            str(ag._nas_photos_csv_path(infos)),
+            r"\\192.168.1.20\Affaires\2024-J33\AE_Expert_captations\accedit-2024-04-30\photos\photos.csv",
+        )
+        self.assertEqual(
+            str(ag._nas_photos_batch_path(infos)),
+            r"\\192.168.1.20\Affaires\2024-J33\AE_Expert_captations\accedit-2024-04-30\photos\photos_batch.csv",
+        )
+
+    def test_nas_photos_path_without_field_or_ids_is_explicit(self):
+        with self.assertRaisesRegex(RuntimeError, "id_affaire/id_captation absents"):
+            ag._nas_photos_csv_path({"pcfixe": {}})
+
+    def test_local_gtp_files_survive_unavailable_nas(self):
+        with self._patch_environment(nas_available=False):
+            state = ag._write_and_publish_validated_annotations(
+                self.df,
+                self.work / "photos_GTP_20261003_0100.csv",
+                self.infos,
+                operation_id="op-local-first",
+            )
+
+        self.assertTrue((self.mirror / "photos_GTP_20261003_0100.csv").is_file())
+        self.assertTrue((self.mirror / "photos_GTP_20261003_0100.xlsx").is_file())
+        self.assertTrue((self.work / "photos_GTP_20261003_0100.csv").is_file())
+        self.assertTrue((self.work / "photos_GTP_20261003_0100.xlsx").is_file())
+        self.assertTrue(state["csv"]["pending"])
+        self.assertTrue(state["xlsx"]["pending"])
+
     def test_pending_and_syncthing_hash_resolution(self):
         with self._patch_environment(nas_available=False):
             ag._write_and_publish_validated_annotations(
@@ -243,6 +294,70 @@ class GtpExportSyncTests(unittest.TestCase):
 
         self.assertTrue(any(str(path).endswith("_GTP_20260724_1200.csv") for path in probe["gtp_files"]))
         self.assertFalse(any(str(path).endswith("photos_batch.csv") for path in probe["gtp_files"]))
+
+
+class InteractiveVlmTimeoutTests(unittest.TestCase):
+    class _Response:
+        def __init__(self, payload=None):
+            self._payload = payload or {"description": "description obtenue"}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class _ReadTimeout(Exception):
+        pass
+
+    class _HTTPError(Exception):
+        pass
+
+    def setUp(self):
+        self.image = ROOT / "tests" / "_vlm_timeout_test.jpg"
+        self.image.write_bytes(b"image")
+
+    def tearDown(self):
+        self.image.unlink(missing_ok=True)
+
+    def _requests(self, post):
+        return types.SimpleNamespace(
+            post=post,
+            ReadTimeout=self._ReadTimeout,
+            HTTPError=self._HTTPError,
+        )
+
+    def test_response_under_180_seconds_is_unchanged(self):
+        post = unittest.mock.Mock(return_value=self._Response())
+        with (
+            patch.object(ag, "requests", self._requests(post)),
+            patch.object(ag, "_load_app_config", return_value={"local_llm": {"base_url": "http://vlm"}}),
+        ):
+            description = ag.call_vlm_single(str(self.image))
+
+        self.assertEqual(description, "description obtenue")
+        post.assert_called_once()
+
+    def test_response_between_180_and_360_seconds_uses_extended_timeout(self):
+        post = unittest.mock.Mock(return_value=self._Response())
+        with (
+            patch.object(ag, "requests", self._requests(post)),
+            patch.object(ag, "_load_app_config", return_value={"local_llm": {"base_url": "http://vlm"}}),
+        ):
+            ag.call_vlm_single(str(self.image))
+
+        self.assertEqual(post.call_args.kwargs["timeout"], 360)
+
+    def test_read_timeout_after_360_seconds_is_explicit_and_not_retried(self):
+        post = unittest.mock.Mock(side_effect=self._ReadTimeout("simulated read timeout"))
+        with (
+            patch.object(ag, "requests", self._requests(post)),
+            patch.object(ag, "_load_app_config", return_value={"local_llm": {"base_url": "http://vlm"}}),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "délai de lecture dépassé après 360 s"):
+                ag.call_vlm_single(str(self.image))
+
+        post.assert_called_once()
 
 
 if __name__ == "__main__":

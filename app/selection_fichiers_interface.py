@@ -20,6 +20,12 @@ from utils import (
     same_project_path,
 )
 from affaire_creation_client import create_affaire_server_compatible
+from pcfixe_sync import (
+    copy_file_atomic_verified,
+    first_available_pcfixe_smb_root,
+    server_affaires_path_to_smb,
+)
+from server_locator import _vpn_active
 
 from traitement_audio import (
     purge_audio_temp,
@@ -885,6 +891,8 @@ def _publish_snapshot_capture(infos: dict, temp: dict, id_affaire: str, id_capta
     paths = {
         "root_affaire": root,
         "photos_dir": base_cap / "photos",
+        "photos": base_cap / "photos" / "photos.csv",
+        "photos_batch": base_cap / "photos" / "photos_batch.csv",
         "audio_dir": base_cap / "audio",
         "trans_dir": trans_dir,
         "config_llm": trans_dir / "config_llm.json",
@@ -909,6 +917,39 @@ def _publish_snapshot_capture(infos: dict, temp: dict, id_affaire: str, id_capta
     snapshot_infos["pcfixe"]["fichier_photos_batch"] = str(pc_paths["photos_batch_csv"])
 
     _atomic_write_text(paths["infos"], json.dumps(snapshot_infos, indent=2, ensure_ascii=False))
+    pcfixe_smb_root = first_available_pcfixe_smb_root(
+        snapshot_infos.get("pcfixe") or {},
+        vpn_active=_vpn_active(),
+    )
+    if not pcfixe_smb_root:
+        raise RuntimeError(
+            "Publication infos_projet.json sur le PC fixe impossible : "
+            "aucune racine SMB PC fixe accessible."
+        )
+    pcfixe_infos_smb = server_affaires_path_to_smb(
+        pcfixe_smb_root,
+        pc_paths["infos"],
+    )
+    copy_file_atomic_verified(paths["infos"], pcfixe_infos_smb)
+
+    photos_real = Path(str(snapshot_infos.get("fichier_photos") or "").strip())
+    if photos_real.is_file():
+        copy_file_atomic_verified(photos_real, paths["photos"])
+        pcfixe_photos_smb = server_affaires_path_to_smb(
+            pcfixe_smb_root,
+            pc_paths["photos_csv"],
+        )
+        copy_file_atomic_verified(paths["photos"], pcfixe_photos_smb)
+
+    batch_real = Path(str(snapshot_infos.get("fichier_photos_batch") or "").strip())
+    if batch_real.is_file():
+        copy_file_atomic_verified(batch_real, paths["photos_batch"])
+        pcfixe_batch_smb = server_affaires_path_to_smb(
+            pcfixe_smb_root,
+            pc_paths["photos_batch_csv"],
+        )
+        copy_file_atomic_verified(paths["photos_batch"], pcfixe_batch_smb)
+
     _atomic_write_text(paths["config_llm"], (config_dir / "config.json").read_text(encoding="utf-8"))
     _atomic_write_text(paths["prompt_gpt"], (config_dir / "prompt_gpt.json").read_text(encoding="utf-8"))
     _atomic_write_text(paths["prompt_gpt_batch"], (config_dir / "prompt_gpt_batch_only.json").read_text(encoding="utf-8"))
