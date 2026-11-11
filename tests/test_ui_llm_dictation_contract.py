@@ -83,11 +83,12 @@ class DummyOpenAI:
         return SimpleNamespace(choices=[choice])
 
 
-def load_generer(response_payload=None, backend="local"):
+def load_generer(response_payload=None, backend="local", model="gpt-test"):
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
     selected = [
         node for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "generer_texte_gpt"
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_openai_chat_completion_kwargs", "generer_texte_gpt"}
     ]
     module = ast.Module(body=selected, type_ignores=[])
     ast.fix_missing_locations(module)
@@ -98,7 +99,7 @@ def load_generer(response_payload=None, backend="local"):
     appcfg = {
         "llm_backend": backend,
         "openai_api_key": "sk-test",
-        "model": "gpt-test",
+        "model": model,
         "temperature": 0.3,
         "max_tokens": 999,
         "local_llm": {
@@ -112,6 +113,7 @@ def load_generer(response_payload=None, backend="local"):
     }
     namespace = {
         "OpenAI": DummyOpenAI,
+        "_OPENAI_REASONING_MODEL_PREFIXES": ("gpt-5", "gpt-6", "o1", "o3", "o4"),
         "_LOCAL_LLM_BUSY_RESULT": "[LLM local occupe, reessayez dans quelques secondes.]",
         "_load_app_config": lambda infos: appcfg,
         "lire_infos_projet": lambda: {"project_id": "test"},
@@ -188,6 +190,31 @@ class UIDictationContractTests(unittest.TestCase):
         ])
         self.assertNotIn("dictee_asr_text", str(call))
         self.assertNotIn("prefer_dictee", str(call))
+
+    def test_openai_gpt6_uses_completion_limit_without_temperature(self):
+        generer, _requests, _st = load_generer(backend="openai", model="gpt-6-luna")
+
+        result = generer("systeme", "prompt openai")
+
+        self.assertEqual(result, "reponse openai")
+        call = DummyOpenAI.calls[0]
+        self.assertEqual(call["max_completion_tokens"], 999)
+        self.assertNotIn("max_tokens", call)
+        self.assertNotIn("temperature", call)
+        self.assertEqual(call["messages"], [
+            {"role": "system", "content": "systeme"},
+            {"role": "user", "content": "prompt openai"},
+        ])
+
+    def test_openai_historical_model_keeps_legacy_parameters(self):
+        generer, _requests, _st = load_generer(backend="openai", model="gpt-4o-mini")
+
+        self.assertEqual(generer("systeme", "prompt openai"), "reponse openai")
+
+        call = DummyOpenAI.calls[0]
+        self.assertEqual(call["max_tokens"], 999)
+        self.assertEqual(call["temperature"], 0.3)
+        self.assertNotIn("max_completion_tokens", call)
 
 
 if __name__ == "__main__":

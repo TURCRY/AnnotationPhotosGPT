@@ -104,6 +104,26 @@ NAS_SSH_PREFLIGHT_TIMEOUT = 15
 NAS_SSH_COMMAND_TIMEOUT = 30
 NAS_SSH_TRANSFER_TIMEOUT = 120
 BUSINESS_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$")
+_OPENAI_REASONING_MODEL_PREFIXES = ("gpt-5", "gpt-6", "o1", "o3", "o4")
+
+
+def _openai_chat_completion_kwargs(
+    model: str,
+    max_tokens,
+    temperature: float,
+    messages: list[dict],
+) -> dict:
+    model_name = str(model or "gpt-6-luna").strip()
+    kwargs = {
+        "model": model_name,
+        "messages": messages,
+    }
+    if model_name.lower().startswith(_OPENAI_REASONING_MODEL_PREFIXES):
+        kwargs["max_completion_tokens"] = max_tokens
+    else:
+        kwargs["max_tokens"] = max_tokens
+        kwargs["temperature"] = float(temperature)
+    return kwargs
 
 
 class BatchSyncError(RuntimeError):
@@ -793,15 +813,15 @@ def generate_with_retry(
                     if client is None:
                         from openai import OpenAI
                         client = OpenAI(api_key=openai_api_key)
-                    response = client.chat.completions.create(
-                        model=model or "gpt-4o-mini",
+                    response = client.chat.completions.create(**_openai_chat_completion_kwargs(
+                        model=model or "gpt-6-luna",
                         temperature=float(temperature),
                         max_tokens=int(max_tokens),
                         messages=[
                             {"role": "system", "content": system},
                             {"role": "user", "content": prompt},
                         ],
-                    )
+                    ))
                     out = str(response.choices[0].message.content or "").strip()
                 else:
                     out = client.generate(
@@ -5332,7 +5352,7 @@ def main() -> int:
     timeout_s = max(timeout_s, 600.0)  # test “sécurisé”
 
     client = None
-    model = str(cfg_llm.get("model", "gpt-4o-mini") or "gpt-4o-mini").strip() if llm_backend == "openai" else local_model
+    model = str(cfg_llm.get("model", "gpt-6-luna") or "gpt-6-luna").strip() if llm_backend == "openai" else local_model
     if llm_backend == "local":
         client = LocalLLMClient(base_url=base_url, api_key=local_llm_api_key, timeout=timeout_s)
         print(f"[BATCH] client.timeout={timeout_s}s")

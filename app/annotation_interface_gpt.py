@@ -63,6 +63,26 @@ _PCFIXE_LOCAL_AFFAIRES_ROOT = r"C:\Affaires"
 _DICTEE_SCHEMA_VERSION = 1
 _LOCAL_LLM_BUSY_RESULT = "[LLM local occupe, reessayez dans quelques secondes.]"
 _UNC_PROBE_TIMEOUT_S = 0.6
+_OPENAI_REASONING_MODEL_PREFIXES = ("gpt-5", "gpt-6", "o1", "o3", "o4")
+
+
+def _openai_chat_completion_kwargs(
+    model: str,
+    max_tokens,
+    temperature: float,
+    messages: list[dict],
+) -> dict:
+    model_name = str(model or "gpt-6-luna").strip()
+    kwargs = {
+        "model": model_name,
+        "messages": messages,
+    }
+    if model_name.lower().startswith(_OPENAI_REASONING_MODEL_PREFIXES):
+        kwargs["max_completion_tokens"] = max_tokens
+    else:
+        kwargs["max_tokens"] = max_tokens
+        kwargs["temperature"] = float(temperature)
+    return kwargs
 
 
 def _load_env_for_runtime_config() -> None:
@@ -3106,15 +3126,15 @@ def generer_texte_gpt(
         return "[Erreur GPT : Clé API OpenAI introuvable (env OPENAI_API_KEY ou config.openai_api_key).]"
     try:
         client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model=appcfg.get("model", "gpt-4o-mini"),
+        response = client.chat.completions.create(**_openai_chat_completion_kwargs(
+            model=appcfg.get("model", "gpt-6-luna"),
             temperature=float(appcfg.get("temperature", 0.3)),
             max_tokens=appcfg.get("max_tokens"),
             messages=[
                 {"role": "system", "content": role_systeme},
                 {"role": "user", "content": prompt_user},
             ],
-        )
+        ))
         return _strip_wrapping_quotes(response.choices[0].message.content or "")
     except Exception as e:
         return f"[Erreur GPT OpenAI : {e}]"

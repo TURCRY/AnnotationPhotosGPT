@@ -36,6 +36,26 @@ VLM_ENDPOINT = "/vision/describe_batch"
 LLM_ENDPOINT = "/annoter"
 DEFAULT_BATCH_SIZE = 20
 PROMPT_VERSION = "batch_vlm_v2_consolide"
+_OPENAI_REASONING_MODEL_PREFIXES = ("gpt-5", "gpt-6", "o1", "o3", "o4")
+
+
+def _openai_chat_completion_kwargs(
+    model: str,
+    max_tokens,
+    temperature: float,
+    messages: list[dict],
+) -> dict:
+    model_name = str(model or "gpt-6-luna").strip()
+    kwargs = {
+        "model": model_name,
+        "messages": messages,
+    }
+    if model_name.lower().startswith(_OPENAI_REASONING_MODEL_PREFIXES):
+        kwargs["max_completion_tokens"] = max_tokens
+    else:
+        kwargs["max_tokens"] = max_tokens
+        kwargs["temperature"] = float(temperature)
+    return kwargs
 
 
 def load_app_config(transcript_dir: Path) -> dict:
@@ -113,7 +133,7 @@ def load_llm_config_sanitized(config_path: Path) -> dict:
 
     # --- OpenAI (fallback ou usage direct) ---
     cfg["openai_api_key"] = raw.get("openai_api_key")
-    cfg["model"]          = raw.get("model", "gpt-4o-mini")
+    cfg["model"]          = raw.get("model", "gpt-6-luna")
     cfg["temperature"]    = raw.get("temperature", 0.3)
     cfg["max_tokens"]     = raw.get("max_tokens", 120)
 
@@ -324,19 +344,18 @@ def build_prompt(prompt: dict, kind: str, mission: str, contexte: str, transcrip
     # On envoie au serveur /annoter un seul "prompt" texte (comme votre UI)
     return (sys_txt + "\n\n" + user_txt).strip()
 
-def call_llm(prompt: str) -> str:
-    cfg = load_app_config()
+def call_llm(prompt: str, cfg: dict) -> str:
     backend = cfg.get("llm_backend", "local").lower()
 
     if backend == "openai":
         from openai import OpenAI
         client = OpenAI(api_key=cfg["openai_api_key"])
-        r = client.chat.completions.create(
-            model=cfg.get("model", "gpt-4o-mini"),
+        r = client.chat.completions.create(**_openai_chat_completion_kwargs(
+            model=cfg.get("model", "gpt-6-luna"),
             temperature=float(cfg.get("temperature", 0.25)),
             max_tokens=int(cfg.get("max_tokens", 120)),
             messages=[{"role": "user", "content": prompt}],
-        )
+        ))
         return r.choices[0].message.content.strip()
 
     # fallback local (strictement identique UI)
