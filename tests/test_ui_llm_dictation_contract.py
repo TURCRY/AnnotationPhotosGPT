@@ -1,4 +1,5 @@
 import ast
+import logging
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -79,8 +80,16 @@ class DummyOpenAI:
     def _create(self, **kwargs):
         self.__class__.calls.append(kwargs)
         message = SimpleNamespace(content="reponse openai")
-        choice = SimpleNamespace(message=message)
-        return SimpleNamespace(choices=[choice])
+        choice = SimpleNamespace(message=message, finish_reason="stop")
+        return SimpleNamespace(
+            model=kwargs["model"],
+            choices=[choice],
+            usage=SimpleNamespace(
+                prompt_tokens=10,
+                completion_tokens=5,
+                completion_tokens_details=SimpleNamespace(reasoning_tokens=0),
+            ),
+        )
 
 
 def load_generer(response_payload=None, backend="local", model="gpt-test"):
@@ -88,7 +97,15 @@ def load_generer(response_payload=None, backend="local", model="gpt-test"):
     selected = [
         node for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name in {"_openai_chat_completion_kwargs", "generer_texte_gpt"}
+        and node.name in {
+            "_openai_chat_completion_kwargs",
+            "_openai_response_metadata",
+            "_openai_response_text",
+            "_openai_failure_reason",
+            "_openai_status_code",
+            "_call_openai_chat",
+            "generer_texte_gpt",
+        }
     ]
     module = ast.Module(body=selected, type_ignores=[])
     ast.fix_missing_locations(module)
@@ -114,6 +131,7 @@ def load_generer(response_payload=None, backend="local", model="gpt-test"):
     namespace = {
         "OpenAI": DummyOpenAI,
         "_OPENAI_REASONING_MODEL_PREFIXES": ("gpt-5", "gpt-6", "o1", "o3", "o4"),
+        "_DEFAULT_OPENAI_MODEL": "gpt-6-luna",
         "_LOCAL_LLM_BUSY_RESULT": "[LLM local occupe, reessayez dans quelques secondes.]",
         "_load_app_config": lambda infos: appcfg,
         "lire_infos_projet": lambda: {"project_id": "test"},
@@ -122,6 +140,7 @@ def load_generer(response_payload=None, backend="local", model="gpt-test"):
         "requests": requests,
         "st": st,
         "time": SimpleNamespace(sleep=lambda seconds: None),
+        "log": logging.getLogger("ui-llm-test"),
         "_strip_wrapping_quotes": lambda value: value,
     }
     exec(compile(module, str(SOURCE), "exec"), namespace)
@@ -199,6 +218,7 @@ class UIDictationContractTests(unittest.TestCase):
         self.assertEqual(result, "reponse openai")
         call = DummyOpenAI.calls[0]
         self.assertEqual(call["max_completion_tokens"], 999)
+        self.assertEqual(call["reasoning_effort"], "none")
         self.assertNotIn("max_tokens", call)
         self.assertNotIn("temperature", call)
         self.assertEqual(call["messages"], [
