@@ -49,5 +49,31 @@ Voir `docs/Compilation_PyInstaller_Procedure.pdf` ou `docs/README_compilation.md
 ## Configuration API
 
 - La clé API OpenAI est lue depuis `config/.env`
+
+### Appels OpenAI de l'interface d'annotation
+
+Le modèle distant par défaut est `gpt-6-luna`. L'ordre de priorité est :
+
+1. `config_llm.json` de l'affaire (`model`) ;
+2. modèle choisi et enregistré dans l'interface (`openai_model` dans `infos_projet.json`) ;
+3. valeur de `config/config.json`, avec repli sur `gpt-6-luna` si elle est absente ou vide.
+
+L'interface utilise l'API Chat Completions. Pour les modèles de raisonnement
+(`gpt-5*`, `gpt-6*`, `o1*`, `o3*`, `o4*`), elle transmet
+`max_completion_tokens` et `reasoning_effort="none"`, sans `temperature`. Les
+modèles historiques tels que `gpt-4o-mini` conservent `max_tokens` et
+`temperature`. Les budgets par défaut sont configurables avec
+`max_tokens_libelle` (120) et `max_tokens_commentaire` (500).
+
+Une sortie vide ou terminée par `finish_reason=length` est rejetée et ne
+remplace jamais l'annotation affichée ou enregistrée. Les traces techniques
+indiquent le modèle demandé/retourné, les paramètres non sensibles, la raison
+de fin et les compteurs de tokens, y compris les tokens de raisonnement quand
+le SDK les fournit. Une erreur HTTP 400 n'est pas répétée ; seuls les incidents
+transitoires (absence de statut, 429, 5xx) peuvent être retentés.
+
+Les boutons de régénération d'un champ et de recalcul des deux champs passent
+par le même client OpenAI. Ils conservent les prompts existants et n'écrivent
+un libellé ou un commentaire qu'après obtention d'une réponse non vide.
 - Un exemple est fourni : `config/.env.exemple`
 - Ne versionnez jamais `config/.env` contenant votre clé réelle
