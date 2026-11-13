@@ -64,6 +64,7 @@ _DICTEE_SCHEMA_VERSION = 1
 _LOCAL_LLM_BUSY_RESULT = "[LLM local occupe, reessayez dans quelques secondes.]"
 _UNC_PROBE_TIMEOUT_S = 0.6
 _OPENAI_REASONING_MODEL_PREFIXES = ("gpt-5", "gpt-6", "o1", "o3", "o4")
+_DEFAULT_OPENAI_MODEL = "gpt-6-luna"
 
 
 def _openai_chat_completion_kwargs(
@@ -72,17 +73,97 @@ def _openai_chat_completion_kwargs(
     temperature: float,
     messages: list[dict],
 ) -> dict:
-    model_name = str(model or "gpt-6-luna").strip()
+    model_name = str(model or _DEFAULT_OPENAI_MODEL).strip()
     kwargs = {
         "model": model_name,
         "messages": messages,
     }
     if model_name.lower().startswith(_OPENAI_REASONING_MODEL_PREFIXES):
         kwargs["max_completion_tokens"] = max_tokens
+        kwargs["reasoning_effort"] = "none"
     else:
         kwargs["max_tokens"] = max_tokens
         kwargs["temperature"] = float(temperature)
     return kwargs
+
+
+def _openai_response_metadata(response) -> dict:
+    choices = list(getattr(response, "choices", None) or [])
+    choice = choices[0] if choices else None
+    usage = getattr(response, "usage", None)
+    completion_details = getattr(usage, "completion_tokens_details", None)
+    return {
+        "returned_model": str(getattr(response, "model", "") or ""),
+        "finish_reason": str(getattr(choice, "finish_reason", "") or ""),
+        "input_tokens": getattr(usage, "prompt_tokens", None),
+        "output_tokens": getattr(usage, "completion_tokens", None),
+        "reasoning_tokens": getattr(completion_details, "reasoning_tokens", None),
+    }
+
+
+def _openai_response_text(response) -> str:
+    choices = list(getattr(response, "choices", None) or [])
+    if not choices:
+        return ""
+    message = getattr(choices[0], "message", None)
+    return str(getattr(message, "content", "") or "").strip()
+
+
+def _openai_failure_reason(response) -> str:
+    meta = _openai_response_metadata(response)
+    if meta["finish_reason"] == "length":
+        return "budget de sortie épuisé (finish_reason=length)"
+    if not _openai_response_text(response):
+        if meta["reasoning_tokens"] and meta["output_tokens"] == meta["reasoning_tokens"]:
+            return "réponse vide : budget entièrement consommé par le raisonnement"
+        return "réponse vide ou inexploitable"
+    return ""
+
+
+def _openai_status_code(exc: Exception) -> int | None:
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _call_openai_chat(client, *, model: str, temperature: float, max_tokens: int, messages: list[dict], retries: int = 1) -> str:
+    kwargs = _openai_chat_completion_kwargs(model, max_tokens, temperature, messages)
+    requested_model = kwargs["model"]
+    attempts = max(1, int(retries or 1))
+    safe_params = {key: value for key, value in kwargs.items() if key != "messages"}
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = client.chat.completions.create(**kwargs)
+            meta = _openai_response_metadata(response)
+            failure = _openai_failure_reason(response)
+            log.info(
+                "OpenAI annotation requested_model=%s returned_model=%s params=%s finish_reason=%s "
+                "input_tokens=%s output_tokens=%s reasoning_tokens=%s status=%s cause=%s",
+                requested_model, meta["returned_model"], safe_params, meta["finish_reason"],
+                meta["input_tokens"], meta["output_tokens"], meta["reasoning_tokens"],
+                "failed" if failure else "ok", failure or "-",
+            )
+            if failure:
+                # Un budget épuisé ne sera pas réparé en répétant le même appel.
+                raise ValueError(failure)
+            return _openai_response_text(response)
+        except ValueError:
+            raise
+        except Exception as exc:
+            status_code = _openai_status_code(exc)
+            retryable = status_code is None or status_code == 429 or status_code >= 500
+            log.warning(
+                "OpenAI annotation requested_model=%s params=%s status=failed http_status=%s cause=%s attempt=%s/%s",
+                requested_model, safe_params, status_code, type(exc).__name__, attempt, attempts,
+            )
+            if attempt >= attempts or not retryable:
+                raise
+            time.sleep(min(2 ** (attempt - 1), 4))
 
 
 def _load_env_for_runtime_config() -> None:
@@ -112,6 +193,7 @@ def _is_llm_runtime_message(value: str) -> bool:
         "[Réponse LLM local vide ou inexploitable]",
         "[LLM local occupé,",
         "[LLM local ok=False:",
+        "[Erreur réponse OpenAI :",
     )
     return any(text.startswith(prefix) for prefix in prefixes)
 
@@ -136,6 +218,23 @@ def _deep_merge_dict(base: dict, override: dict) -> dict:
         else:
             merged[key] = value
     return merged
+
+
+def _resolve_openai_model(base_model: str, ui_model: str, project_cfg: dict | None = None) -> str:
+    project_model = str((project_cfg or {}).get("model") or "").strip()
+    if project_model:
+        return project_model
+    ui_model = str(ui_model or "").strip()
+    if ui_model:
+        return ui_model
+    return str(base_model or _DEFAULT_OPENAI_MODEL).strip() or _DEFAULT_OPENAI_MODEL
+
+
+def _explicit_project_openai_model(infos: dict | None = None) -> str:
+    project_cfg_path = _resolve_project_config_llm_path(infos)
+    if not project_cfg_path:
+        return ""
+    return str(_load_json_file(project_cfg_path).get("model") or "").strip()
 
 
 def _load_json_file(path: Path) -> dict:
@@ -3126,16 +3225,26 @@ def generer_texte_gpt(
         return "[Erreur GPT : Clé API OpenAI introuvable (env OPENAI_API_KEY ou config.openai_api_key).]"
     try:
         client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(**_openai_chat_completion_kwargs(
-            model=appcfg.get("model", "gpt-6-luna"),
+        prompt_upper = prompt_user.upper()
+        is_commentaire = "COMMENTAIRE" in prompt_upper
+        max_tokens = appcfg.get(
+            "max_tokens_commentaire" if is_commentaire else "max_tokens_libelle",
+            appcfg.get("max_tokens", 500 if is_commentaire else 120),
+        )
+        text = _call_openai_chat(
+            client,
+            model=appcfg.get("model", _DEFAULT_OPENAI_MODEL),
             temperature=float(appcfg.get("temperature", 0.3)),
-            max_tokens=appcfg.get("max_tokens"),
+            max_tokens=int(max_tokens),
+            retries=int(appcfg.get("retries", 1)),
             messages=[
                 {"role": "system", "content": role_systeme},
                 {"role": "user", "content": prompt_user},
             ],
-        ))
-        return _strip_wrapping_quotes(response.choices[0].message.content or "")
+        )
+        return _strip_wrapping_quotes(text)
+    except ValueError as e:
+        return f"[Erreur réponse OpenAI : {e}]"
     except Exception as e:
         return f"[Erreur GPT OpenAI : {e}]"
 
@@ -3144,9 +3253,19 @@ def _load_app_config(infos: dict | None = None) -> dict:
     cfg_path = _CONFIG_DIR / "config.json"
     cfg = _load_json_file(cfg_path)
 
+    # La configuration globale fournit les valeurs par défaut. Un choix UI
+    # persistant dans infos_projet.json la surcharge, puis config_llm.json de
+    # l'affaire garde la priorité la plus haute.
+    base_model = cfg.get("model")
+    ui_model = (infos or {}).get("openai_model")
+
     project_cfg_path = _resolve_project_config_llm_path(infos)
+    project_cfg = {}
     if project_cfg_path:
-        cfg = _deep_merge_dict(cfg, _load_json_file(project_cfg_path))
+        project_cfg = _load_json_file(project_cfg_path)
+        cfg = _deep_merge_dict(cfg, project_cfg)
+
+    cfg["model"] = _resolve_openai_model(base_model, ui_model, project_cfg)
 
     backend_from_infos = str((infos or {}).get("llm_backend") or "").strip().lower()
     if backend_from_infos in {"local", "openai"}:
@@ -3541,6 +3660,17 @@ def show_annotation_interface():
     if current_backend not in {"local", "openai"}:
         current_backend = "local"
     st.session_state.setdefault("llm_backend_input", current_backend)
+    current_openai_model = str(appcfg.get("model") or _DEFAULT_OPENAI_MODEL).strip()
+    project_openai_model = _explicit_project_openai_model(infos)
+    if project_openai_model:
+        # Le sélecteur reflète toujours le modèle réellement transmis lorsque
+        # l'affaire impose sa propre configuration.
+        st.session_state["openai_model_input"] = current_openai_model
+    else:
+        st.session_state.setdefault(
+            "openai_model_input",
+            str(infos.get("openai_model") or current_openai_model).strip(),
+        )
 
     # ─────────────────────────────────────────────────────────────
     # 🔗 Vérifications de base
@@ -3818,6 +3948,28 @@ def show_annotation_interface():
         )
         st.caption("`local` utilise SERVER_URL/LOCAL_LLM_API_KEY ; `openai` utilise OPENAI_API_KEY.")
 
+        model_options = list(dict.fromkeys([
+            str(st.session_state.get("openai_model_input") or "").strip(),
+            current_openai_model,
+            _DEFAULT_OPENAI_MODEL,
+            "gpt-4o-mini",
+        ]))
+        model_options = [value for value in model_options if value]
+        openai_model_ui = st.selectbox(
+            "Modèle OpenAI",
+            model_options,
+            index=model_options.index(str(st.session_state.get("openai_model_input") or current_openai_model)),
+            key="openai_model_input",
+            disabled=bool(project_openai_model),
+        )
+        if project_openai_model:
+            st.caption(
+                f"Modèle effectif imposé par `config_llm.json` : `{current_openai_model}`. "
+                "Le sélecteur est verrouillé pour éviter une sélection sans effet."
+            )
+        else:
+            st.caption(f"Modèle effectif : `{current_openai_model}`.")
+
         st.markdown("Cliquez sur le bouton ci-dessous pour sauvegarder les durées actuellement utilisées.")
         if st.button("💾 Enregistrer les durées dans le fichier projet"):
             infos["plages_utilisees"] = {
@@ -3829,6 +3981,8 @@ def show_annotation_interface():
             infos["audio_av"] = float(st.session_state.get("audio_av_input", 10))
             infos["audio_ap"] = float(st.session_state.get("audio_ap_input", 10))
             infos["llm_backend"] = llm_backend_ui
+            if not project_openai_model:
+                infos["openai_model"] = openai_model_ui
 
             sauvegarder_infos_projet(infos)
             persisted_cfg, cfg_path = _persist_llm_backend(infos, llm_backend_ui)
